@@ -3,6 +3,7 @@
 
 pub mod address;
 pub mod message;
+pub mod parse;
 
 use std::fmt;
 
@@ -11,6 +12,7 @@ use uuid::Uuid;
 
 pub use address::Address;
 pub use message::{Conversation, Flags, MessageHeader, StoredMessage};
+pub use parse::{ParseError, decode_rfc2047, normalized_subject, parse_flags, parse_header_block};
 
 /// Typed wrapper so folder, message, and thread ids cannot be mixed up.
 macro_rules! id_type {
