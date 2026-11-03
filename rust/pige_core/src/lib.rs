@@ -7,6 +7,8 @@
 pub mod account;
 pub mod mail;
 pub mod store;
+pub mod sync;
+pub mod transport;
 
 pub use account::{Account, AccountId, AuthKind, Security, ServerConfig};
 pub use mail::{
