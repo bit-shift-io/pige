@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::account::AccountId;
 use crate::mail::{Folder, FolderId, FolderKind};
 
+use super::messages::recompute_thread_on;
 use super::{Store, StoreError};
 
 const COLUMNS: &str = "id, account_id, name, delimiter, kind, unread, total, uidvalidity, uidnext";
@@ -70,7 +71,20 @@ impl Store {
             return Ok(());
         };
 
+        let mut affected = Vec::new();
+        {
+            let mut stmt =
+                tx.prepare("SELECT DISTINCT thread_id FROM messages WHERE folder_id = ?1")?;
+            let mut rows = stmt.query([&folder_id])?;
+            while let Some(row) = rows.next()? {
+                affected.push(crate::mail::ThreadId(row.get(0)?));
+            }
+        }
+
         tx.execute("DELETE FROM messages WHERE folder_id = ?1", [&folder_id])?;
+        for thread in affected {
+            recompute_thread_on(&tx, &thread)?;
+        }
         tx.execute(
             "UPDATE folders
              SET uidvalidity = ?1, uidnext = NULL, unread = 0, total = 0, last_synced_at = NULL

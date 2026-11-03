@@ -2,7 +2,8 @@
 
 use crate::account::{Account, AccountId};
 use crate::mail::{
-    Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadId, Uid, sender_display,
+    Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner, ThreadId, Uid,
+    sender_display, thread::participants_of,
 };
 use crate::store::{Store, StoreError};
 use crate::transport::{MailTransport, RemoteFolder, RemoteMessage, TransportError, UidRange};
@@ -74,6 +75,12 @@ pub async fn sync_account(
 
     let folders = store.folders(&account.id)?;
 
+    // Seed threading from cached headers once per account. This is the only
+    // place the index is built, so every folder sync shares conversations and
+    // a Sent reply can join its Inbox parent. No bodies are read.
+    let existing_messages = store.messages_for_account(&account.id)?;
+    let mut threads = ThreadAssigner::from_messages(&existing_messages);
+
     // Inbox first, then the special folders; Other folders are not auto-synced.
     let mut to_sync: Vec<&RemoteFolder> = remote_folders
         .iter()
@@ -86,7 +93,17 @@ pub async fn sync_account(
             .iter()
             .find(|f| f.name == remote.name)
             .expect("folder upserted above");
-        match sync_folder(store, account, transport, remote, local, window).await {
+        match sync_folder(
+            store,
+            account,
+            transport,
+            remote,
+            local,
+            window,
+            &mut threads,
+        )
+        .await
+        {
             Ok(summaries) => {
                 report.synced_folders += 1;
                 report.new_inbox.extend(summaries);
@@ -119,6 +136,7 @@ async fn sync_folder(
     remote: &RemoteFolder,
     local: &Folder,
     window: u32,
+    threads: &mut ThreadAssigner,
 ) -> Result<Vec<NewMailSummary>, String> {
     let folder_id = local.id.clone();
     let account_id = account.id.clone();
@@ -137,6 +155,13 @@ async fn sync_folder(
             .reset_folder(&account_id, &remote.name, state.uidvalidity)
             .map_err(|e| format!("reset {}: {e}", remote.name))?;
         reset = true;
+        // The reset deleted this folder's cached messages; rebuild the index
+        // so new headers cannot join conversations that no longer exist.
+        *threads = ThreadAssigner::from_messages(
+            &store
+                .messages_for_account(&account_id)
+                .map_err(|e| format!("read {}: {e}", remote.name))?,
+        );
     }
 
     // High-water mark is the UIDNEXT recorded on the previous sync. A first
@@ -175,16 +200,26 @@ async fn sync_folder(
     let mut inserted: Vec<StoredMessage> = Vec::new();
     for message in &fetched {
         let id = MessageId::new();
-        // Until Task 10 installs real threading, each message gets its own
-        // thread id so the conversation list still works. The id is derived
-        // deterministically so a retry after a partial failure keeps the same
-        // thread id instead of rewriting it on the upsert conflict.
-        let thread_id =
-            temporary_thread_id(&account_id, &folder_id, state.uidvalidity, message.uid);
         let mut header = message.header.clone();
         // The transport-reported RFC822.SIZE is authoritative over the size the
         // header parser leaves at 0.
         header.size = message.size;
+        let participants = participants_of(&header);
+        let thread_id = threads.assign(&account_id, &header, header.date, &participants);
+        // A message that bridges two existing conversations forces a store
+        // merge before it is inserted, so every row ends up on the survivor.
+        for (from, into) in threads.take_merges() {
+            store
+                .merge_threads(&from, &into)
+                .map_err(|e| format!("merge {}: {e}", remote.name))?;
+            // Messages inserted earlier in this batch still carry the losing id
+            // in memory; keep their snippet upserts on the survivor.
+            for stored in &mut inserted {
+                if stored.thread_id == from {
+                    stored.thread_id = into.clone();
+                }
+            }
+        }
         let stored = StoredMessage {
             id,
             account_id: account_id.clone(),
@@ -278,16 +313,4 @@ async fn sync_folder(
             subject: m.header.subject.clone(),
         })
         .collect())
-}
-
-/// Temporary per-message thread id, stable across retries: derived from the
-/// message's natural key so a re-insert after a partial failure keeps it. Task
-/// 10 replaces this with real threading.
-pub(crate) fn temporary_thread_id(
-    account: &AccountId,
-    folder: &FolderId,
-    uidvalidity: u32,
-    uid: Uid,
-) -> ThreadId {
-    ThreadId(format!("{account}:{folder}:{uidvalidity}:{}", uid.0))
 }

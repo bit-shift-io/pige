@@ -16,7 +16,7 @@ pub mod transport;
 pub use account::{Account, AccountId, AuthKind, Security, ServerConfig};
 pub use mail::{
     Address, Conversation, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId,
-    StoredMessage, ThreadId, Uid,
+    StoredMessage, ThreadAssigner, ThreadId, Uid,
 };
 pub use store::{Body, Store, StoreError};
 

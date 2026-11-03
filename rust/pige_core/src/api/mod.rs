@@ -19,11 +19,11 @@ use tokio::sync::broadcast;
 use crate::account::{Account, AccountId, AuthKind, ServerConfig};
 use crate::html::{MailDocument, parse_html, plain_text_document};
 use crate::mail::{
-    Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadId, Uid, sender_display,
+    Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner, ThreadId, Uid,
+    sender_display, thread::participants_of,
 };
 use crate::platform::{CredentialStore, Notifier, Opener, TransportFactory};
 use crate::store::{Body, Store};
-use crate::sync::engine::temporary_thread_id;
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{RemoteFolder, UidRange};
 
@@ -926,6 +926,12 @@ async fn backfill_older(
     let server_more = found.len() > want;
     found.truncate(want);
 
+    let mut threads = ThreadAssigner::from_messages(
+        &store
+            .messages_for_account(&account.id)
+            .map_err(|error| format!("read thread index: {error}"))?,
+    );
+
     for message in &found {
         let crate::transport::RemoteMessage {
             uid,
@@ -935,6 +941,13 @@ async fn backfill_older(
         } = message.clone();
         let mut header = header;
         header.size = size;
+        let participants = participants_of(&header);
+        let thread_id = threads.assign(&account.id, &header, header.date, &participants);
+        for (from, into) in threads.take_merges() {
+            store
+                .merge_threads(&from, &into)
+                .map_err(|error| format!("merge older {}: {error}", folder.name))?;
+        }
         let stored = StoredMessage {
             id: MessageId::new(),
             account_id: account.id.clone(),
@@ -943,7 +956,7 @@ async fn backfill_older(
             uidvalidity,
             header,
             flags,
-            thread_id: temporary_thread_id(&account.id, &folder.id, uidvalidity, uid),
+            thread_id,
             snippet: String::new(),
             has_attachments: false,
         };

@@ -1,6 +1,6 @@
 //! Message persistence, flag updates, paging, and conversation aggregation.
 
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::account::AccountId;
 use crate::mail::{
@@ -24,7 +24,26 @@ impl Store {
         // refresh updates the cached row without changing its local id. Body
         // state and raw paths are left intact for the body fetch path.
         let conn = self.connection();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+
+        // A header refresh may move a message to a different thread (for
+        // example when threading first learns about a reply). Remember the old
+        // thread so its aggregates are recomputed too.
+        let previous_thread: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM messages
+                 WHERE account_id = ?1 AND folder_id = ?2 AND uidvalidity = ?3 AND uid = ?4",
+                params![
+                    message.account_id.0,
+                    message.folder_id.0,
+                    message.uidvalidity,
+                    message.uid.0,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        tx.execute(
             "INSERT INTO messages (
                  id, account_id, folder_id, uid, uidvalidity,
                  message_id, in_reply_to, references_json, thread_id, subject,
@@ -65,6 +84,14 @@ impl Store {
                 message.has_attachments,
             ],
         )?;
+
+        recompute_thread_on(&tx, &message.thread_id)?;
+        if let Some(previous) = previous_thread
+            && previous != message.thread_id.0
+        {
+            recompute_thread_on(&tx, &ThreadId(previous))?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -108,10 +135,70 @@ impl Store {
 
     pub fn set_flags(&self, id: &MessageId, flags: &Flags) -> Result<(), StoreError> {
         let conn = self.connection();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let thread: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM messages WHERE id = ?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute(
             "UPDATE messages SET flags = ?1 WHERE id = ?2",
             params![flags.to_bits(), id.0],
         )?;
+        if let Some(thread) = thread {
+            recompute_thread_on(&tx, &ThreadId(thread))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every cached header for one account, across folders. Bodies live in a
+    /// separate table, so this is safe to use for rebuilding the thread index.
+    pub fn messages_for_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        let conn = self.connection();
+        let sql = format!(
+            "SELECT {COLUMNS} FROM messages
+             WHERE account_id = ?1
+             ORDER BY date ASC, uid ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([&account.0])?;
+
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(message_from_row(row)?);
+        }
+        Ok(messages)
+    }
+
+    /// Recompute the aggregate row for one conversation from its messages:
+    /// newest display fields plus message count, unread count, and attachment
+    /// flag. A thread with no messages is removed.
+    pub fn recompute_thread(&self, id: &ThreadId) -> Result<(), StoreError> {
+        let conn = self.connection();
+        recompute_thread_on(&conn, id)
+    }
+
+    /// Fold every message from `from` into `into` in one transaction, then
+    /// refresh both aggregate rows.
+    pub fn merge_threads(&self, from: &ThreadId, into: &ThreadId) -> Result<(), StoreError> {
+        if from == into {
+            return self.recompute_thread(into);
+        }
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE messages SET thread_id = ?1 WHERE thread_id = ?2",
+            params![into.0, from.0],
+        )?;
+        recompute_thread_on(&tx, into)?;
+        recompute_thread_on(&tx, from)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -123,10 +210,26 @@ impl Store {
         uid: Uid,
     ) -> Result<usize, StoreError> {
         let conn = self.connection();
-        let deleted = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let mut affected = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT thread_id FROM messages
+                 WHERE folder_id = ?1 AND uid < ?2",
+            )?;
+            let mut rows = stmt.query(params![folder.0, uid.0])?;
+            while let Some(row) = rows.next()? {
+                affected.push(ThreadId(row.get(0)?));
+            }
+        }
+        let deleted = tx.execute(
             "DELETE FROM messages WHERE folder_id = ?1 AND uid < ?2",
             params![folder.0, uid.0],
         )?;
+        for thread in affected {
+            recompute_thread_on(&tx, &thread)?;
+        }
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -286,6 +389,74 @@ pub(crate) fn unified_conversations_on(
         });
     }
     Ok(conversations)
+}
+
+/// Recompute one `threads` row inside a caller-owned transaction. The newest
+/// message supplies the display subject/sender/snippet; the aggregate columns
+/// cover every folder so a conversation moved between folders stays coherent.
+pub(crate) fn recompute_thread_on(conn: &Connection, id: &ThreadId) -> Result<(), StoreError> {
+    let newest = conn
+        .query_row(
+            "SELECT account_id, subject, from_json, snippet, date, has_attachments
+             FROM messages
+             WHERE thread_id = ?1
+             ORDER BY date DESC, uid DESC
+             LIMIT 1",
+            [&id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((account_id, subject, from_json, snippet, date, has_attachments)) = newest else {
+        conn.execute("DELETE FROM threads WHERE id = ?1", [&id.0])?;
+        return Ok(());
+    };
+
+    let (message_count, unread, any_attachments): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN (flags & 1) = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(MAX(has_attachments), 0)
+         FROM messages WHERE thread_id = ?1",
+        [&id.0],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+
+    conn.execute(
+        "INSERT INTO threads (
+             id, account_id, subject, snippet, sender, date,
+             message_count, unread, has_attachments
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+             account_id = excluded.account_id,
+             subject = excluded.subject,
+             snippet = excluded.snippet,
+             sender = excluded.sender,
+             date = excluded.date,
+             message_count = excluded.message_count,
+             unread = excluded.unread,
+             has_attachments = excluded.has_attachments",
+        params![
+            id.0,
+            account_id,
+            subject,
+            snippet,
+            sender_from_json(&from_json)?,
+            date,
+            message_count,
+            unread,
+            any_attachments.max(has_attachments),
+        ],
+    )?;
+    Ok(())
 }
 
 fn encode_json<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
