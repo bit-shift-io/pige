@@ -1,10 +1,13 @@
 //! Message persistence, flag updates, paging, and conversation aggregation.
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::account::AccountId;
 use crate::mail::{
-    Address, Conversation, Flags, FolderId, MessageHeader, MessageId, StoredMessage, ThreadId, Uid,
+    Address, Conversation, Flags, FolderId, MessageHeader, MessageId, StoredMessage,
+    ThreadAssigner, ThreadId, Uid, thread::is_legacy_thread_id, thread::participants_of,
 };
 
 use super::{Store, StoreError};
@@ -184,17 +187,77 @@ impl Store {
         recompute_thread_on(&conn, id)
     }
 
+    /// Reassign rows that still carry the pre-threading per-message id. Stable
+    /// thread ids (UUIDs assigned by this task, or ids seeded by tests/API
+    /// callers) are left exactly as they are.
+    ///
+    /// Returns the number of message rows whose thread id changed.
+    pub fn rethread_legacy_threads(&self, account: &AccountId) -> Result<usize, StoreError> {
+        let messages = self.messages_for_account(account)?;
+        let (legacy, stable): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(is_legacy_thread_id);
+        if legacy.is_empty() {
+            return Ok(0);
+        }
+
+        let mut assigner = ThreadAssigner::from_messages(&stable);
+        let mut affected: HashSet<ThreadId> = HashSet::new();
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let mut changed = 0;
+
+        // `messages_for_account` is oldest-first, so parents are assigned
+        // before their replies and reference chains resolve correctly.
+        for message in &legacy {
+            let participants = participants_of(&message.header);
+            let thread = assigner.assign(
+                &message.account_id,
+                &message.header,
+                message.header.date,
+                &participants,
+            );
+            for (from, into) in assigner.take_merges() {
+                changed += tx.execute(
+                    "UPDATE messages SET thread_id = ?1
+                     WHERE account_id = ?2 AND thread_id = ?3",
+                    params![into.0, account.0, from.0],
+                )?;
+                affected.insert(from);
+                affected.insert(into);
+            }
+            if thread != message.thread_id {
+                changed += tx.execute(
+                    "UPDATE messages SET thread_id = ?1 WHERE id = ?2 AND account_id = ?3",
+                    params![thread.0, message.id.0, account.0],
+                )?;
+                affected.insert(message.thread_id.clone());
+                affected.insert(thread);
+            }
+        }
+
+        for thread in affected {
+            recompute_thread_on(&tx, &thread)?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Fold every message from `from` into `into` in one transaction, then
-    /// refresh both aggregate rows.
-    pub fn merge_threads(&self, from: &ThreadId, into: &ThreadId) -> Result<(), StoreError> {
+    /// refresh both aggregate rows. Only rows in `account` are touched.
+    pub fn merge_threads(
+        &self,
+        account: &AccountId,
+        from: &ThreadId,
+        into: &ThreadId,
+    ) -> Result<(), StoreError> {
         if from == into {
             return self.recompute_thread(into);
         }
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE messages SET thread_id = ?1 WHERE thread_id = ?2",
-            params![into.0, from.0],
+            "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3",
+            params![into.0, account.0, from.0],
         )?;
         recompute_thread_on(&tx, into)?;
         recompute_thread_on(&tx, from)?;
@@ -397,7 +460,7 @@ pub(crate) fn unified_conversations_on(
 pub(crate) fn recompute_thread_on(conn: &Connection, id: &ThreadId) -> Result<(), StoreError> {
     let newest = conn
         .query_row(
-            "SELECT account_id, subject, from_json, snippet, date, has_attachments
+            "SELECT account_id, subject, from_json, snippet, date
              FROM messages
              WHERE thread_id = ?1
              ORDER BY date DESC, uid DESC
@@ -410,13 +473,12 @@ pub(crate) fn recompute_thread_on(conn: &Connection, id: &ThreadId) -> Result<()
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((account_id, subject, from_json, snippet, date, has_attachments)) = newest else {
+    let Some((account_id, subject, from_json, snippet, date)) = newest else {
         conn.execute("DELETE FROM threads WHERE id = ?1", [&id.0])?;
         return Ok(());
     };
@@ -453,7 +515,7 @@ pub(crate) fn recompute_thread_on(conn: &Connection, id: &ThreadId) -> Result<()
             date,
             message_count,
             unread,
-            any_attachments.max(has_attachments),
+            any_attachments,
         ],
     )?;
     Ok(())

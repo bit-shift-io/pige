@@ -75,6 +75,10 @@ pub async fn sync_account(
 
     let folders = store.folders(&account.id)?;
 
+    // Upgrade rows cached before threading existed exactly once. Messages that
+    // already carry real thread ids are left alone.
+    store.rethread_legacy_threads(&account.id)?;
+
     // Seed threading from cached headers once per account. This is the only
     // place the index is built, so every folder sync shares conversations and
     // a Sent reply can join its Inbox parent. No bodies are read.
@@ -210,7 +214,7 @@ async fn sync_folder(
         // merge before it is inserted, so every row ends up on the survivor.
         for (from, into) in threads.take_merges() {
             store
-                .merge_threads(&from, &into)
+                .merge_threads(&account_id, &from, &into)
                 .map_err(|e| format!("merge {}: {e}", remote.name))?;
             // Messages inserted earlier in this batch still carry the losing id
             // in memory; keep their snippet upserts on the survivor.

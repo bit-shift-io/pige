@@ -118,8 +118,10 @@ impl ThreadAssigner {
         }
 
         if let Some(message_id) = &message.header.message_id {
-            self.message_threads
-                .insert((account, message_id.clone()), message.thread_id.clone());
+            self.message_threads.insert(
+                (account, message_key(message_id)),
+                message.thread_id.clone(),
+            );
         }
     }
 
@@ -143,7 +145,7 @@ impl ThreadAssigner {
         if let Some(message_id) = &header.message_id
             && let Some(thread) = self
                 .message_threads
-                .get(&(account_key.clone(), message_id.clone()))
+                .get(&(account_key.clone(), message_key(message_id)))
                 .cloned()
         {
             if let Some(record) = self.threads.get_mut(&thread) {
@@ -156,7 +158,7 @@ impl ThreadAssigner {
         for message_id in header.references.iter().chain(header.in_reply_to.iter()) {
             if let Some(thread) = self
                 .message_threads
-                .get(&(account_key.clone(), message_id.clone()))
+                .get(&(account_key.clone(), message_key(message_id)))
                 .cloned()
                 && !referenced.contains(&thread)
             {
@@ -170,8 +172,8 @@ impl ThreadAssigner {
             }
             self.remember(&survivor, account, date, participants);
             survivor
-        } else if let Some(existing) =
-            self.subject_match(&account_key, &subject, date, participants)
+        } else if !subject.is_empty()
+            && let Some(existing) = self.subject_match(&account_key, &subject, date, participants)
         {
             self.remember(&existing, account, date, participants);
             existing
@@ -190,7 +192,7 @@ impl ThreadAssigner {
 
         if let Some(message_id) = &header.message_id {
             self.message_threads
-                .insert((account_key, message_id.clone()), thread.clone());
+                .insert((account_key, message_key(message_id)), thread.clone());
         }
         thread
     }
@@ -199,6 +201,17 @@ impl ThreadAssigner {
     /// applies the returned pair to the store through [`Self::take_merges`].
     pub fn merge(&mut self, from: &ThreadId, into: &ThreadId) {
         if from == into {
+            return;
+        }
+        let Some(loser_account) = self.threads.get(from).map(|record| record.account.clone())
+        else {
+            return;
+        };
+        // Thread ids are account-scoped; a caller mistake must not move another
+        // account's messages into this conversation.
+        if let Some(survivor) = self.threads.get(into)
+            && survivor.account != loser_account
+        {
             return;
         }
         let Some(loser) = self.threads.remove(from) else {
@@ -286,6 +299,23 @@ pub fn participants_of(header: &MessageHeader) -> Vec<Address> {
 
 fn participant_key(address: &Address) -> String {
     address.email.trim().to_ascii_lowercase()
+}
+
+/// Message-ID lookup key. Headers are matched case-insensitively so servers
+/// that rewrite the domain casing still thread replies with their parents.
+fn message_key(message_id: &str) -> String {
+    message_id.trim().to_ascii_lowercase()
+}
+
+/// Whether a row still carries the pre-threading per-message id
+/// (`{account}:{folder}:{uidvalidity}:{uid}`). These are the only rows the
+/// one-time rethread pass may rewrite; UUID ids are left untouched.
+pub fn is_legacy_thread_id(message: &StoredMessage) -> bool {
+    message.thread_id.0
+        == format!(
+            "{}:{}:{}:{}",
+            message.account_id.0, message.folder_id.0, message.uidvalidity, message.uid.0
+        )
 }
 
 #[cfg(test)]

@@ -925,6 +925,9 @@ async fn backfill_older(
     found.sort_unstable_by_key(|message| Reverse(message.uid));
     let server_more = found.len() > want;
     found.truncate(want);
+    // References point backwards, so assignment must see the oldest message
+    // first. Upsert order does not matter because rows are keyed naturally.
+    found.sort_unstable_by_key(|message| message.uid);
 
     let mut threads = ThreadAssigner::from_messages(
         &store
@@ -945,7 +948,7 @@ async fn backfill_older(
         let thread_id = threads.assign(&account.id, &header, header.date, &participants);
         for (from, into) in threads.take_merges() {
             store
-                .merge_threads(&from, &into)
+                .merge_threads(&account.id, &from, &into)
                 .map_err(|error| format!("merge older {}: {error}", folder.name))?;
         }
         let stored = StoredMessage {

@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pige_core::{
-    AccountId, Address, AuthKind, Flags, FolderKind, MessageHeader, MessageId, Security,
-    ServerConfig, Store, StoredMessage, ThreadId, Uid,
+    AccountId, Address, AuthKind, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId,
+    Security, ServerConfig, Store, StoredMessage, ThreadId, Uid,
     api::{self, AccountInput, Config, MessageBody},
     mail::{ThreadAssigner, normalized_subject},
     platform::fake::{FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory},
@@ -216,6 +216,109 @@ fn cross_account_messages_with_the_same_message_id_stay_separate() {
     );
 
     assert_ne!(first, second);
+}
+
+#[test]
+fn rethread_legacy_thread_ids_groups_existing_mail_and_keeps_uuid_threads() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account("account");
+    store.upsert_account(&account).unwrap();
+    let folder = Folder {
+        id: FolderId("folder".to_string()),
+        account_id: account.id.clone(),
+        name: "INBOX".to_string(),
+        delimiter: Some("/".to_string()),
+        kind: FolderKind::Inbox,
+        unread: 0,
+        total: 3,
+        uidvalidity: Some(1),
+        uidnext: Some(4),
+    };
+    store.upsert_folder(&folder).unwrap();
+
+    let temporary = |uid: u32| ThreadId(format!("{}:{}:1:{}", account.id.0, folder.id.0, uid));
+    let message = |uid: u32,
+                   message_id: &str,
+                   references: Vec<String>,
+                   subject: &str,
+                   date: i64,
+                   thread_id: ThreadId| StoredMessage {
+        id: MessageId(format!("message-{uid}")),
+        account_id: account.id.clone(),
+        folder_id: folder.id.clone(),
+        uid: Uid(uid),
+        uidvalidity: 1,
+        header: MessageHeader {
+            message_id: Some(message_id.to_string()),
+            in_reply_to: references.last().cloned(),
+            references,
+            subject: subject.to_string(),
+            from: vec![address("alice@example.com")],
+            to: vec![address("bob@example.com")],
+            cc: Vec::new(),
+            date,
+            size: 64,
+        },
+        flags: Flags::default(),
+        thread_id,
+        snippet: String::new(),
+        has_attachments: false,
+    };
+
+    store
+        .upsert_message(&message(
+            1,
+            "<a@example.com>",
+            Vec::new(),
+            "Project",
+            1_000,
+            temporary(1),
+        ))
+        .unwrap();
+    // The reply has an unrelated subject, so only its reference can group it.
+    store
+        .upsert_message(&message(
+            2,
+            "<b@example.com>",
+            vec!["<a@example.com>".to_string()],
+            "Completely different",
+            2_000,
+            temporary(2),
+        ))
+        .unwrap();
+    store
+        .upsert_message(&message(
+            3,
+            "<c@example.com>",
+            Vec::new(),
+            "Other",
+            3_000,
+            ThreadId("kept-uuid".to_string()),
+        ))
+        .unwrap();
+
+    let changed = store.rethread_legacy_threads(&account.id).unwrap();
+    assert_eq!(changed, 2);
+
+    let messages = store.messages(&folder.id, 10, None).unwrap();
+    let first = messages
+        .iter()
+        .find(|message| message.uid == Uid(1))
+        .unwrap();
+    let second = messages
+        .iter()
+        .find(|message| message.uid == Uid(2))
+        .unwrap();
+    let stable = messages
+        .iter()
+        .find(|message| message.uid == Uid(3))
+        .unwrap();
+
+    assert_eq!(first.thread_id, second.thread_id);
+    assert_ne!(first.thread_id, temporary(1));
+    assert_eq!(stable.thread_id, ThreadId("kept-uuid".to_string()));
+    assert_eq!(store.conversations(&folder.id, 10, None).unwrap().len(), 2);
 }
 
 fn account(id: &str) -> pige_core::Account {

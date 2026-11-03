@@ -726,6 +726,71 @@ async fn load_older_backfills_remote_mail_when_cache_is_exhausted() {
 }
 
 #[tokio::test]
+async fn load_older_threads_reference_chain_before_subject_fallback() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let store = harness.open_store();
+    let inbox = Folder {
+        id: FolderId("inbox".to_string()),
+        account_id: account_id.clone(),
+        name: "INBOX".to_string(),
+        delimiter: Some("/".to_string()),
+        kind: FolderKind::Inbox,
+        unread: 0,
+        total: 3,
+        uidvalidity: Some(1),
+        uidnext: Some(4),
+    };
+    store.upsert_folder(&inbox).unwrap();
+
+    // Only the newest message is cached; the older reference chain must come
+    // from the backfill path.
+    let mut newest = stored_message(&inbox, 3);
+    newest.header.date = 3_000;
+    newest.header.subject = "Newest".to_string();
+    newest.thread_id = ThreadId("newest-thread".to_string());
+    store.upsert_message(&newest).unwrap();
+
+    let parent = remote_message(1, "Alpha", "alice@example.com");
+    let mut child = remote_message(2, "Beta", "bob@example.com");
+    child.header.references = vec!["<1@example.com>".to_string()];
+    child.header.in_reply_to = Some("<1@example.com>".to_string());
+    harness
+        .factory
+        .add_transport(account_id, inbox_transport(vec![parent, child]));
+
+    let snapshot = api::select_folder(&inbox.id).await.expect("select inbox");
+    assert_eq!(snapshot.conversations.len(), 1);
+    let snapshot = api::load_older(&inbox.id).await.expect("backfill older");
+    assert_eq!(snapshot.conversations.len(), 2);
+
+    let messages = harness
+        .open_store()
+        .messages(&inbox.id, 10, None)
+        .expect("read cached messages");
+    let parent = messages
+        .iter()
+        .find(|message| message.uid == Uid(1))
+        .expect("backfilled parent");
+    let child = messages
+        .iter()
+        .find(|message| message.uid == Uid(2))
+        .expect("backfilled child");
+
+    // Alpha and Beta must join through References, not the subject fallback.
+    assert_eq!(
+        parent.thread_id, child.thread_id,
+        "backfill must assign parents before their replies"
+    );
+}
+
+#[tokio::test]
 async fn load_older_handles_duplicate_timestamps() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
