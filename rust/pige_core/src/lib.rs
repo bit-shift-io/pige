@@ -1,5 +1,19 @@
 //! Core data model for the `pige` mail client. The desktop and Android shells
-//! stay thin; the storage schema and mail logic will live here.
+//! stay thin; accounts, the SQLite cache, and mail logic live here.
+//!
+//! This crate must not depend on iced or any Android UI code so it can run in
+//! the sync worker and under unit tests on every platform.
+
+pub mod account;
+pub mod mail;
+pub mod store;
+
+pub use account::{Account, AccountId, AuthKind, Security, ServerConfig};
+pub use mail::{
+    Address, Conversation, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId,
+    StoredMessage, ThreadId, Uid,
+};
+pub use store::{Store, StoreError};
 
 /// Bumped whenever the persisted schema changes; later tasks version the store
 /// against this so a mismatched database can be migrated or rebuilt.
