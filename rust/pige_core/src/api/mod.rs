@@ -439,6 +439,7 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
                     account,
                     folder: folder_row,
                     oldest,
+                    limit,
                 }),
                 sender,
             )
@@ -464,7 +465,10 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
     {
         Ok((stored, server_more)) => {
             let mut guard = lock_state();
-            if let Some(state) = guard.as_mut() {
+            if let Some(state) = guard.as_mut()
+                && state.selected_folder.as_ref() == Some(&request.folder.id)
+                && state.conversation_limit == request.limit
+            {
                 state.conversation_limit = state.conversation_limit.saturating_add(stored as u32);
                 state.server_more = Some(server_more);
             }
@@ -485,6 +489,9 @@ struct BackfillRequest {
     account: Account,
     folder: Folder,
     oldest: Option<Uid>,
+    /// Visible page size when the backfill started; used to detect a selection
+    /// or paging change while the network wait was in flight.
+    limit: u32,
 }
 
 fn locate_folder(store: &Store, id: &FolderId) -> Result<(Account, Folder), String> {
@@ -718,6 +725,7 @@ fn finish_sync(attempted: usize, outcome: SyncOutcome) -> SyncStatus {
     let mut guard = lock_state();
     if let Some(state) = guard.as_mut() {
         state.status = status.clone();
+        state.server_more = None;
         state.ensure_selection();
     }
     status

@@ -20,7 +20,7 @@ use pige_core::{
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -822,4 +822,125 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+#[tokio::test]
+async fn backfill_result_is_discarded_when_selection_changes() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let store = harness.open_store();
+    let inbox = Folder {
+        id: FolderId("inbox".to_string()),
+        account_id: account_id.clone(),
+        name: "INBOX".to_string(),
+        delimiter: Some("/".to_string()),
+        kind: FolderKind::Inbox,
+        unread: 0,
+        total: 400,
+        uidvalidity: Some(1),
+        uidnext: Some(401),
+    };
+    store.upsert_folder(&inbox).unwrap();
+    for uid in 101..=400 {
+        store.upsert_message(&stored_message(&inbox, uid)).unwrap();
+    }
+
+    let archive = Folder {
+        id: FolderId("archive".to_string()),
+        account_id: account_id.clone(),
+        name: "Archive".to_string(),
+        delimiter: Some("/".to_string()),
+        kind: FolderKind::Archive,
+        unread: 0,
+        total: 350,
+        uidvalidity: Some(1),
+        uidnext: Some(351),
+    };
+    store.upsert_folder(&archive).unwrap();
+    for uid in 1..=350 {
+        let mut message = stored_message(&archive, uid);
+        message.id = MessageId(format!("archive-message-{uid}"));
+        message.thread_id = ThreadId(format!("archive-thread-{uid}"));
+        store.upsert_message(&message).unwrap();
+    }
+
+    let started = Arc::new(Semaphore::new(0));
+    let pause = Arc::new(Semaphore::new(0));
+    let messages = (1..=400)
+        .map(|uid| remote_message(uid, &format!("Subject {uid}"), "sender@example.com"))
+        .collect();
+    let mut transport = inbox_transport(messages);
+    transport.fetch_headers_started = Some(started.clone());
+    transport.fetch_headers_pause = Some(pause.clone());
+    harness.factory.add_transport(account_id, transport);
+
+    let inbox_snapshot = api::select_folder(&inbox.id).await.expect("select inbox");
+    assert_eq!(inbox_snapshot.conversations.len(), 300);
+    assert!(inbox_snapshot.has_more);
+
+    let folder = inbox.id.clone();
+    let loading = tokio::spawn(async move { api::load_older(&folder).await });
+
+    // Wait until the backfill is inside the network fetch, then switch folders.
+    let permit = started.acquire().await.unwrap();
+    drop(permit);
+    let archive_snapshot = api::select_folder(&archive.id)
+        .await
+        .expect("select archive");
+    assert_eq!(archive_snapshot.selected_folder.as_ref(), Some(&archive.id));
+    assert_eq!(archive_snapshot.conversations.len(), 300);
+    assert!(archive_snapshot.has_more);
+
+    // Let the original backfill finish; its paging state must not leak into
+    // the newly selected folder.
+    pause.add_permits(1);
+    loading.await.unwrap().expect("backfill completes");
+
+    let snapshot = api::snapshot();
+    assert_eq!(snapshot.selected_folder.as_ref(), Some(&archive.id));
+    assert_eq!(snapshot.conversations.len(), 300);
+    assert!(snapshot.has_more);
+}
+
+#[tokio::test]
+async fn sync_finish_clears_stale_server_more() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let messages: Vec<_> = (1..=500)
+        .map(|uid| remote_message(uid, &format!("Subject {uid}"), "sender@example.com"))
+        .collect();
+    harness
+        .factory
+        .add_transport(account_id.clone(), inbox_transport(messages.clone()));
+
+    let snapshot = api::sync_all().await.expect("initial sync");
+    let inbox = snapshot
+        .selected_folder
+        .clone()
+        .expect("auto-selected inbox");
+    let snapshot = api::load_older(&inbox).await.expect("backfill");
+    assert!(snapshot.has_more, "the server still has older mail");
+
+    // The next sync reports a smaller total and no new UIDs. The old backfill
+    // probe must not keep claiming there is more mail.
+    let mut second = inbox_transport(messages);
+    second.states.get_mut("INBOX").expect("inbox state").exists = 400;
+    harness.factory.add_transport(account_id, second);
+
+    let snapshot = api::sync_all().await.expect("second sync");
+    assert_eq!(snapshot.selected_folder.as_ref(), Some(&inbox));
+    assert_eq!(snapshot.conversations.len(), 400);
+    assert!(!snapshot.has_more, "finish_sync must clear server_more");
 }

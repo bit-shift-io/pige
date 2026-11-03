@@ -1,8 +1,10 @@
 //! A scripted, in-memory [`MailTransport`] for sync and mutation tests.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Semaphore;
 
 use crate::mail::{Flags, Uid};
 
@@ -34,6 +36,12 @@ pub struct FakeTransport {
     pub fetch_flags_calls: Vec<(String, Vec<Uid>)>,
     pub fetch_texts_calls: Vec<(String, Vec<Uid>, usize)>,
     pub fetch_body_calls: Vec<(String, Uid)>,
+
+    /// Test hooks for deterministic backfill race tests: `started` receives a
+    /// permit when a header fetch begins, and the fetch waits for a permit on
+    /// `pause` before returning.
+    pub fetch_headers_started: Option<Arc<Semaphore>>,
+    pub fetch_headers_pause: Option<Arc<Semaphore>>,
 
     /// Internal: the folder most recently selected, if any.
     pub current: Option<String>,
@@ -89,6 +97,12 @@ impl MailTransport for FakeTransport {
     ) -> Result<Vec<RemoteMessage>, TransportError> {
         let folder = self.current_folder()?;
         self.fetch_headers_calls.push((folder.clone(), range));
+        if let Some(started) = &self.fetch_headers_started {
+            started.add_permits(1);
+        }
+        if let Some(pause) = &self.fetch_headers_pause {
+            let _ = pause.acquire().await;
+        }
         Ok(self
             .messages
             .get(&folder)
