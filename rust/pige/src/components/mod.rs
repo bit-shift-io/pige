@@ -18,9 +18,9 @@
 //! qlaunch's `components.rs` and companion modules (bitshift, MIT).
 
 use iced::Color;
-use iced::widget::text;
+use iced::widget::{column, container, text};
 
-use crate::theme::{self, Typography};
+use crate::theme::{self, TextRole, Typography};
 
 pub mod avatar;
 pub mod buttons;
@@ -41,6 +41,37 @@ pub use chrome::{app_bar, empty_state, snackbar};
 pub use dialog::dialog;
 pub use fields::{search_field, text_field};
 pub use rows::{FolderKind, FolderView, ListRow, folder_row, list_row, section_header};
+
+/// A collapsible account header: the label, unread roll-up and the account's
+/// email underneath. The label row is the click target that toggles it.
+pub fn account_header<'a>(
+    label: &str,
+    email: &str,
+    collapsed: bool,
+    unread: u32,
+    on_toggle: crate::Message,
+) -> iced::Element<'a, crate::Message> {
+    let palette = theme::active();
+    let email_style = palette.role(TextRole::LabelMedium);
+
+    column![
+        section_header(label, collapsed, unread, on_toggle),
+        container(styled_text(
+            email.to_string(),
+            email_style,
+            palette.on_surface_variant,
+        ))
+        .width(iced::Fill)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: palette.space.md,
+            bottom: palette.space.xs,
+            left: palette.space.md,
+        }),
+    ]
+    .width(iced::Fill)
+    .into()
+}
 
 /// A text widget that already carries the palette's type style and colour.
 pub(crate) fn styled_text<'a>(
