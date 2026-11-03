@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::mail::{AttachmentDisposition, AttachmentPart, MessageId};
+use crate::mail::{AttachmentDisposition, AttachmentPart, MessageId, ThreadId};
 
-use super::{Store, StoreError};
+use super::{Store, StoreError, messages::recompute_thread_on};
 
 /// One attachment row: the display/fetch metadata plus the cached file, when
 /// the user has opened it at least once.
@@ -110,6 +110,24 @@ impl Store {
                     params![message_id.0, part_id],
                 )?;
             }
+        }
+
+        // Sync only writes headers, so it cannot know whether a message has
+        // user-visible attachments. Recompute the flag from the metadata we
+        // just stored, and refresh the thread aggregate that the list reads.
+        let thread_id: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM messages WHERE id = ?1",
+                [&message_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute(
+            "UPDATE messages SET has_attachments = ?1 WHERE id = ?2",
+            params![!parts.is_empty(), message_id.0],
+        )?;
+        if let Some(thread_id) = thread_id {
+            recompute_thread_on(&tx, &ThreadId(thread_id))?;
         }
 
         tx.commit()?;

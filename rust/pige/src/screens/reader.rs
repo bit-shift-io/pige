@@ -283,12 +283,10 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
         }
     }
 
-    // One chip per real attachment. Rows cached before attachment metadata was
-    // stored keep the generic chip until their body is fetched again.
+    // One chip per user-visible attachment. Metadata is stored when the body
+    // is fetched; a cached pre-v3 body has no metadata and shows no chips.
     if !latest.attachments.is_empty() {
         content = content.push(attachment_chips(latest));
-    } else if latest.has_attachments {
-        content = content.push(attachments_placeholder());
     }
 
     // Earlier messages (collapsed; empty until threading).
@@ -400,15 +398,6 @@ fn attachment_chips<'a>(message: &'a MessageSummary) -> Element<'a, Message> {
         ));
     }
     container(chips)
-        .width(Fill)
-        .padding([palette.space.xs, palette.space.lg])
-        .into()
-}
-
-/// A placeholder row of attachment chips (real attachments land in Task 15).
-fn attachments_placeholder<'a>() -> Element<'a, Message> {
-    let palette = theme::active();
-    container(components::attachment_chip("Attachment", 0, Message::Noop))
         .width(Fill)
         .padding([palette.space.xs, palette.space.lg])
         .into()

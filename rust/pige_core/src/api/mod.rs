@@ -1509,6 +1509,8 @@ pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf,
                 .find(|candidate| candidate.part_id == part)
                 .cloned()
                 .ok_or_else(|| format!("attachment part {part} is not present in the message"))?;
+            // Refuse before allocating and decoding an oversized MIME part.
+            check_attachment_size(part_meta.size).map_err(|error| error.to_string())?;
             let bytes = attachment_bytes(&raw, &part_meta.part_id).ok_or_else(|| {
                 format!("attachment part {} could not be decoded", part_meta.part_id)
             })?;
@@ -1555,6 +1557,10 @@ pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf,
 fn verified_cached_attachment(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
     let root = cache_dir.join("attachments");
     if !path.starts_with(&root) || !path.is_file() {
+        return None;
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    if check_attachment_size(metadata.len()).is_err() {
         return None;
     }
     let canonical_root = std::fs::canonicalize(&root).ok()?;
@@ -2053,5 +2059,84 @@ mod tests {
         ));
         assert_eq!(search.query, "query");
         assert_eq!(search.results.len(), 1);
+    }
+
+    #[test]
+    fn cached_path_outside_the_attachments_root_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+
+        assert!(verified_cached_attachment(cache, &outside).is_none());
+    }
+
+    #[test]
+    fn cached_path_with_parent_traversal_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path();
+        let root = cache.join("attachments");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = cache.join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+
+        let traversal = root.join("..").join("outside.txt");
+        assert!(traversal.starts_with(&root));
+        assert!(verified_cached_attachment(cache, &traversal).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_symlink_escaping_the_attachments_root_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path();
+        let root = cache.join("attachments");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = cache.join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let link = root.join("link.txt");
+        symlink(&outside, &link).unwrap();
+
+        assert!(link.is_file(), "the symlink resolves to a regular file");
+        assert!(verified_cached_attachment(cache, &link).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_attachment_replaces_a_symlink_instead_of_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path();
+        let message = MessageId("message-1".to_string());
+        let part = AttachmentPart {
+            part_id: "2".to_string(),
+            filename: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 3,
+            content_id: None,
+            disposition: crate::mail::AttachmentDisposition::Attachment,
+        };
+
+        let directory = cache.join("attachments/message-1/2");
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = dir.path().join("outside.txt");
+        std::fs::write(&target, b"keep").unwrap();
+        let planted = directory.join("report.pdf");
+        symlink(&target, &planted).unwrap();
+
+        let path = cache_attachment(cache, &message, &part, b"new").expect("cache attachment");
+
+        assert_eq!(path, planted);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 }

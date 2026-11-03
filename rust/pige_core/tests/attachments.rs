@@ -187,7 +187,8 @@ fn message(folder: &Folder, thread: &str) -> StoredMessage {
         flags: Flags::default(),
         thread_id: ThreadId(thread.to_string()),
         snippet: String::new(),
-        has_attachments: true,
+        // Header sync cannot see MIME attachments; the flag starts false.
+        has_attachments: false,
     }
 }
 
@@ -271,6 +272,59 @@ async fn open_conversation_exposes_attachment_metadata() {
         .attachments(&latest.id)
         .expect("read stored attachments");
     assert_eq!(stored, latest.attachments);
+
+    // Storing metadata recomputes the flag that header sync wrote as false.
+    let persisted = harness
+        .store
+        .message(&latest.id)
+        .expect("read message")
+        .expect("message row");
+    assert!(persisted.has_attachments);
+}
+
+#[tokio::test]
+async fn storing_attachment_metadata_updates_the_message_flag() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = harness("thread-flag").await;
+    let id = &harness.message.id;
+
+    let before = harness
+        .store
+        .message(id)
+        .expect("read message")
+        .expect("row");
+    assert!(!before.has_attachments);
+
+    let parts = extract_attachments(WITH_ATTACHMENT);
+    harness
+        .store
+        .store_attachments(id, &parts)
+        .expect("store attachments");
+    let with_attachments = harness
+        .store
+        .message(id)
+        .expect("read message")
+        .expect("row");
+    assert!(with_attachments.has_attachments);
+
+    // Removing the last part clears the flag in the same transaction.
+    harness
+        .store
+        .store_attachments(id, &[])
+        .expect("clear attachments");
+    let without_attachments = harness
+        .store
+        .message(id)
+        .expect("read message")
+        .expect("row");
+    assert!(!without_attachments.has_attachments);
+    assert!(
+        harness
+            .store
+            .attachments(id)
+            .expect("read attachments")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
