@@ -7,8 +7,12 @@ use iced::Size;
 use pige_core::account::AccountId;
 use pige_core::api::ModelSnapshot;
 use pige_core::mail::{FolderId, ThreadId};
+use pige_core::search::{SearchHit, SearchScope};
 
 #[derive(Debug, Clone)]
+// A snapshot is deliberately passed by value: it is the authoritative view
+// model, and boxing it would only move the allocation to every match arm.
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     /// A fresh view of the cache.
     Snapshot(ModelSnapshot),
@@ -26,7 +30,17 @@ pub enum Message {
     SyncNow,
     /// Pull-to-refresh from the list.
     Refresh,
-    Search(String),
+    /// The search field changed.
+    SearchChanged(String),
+    /// The user cycled the search scope chip.
+    SearchScopeChanged(SearchScope),
+    /// A background search finished. The query is echoed so a slow response
+    /// for an older keystroke cannot replace newer results.
+    SearchResults {
+        query: String,
+        scope: SearchScope,
+        result: Result<Vec<SearchHit>, String>,
+    },
     /// A conversation was chosen; the reader lands in a later task.
     OpenConversation(ThreadId),
     /// The reader's "Load images" bar was pressed: re-parse the body with

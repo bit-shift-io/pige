@@ -88,6 +88,21 @@ impl Store {
             ],
         )?;
 
+        // Resolve the natural-key row's id: an update keeps the original local
+        // id, so index that row rather than a freshly generated one.
+        let stored_id: String = tx.query_row(
+            "SELECT id FROM messages
+             WHERE account_id = ?1 AND folder_id = ?2 AND uidvalidity = ?3 AND uid = ?4",
+            params![
+                message.account_id.0,
+                message.folder_id.0,
+                message.uidvalidity,
+                message.uid.0,
+            ],
+            |row| row.get(0),
+        )?;
+        super::search::index_message_on(&tx, &MessageId(stored_id))?;
+
         recompute_thread_on(&tx, &message.thread_id)?;
         if let Some(previous) = previous_thread
             && previous != message.thread_id.0

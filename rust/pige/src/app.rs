@@ -12,6 +12,7 @@ use pige_core::api::{
 };
 use pige_core::mail::{FolderId, FolderKind as CoreFolderKind};
 use pige_core::platform::fake::{FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory};
+use pige_core::search::{SearchHit, SearchScope};
 
 use crate::components::elastic_scroll::Motion;
 use crate::components::{FolderKind, FolderView, ListRow};
@@ -48,6 +49,11 @@ pub struct App {
     /// Accounts whose folder groups are collapsed.
     pub collapsed: HashSet<AccountId>,
     pub(crate) search: String,
+    /// The scope chip's current choice. Starts at All accounts and cycles
+    /// through the selected account and folder when they exist.
+    pub(crate) search_scope: SearchScope,
+    /// The latest background search results.
+    pub(crate) search_results: Vec<SearchHit>,
     pub(crate) size: Size,
     pub(crate) dark: bool,
     pub(crate) list_motion: Motion,
@@ -78,6 +84,8 @@ impl App {
                 selected_account,
                 collapsed: HashSet::new(),
                 search: String::new(),
+                search_scope: SearchScope::AllAccounts,
+                search_results: Vec::new(),
                 size: Size::new(900.0, 700.0),
                 dark: true,
                 list_motion: Motion::new(),
@@ -92,6 +100,9 @@ impl App {
     /// place for both event-driven and tick refreshes.
     pub(crate) fn apply_snapshot(&mut self, snapshot: ModelSnapshot) {
         self.selected_account = selection_account(&snapshot);
+        if !self.search.is_empty() && snapshot.search_query == self.search {
+            self.search_results = snapshot.search_results.clone();
+        }
         self.snapshot = snapshot;
     }
 }
@@ -329,6 +340,34 @@ pub fn row_view(conversation: &CoreConversationSummary) -> ListRow {
         unread: conversation.unread,
         has_attachment: conversation.has_attachments,
         count: conversation.message_count,
+    }
+}
+
+/// Turn one search hit into the same row shape as a conversation. Search hits
+/// carry only match metadata, so snippet aggregation and unread count are
+/// intentionally blank.
+pub fn search_row_view(hit: &SearchHit) -> ListRow {
+    let sender = if hit.sender.trim().is_empty() {
+        "Unknown sender".to_string()
+    } else {
+        hit.sender.clone()
+    };
+    let subject = if hit.subject.trim().is_empty() {
+        "(no subject)".to_string()
+    } else {
+        hit.subject.clone()
+    };
+
+    ListRow {
+        initials: initials(&sender),
+        avatar_color: avatar_color(&sender),
+        sender,
+        date: format_list_date(now_unix(), hit.date),
+        subject,
+        snippet: String::new(),
+        unread: false,
+        has_attachment: false,
+        count: 0,
     }
 }
 

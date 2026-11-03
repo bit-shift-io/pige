@@ -23,6 +23,7 @@ use crate::mail::{
     sender_display, thread::participants_of,
 };
 use crate::platform::{CredentialStore, Notifier, Opener, TransportFactory};
+use crate::search::{SearchHit, SearchScope};
 use crate::store::{Body, Store};
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{RemoteFolder, UidRange};
@@ -39,6 +40,9 @@ pub const DB_FILE_NAME: &str = "pige.db";
 const INITIAL_PAGE: u32 = 300;
 /// Conversations added by one `load_older` call.
 const PAGE_SIZE: u32 = 100;
+/// Search hits returned to one query. One hit per conversation, so this is a
+/// generous cap for the list screen.
+const SEARCH_LIMIT: u32 = 100;
 /// Headers fetched per folder on a first sync.
 const SYNC_WINDOW: u32 = 300;
 /// The largest raw message body the reader will download, in bytes. Messages
@@ -79,6 +83,11 @@ struct AppState {
     unified_selected: bool,
     conversation_limit: u32,
     selected_conversation: Option<ConversationDetail>,
+    /// Last search query, scope, and results, mirrored into snapshots so a
+    /// CoreEvent refresh can redraw the search screen without repeating work.
+    search_query: String,
+    search_scope: SearchScope,
+    search_results: Vec<SearchHit>,
     /// `Some(true/false)` once a server backfill has probed for older mail;
     /// `None` means fall back to comparing the server total with the cache.
     server_more: Option<bool>,
@@ -120,6 +129,9 @@ impl AppState {
                     return ModelSnapshot {
                         status: self.status.clone(),
                         unified_selected: self.unified_selected,
+                        search_query: self.search_query.clone(),
+                        search_scope: self.search_scope.clone(),
+                        search_results: self.search_results.clone(),
                         ..ModelSnapshot::default()
                     };
                 }
@@ -191,6 +203,9 @@ impl AppState {
             selected_folder,
             conversations,
             selected_conversation: self.selected_conversation.clone(),
+            search_query: self.search_query.clone(),
+            search_scope: self.search_scope.clone(),
+            search_results: self.search_results.clone(),
             status: self.status.clone(),
             has_more,
         }
@@ -248,6 +263,9 @@ pub fn init(config: Config) -> Result<(), String> {
         unified_selected: false,
         conversation_limit: INITIAL_PAGE,
         selected_conversation: None,
+        search_query: String::new(),
+        search_scope: SearchScope::AllAccounts,
+        search_results: Vec::new(),
         server_more: None,
         status: SyncStatus::Idle,
         events: sender.clone(),
@@ -271,6 +289,47 @@ pub fn snapshot() -> ModelSnapshot {
 /// Whether [`init`] has installed the process-wide state.
 pub fn is_initialized() -> bool {
     lock_state().is_some()
+}
+
+/// Search cached mail for the search screen. The SQLite scan runs on a
+/// blocking worker with its own connection, so a long query never stalls the
+/// UI thread or the global state lock. Results are also stored in the snapshot
+/// and announced with [`CoreEvent::SearchChanged`].
+pub async fn search_mail(query: &str, scope: SearchScope) -> Result<Vec<SearchHit>, String> {
+    let query = query.trim().to_string();
+    let (data_dir, sender) = {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        (state.config.data_dir.clone(), state.events.clone())
+    };
+
+    let hits = if query.is_empty() {
+        Vec::new()
+    } else {
+        let search_query = query.clone();
+        let search_scope = scope.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = Store::open(database_path(&data_dir))
+                .map_err(|error| format!("open search store: {error}"))?;
+            crate::search::search(&store, &search_query, &search_scope, SEARCH_LIMIT)
+                .map_err(|error| format!("search mail: {error}"))
+        })
+        .await
+        .map_err(|error| format!("search task: {error}"))??
+    };
+
+    {
+        let mut guard = lock_state();
+        if let Some(state) = guard.as_mut() {
+            state.search_query = query;
+            state.search_scope = scope;
+            state.search_results = hits.clone();
+        }
+    }
+    let _ = sender.send(CoreEvent::SearchChanged);
+    Ok(hits)
 }
 
 /// Persist an account and its password. The password is written through the

@@ -4,6 +4,7 @@
 use crate::account::AccountId;
 use crate::html::MailDocument;
 use crate::mail::{Flags, FolderId, FolderKind, MessageId, ThreadId};
+use crate::search::{SearchHit, SearchScope};
 
 /// One account row in the navigation rail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +103,11 @@ pub struct ModelSnapshot {
     pub selected_folder: Option<FolderId>,
     pub conversations: Vec<ConversationSummary>,
     pub selected_conversation: Option<ConversationDetail>,
+    /// The most recent query and scope sent through [`crate::api::search_mail`].
+    pub search_query: String,
+    pub search_scope: SearchScope,
+    /// One hit per matching conversation, newest first.
+    pub search_results: Vec<SearchHit>,
     pub status: SyncStatus,
     /// Whether more cached conversations exist below the current page.
     pub has_more: bool,

@@ -35,10 +35,12 @@ impl Store {
         .map_err(StoreError::from)
     }
 
-    /// Store (or replace) the cached body for a message.
+    /// Store (or replace) the cached body for a message and refresh its search
+    /// entry with the plain-text half.
     pub fn upsert_body(&self, message_id: &MessageId, body: &Body) -> Result<(), StoreError> {
         let conn = self.connection();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO bodies (message_id, plain_text, html, fetched_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(message_id) DO UPDATE SET
@@ -47,6 +49,8 @@ impl Store {
                  fetched_at = excluded.fetched_at",
             params![message_id.0, body.plain_text, body.html, body.fetched_at,],
         )?;
+        super::search::index_message_on(&tx, message_id)?;
+        tx.commit()?;
         Ok(())
     }
 }

@@ -9,6 +9,7 @@ pub mod api;
 pub mod html;
 pub mod mail;
 pub mod platform;
+pub mod search;
 pub mod store;
 pub mod sync;
 pub mod transport;
@@ -18,11 +19,12 @@ pub use mail::{
     Address, Conversation, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId,
     StoredMessage, ThreadAssigner, ThreadId, Uid,
 };
+pub use search::{SearchHit, SearchScope, fts_query, search};
 pub use store::{Body, Store, StoreError};
 
 /// Bumped whenever the persisted schema changes; later tasks version the store
 /// against this so a mismatched database can be migrated or rebuilt.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {

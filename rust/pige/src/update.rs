@@ -51,7 +51,26 @@ impl App {
             Message::SyncNow | Message::Refresh => {
                 return snapshot_task(api::sync_all());
             }
-            Message::Search(query) => self.search = query,
+            Message::SearchChanged(query) => {
+                self.search = query;
+                return self.run_search();
+            }
+            Message::SearchScopeChanged(scope) => {
+                self.search_scope = scope;
+                return self.run_search();
+            }
+            Message::SearchResults {
+                query,
+                scope,
+                result,
+            } => {
+                if query == self.search && scope == self.search_scope {
+                    match result {
+                        Ok(hits) => self.search_results = hits,
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+            }
             Message::OpenConversation(thread_id) => {
                 self.drawer_open = false;
                 let open_thread = thread_id.clone();
@@ -102,6 +121,27 @@ impl App {
     fn select_folder(&mut self, folder: FolderId) -> Task<Message> {
         self.drawer_open = false;
         snapshot_task(async move { api::select_folder(&folder).await })
+    }
+
+    /// Run the current query on the API's blocking search path. An empty query
+    /// deliberately skips SQLite: the list falls back to recent mail.
+    fn run_search(&mut self) -> Task<Message> {
+        if self.search.trim().is_empty() {
+            self.search_results.clear();
+            return Task::none();
+        }
+        let query = self.search.clone();
+        let scope = self.search_scope.clone();
+        let completed = query.clone();
+        let completed_scope = scope.clone();
+        Task::perform(
+            async move { api::search_mail(&query, scope).await },
+            move |result| Message::SearchResults {
+                query: completed.clone(),
+                scope: completed_scope.clone(),
+                result,
+            },
+        )
     }
 
     pub(crate) fn subscription(&self) -> Subscription<Message> {

@@ -19,6 +19,8 @@ const EVENT_CAPACITY: usize = 4096;
 pub enum CoreEvent {
     /// The model changed; call `api::snapshot()` for the new state.
     SnapshotChanged,
+    /// [`crate::api::search_mail`] replaced the snapshot's search results.
+    SearchChanged,
     SyncStarted {
         account: AccountId,
     },

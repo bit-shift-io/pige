@@ -1,6 +1,8 @@
-//! Schema versioning. Each migration runs in one transaction and records the
-//! version in `meta` so later tasks can add steps without guessing the shape
-//! of an existing database.
+//! Schema versioning. Each migration step runs in one transaction and records
+//! the version in `meta` so later tasks can add steps without guessing the
+//! shape of an existing database.
+
+mod v2;
 
 use rusqlite::OptionalExtension;
 
@@ -13,21 +15,34 @@ impl Store {
     /// Create or upgrade the database to `SCHEMA_VERSION`. Idempotent: calling
     /// it twice is a no-op, and a database from a newer binary is rejected
     /// instead of being silently modified.
+    ///
+    /// Versions are applied stepwise. v1 is the original cache schema; v2 adds
+    /// the FTS5 index and backfills every message already cached.
     pub fn migrate(&self) -> Result<(), StoreError> {
-        match self.existing_schema_version()? {
-            Some(found) if found == SCHEMA_VERSION => return Ok(()),
-            Some(found) if found > SCHEMA_VERSION => {
-                return Err(StoreError::SchemaTooNew {
-                    found,
-                    supported: SCHEMA_VERSION,
-                });
-            }
-            _ => {}
+        let mut version = self.existing_schema_version()?.unwrap_or(0);
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooNew {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
         }
 
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(SCHEMA_SQL)?;
+
+        if version < 1 {
+            tx.execute_batch(SCHEMA_SQL)?;
+            version = 1;
+        }
+        if version < 2 {
+            v2::apply(&tx)?;
+            version = 2;
+        }
+
+        debug_assert_eq!(version, SCHEMA_VERSION);
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

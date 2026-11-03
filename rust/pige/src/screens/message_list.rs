@@ -10,6 +10,7 @@ use crate::components::{self, ButtonVariant, PaneTone};
 use crate::icons;
 use crate::layout::{self, Breakpoint};
 use crate::message::Message;
+use crate::screens::search;
 use crate::theme;
 
 /// The list pane. Compact shows it alone; medium and expanded share the width
@@ -30,7 +31,7 @@ pub fn list_pane<'a>(
     let mut pane = column![].spacing(0).width(Fill).height(Fill);
     pane = pane.push(components::app_bar(folder_title(app), leading, actions));
     pane = pane.push(
-        container(components::search_field(&app.search, Message::Search))
+        container(search::controls(app))
             .padding(iced::Padding {
                 top: 0.0,
                 right: palette.space.lg,
@@ -40,7 +41,14 @@ pub fn list_pane<'a>(
             .width(Fill),
     );
 
-    if app.snapshot.conversations.is_empty() {
+    if search::is_active(app) {
+        let scroller: Element<'a, Message> = scrollable(search::results(app))
+            .width(Fill)
+            .height(Fill)
+            .style(palette.scrollable())
+            .into();
+        pane = pane.push(scroller);
+    } else if app.snapshot.conversations.is_empty() {
         pane = pane.push(components::empty_state(empty_title(app), empty_body(app)));
     } else {
         let mut rows = column![].spacing(0).width(Fill);
