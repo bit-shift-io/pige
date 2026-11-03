@@ -1,6 +1,6 @@
 //! Folder persistence and UIDVALIDITY resets.
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::account::AccountId;
 use crate::mail::{Folder, FolderId, FolderKind};
@@ -11,7 +11,8 @@ const COLUMNS: &str = "id, account_id, name, delimiter, kind, unread, total, uid
 
 impl Store {
     pub fn upsert_folder(&self, folder: &Folder) -> Result<(), StoreError> {
-        self.connection().execute(
+        let conn = self.connection();
+        conn.execute(
             "INSERT INTO folders (
                  id, account_id, name, delimiter, kind, unread, total, uidvalidity, uidnext
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -40,17 +41,8 @@ impl Store {
     }
 
     pub fn folders(&self, account: &AccountId) -> Result<Vec<Folder>, StoreError> {
-        let sql = format!(
-            "SELECT {COLUMNS} FROM folders WHERE account_id = ?1 ORDER BY name COLLATE NOCASE"
-        );
-        let mut stmt = self.connection().prepare(&sql)?;
-        let mut rows = stmt.query([&account.0])?;
-
-        let mut folders = Vec::new();
-        while let Some(row) = rows.next()? {
-            folders.push(folder_from_row(row)?);
-        }
-        Ok(folders)
+        let conn = self.connection();
+        folders_on(&conn, account)
     }
 
     /// Start a new UIDVALIDITY epoch for a folder: drop every cached message
@@ -62,7 +54,8 @@ impl Store {
         folder_name: &str,
         uidvalidity: u32,
     ) -> Result<(), StoreError> {
-        let tx = self.connection().unchecked_transaction()?;
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
 
         let folder_id: Option<String> = tx
             .query_row(
@@ -87,6 +80,35 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+pub(crate) fn folders_on(
+    conn: &Connection,
+    account: &AccountId,
+) -> Result<Vec<Folder>, StoreError> {
+    let sql =
+        format!("SELECT {COLUMNS} FROM folders WHERE account_id = ?1 ORDER BY name COLLATE NOCASE");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([&account.0])?;
+
+    let mut folders = Vec::new();
+    while let Some(row) = rows.next()? {
+        folders.push(folder_from_row(row)?);
+    }
+    Ok(folders)
+}
+
+pub(crate) fn folder_total_on(
+    conn: &Connection,
+    folder: &FolderId,
+) -> Result<Option<u32>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT total FROM folders WHERE id = ?1",
+            [&folder.0],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 fn folder_from_row(row: &Row<'_>) -> Result<Folder, StoreError> {

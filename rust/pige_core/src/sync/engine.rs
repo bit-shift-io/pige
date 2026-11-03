@@ -283,7 +283,7 @@ async fn sync_folder(
 /// Temporary per-message thread id, stable across retries: derived from the
 /// message's natural key so a re-insert after a partial failure keeps it. Task
 /// 10 replaces this with real threading.
-fn temporary_thread_id(
+pub(crate) fn temporary_thread_id(
     account: &AccountId,
     folder: &FolderId,
     uidvalidity: u32,

@@ -25,7 +25,8 @@ impl Store {
             _ => {}
         }
 
-        let tx = self.connection().unchecked_transaction()?;
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
         tx.execute_batch(SCHEMA_SQL)?;
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)

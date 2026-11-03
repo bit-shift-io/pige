@@ -9,9 +9,10 @@ use tokio::sync::broadcast;
 use crate::account::AccountId;
 use crate::sync::NewMailSummary;
 
-/// Capacity is generous enough for a burst of new mail; a slow UI drops stale
-/// events and re-reads the latest snapshot, which is always authoritative.
-const EVENT_CAPACITY: usize = 256;
+/// Capacity covers a first-sync burst (the initial window is 300 messages per
+/// folder) plus progress events. A slow UI drops stale events and re-reads the
+/// latest snapshot, which is always authoritative.
+const EVENT_CAPACITY: usize = 4096;
 
 /// Something the UI or platform layer should react to.
 #[derive(Debug, Clone, PartialEq, Eq)]

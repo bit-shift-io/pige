@@ -1,6 +1,6 @@
 //! Account persistence.
 
-use rusqlite::{Row, params};
+use rusqlite::{Connection, Row, params};
 
 use crate::account::{Account, AccountId, AuthKind, Security, ServerConfig};
 
@@ -12,7 +12,8 @@ const COLUMNS: &str = "id, label, email, display_name, username, \
 
 impl Store {
     pub fn upsert_account(&self, account: &Account) -> Result<(), StoreError> {
-        self.connection().execute(
+        let conn = self.connection();
+        conn.execute(
             "INSERT INTO accounts (
                  id, label, email, display_name, username,
                  imap_host, imap_port, imap_security,
@@ -52,17 +53,21 @@ impl Store {
 
     /// Every account in navigation order.
     pub fn accounts(&self) -> Result<Vec<Account>, StoreError> {
-        let sql =
-            format!("SELECT {COLUMNS} FROM accounts ORDER BY sort_order, label COLLATE NOCASE");
-        let mut stmt = self.connection().prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-
-        let mut accounts = Vec::new();
-        while let Some(row) = rows.next()? {
-            accounts.push(account_from_row(row)?);
-        }
-        Ok(accounts)
+        let conn = self.connection();
+        accounts_on(&conn)
     }
+}
+
+pub(crate) fn accounts_on(conn: &Connection) -> Result<Vec<Account>, StoreError> {
+    let sql = format!("SELECT {COLUMNS} FROM accounts ORDER BY sort_order, label COLLATE NOCASE");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+
+    let mut accounts = Vec::new();
+    while let Some(row) = rows.next()? {
+        accounts.push(account_from_row(row)?);
+    }
+    Ok(accounts)
 }
 
 fn account_from_row(row: &Row<'_>) -> Result<Account, StoreError> {

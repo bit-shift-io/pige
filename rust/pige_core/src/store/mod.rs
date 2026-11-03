@@ -9,8 +9,37 @@ mod schema;
 
 use std::fmt;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
+
+use crate::account::Account;
+use crate::mail::{Conversation, Folder, FolderId};
+
+use accounts::accounts_on;
+use folders::{folder_total_on, folders_on};
+use messages::{conversations_on, message_count_on};
+
+/// A consistent read of the cache used to build one UI snapshot.
+#[derive(Debug, Default)]
+pub struct StoreView {
+    pub sections: Vec<AccountFolders>,
+    pub conversations: Vec<Conversation>,
+    /// Whether the folder has cached conversations beyond the requested page.
+    pub has_more_local: bool,
+    /// Folder total reported by the server (0 when unknown).
+    pub selected_total: u32,
+    /// Number of messages cached locally for the selected folder.
+    pub selected_cached: u32,
+}
+
+/// One account plus its folders, read under the same transaction as the rest of
+/// a [`StoreView`].
+#[derive(Debug)]
+pub struct AccountFolders {
+    pub account: Account,
+    pub folders: Vec<Folder>,
+}
 
 /// Errors surfaced by the store. Callers map these into user-visible strings at
 /// the API boundary; the core never panics on bad persisted data.
@@ -37,11 +66,11 @@ impl StoreError {
     }
 }
 
-/// Handle to the local cache. Methods take `&self`; transactions use SQLite's
-/// unchecked transaction so the handle can be shared behind a mutex by the API
-/// layer without exposing `&mut Connection`.
+/// Handle to the local cache. The connection sits behind a mutex so a `Store`
+/// is `Send + Sync`; every method keeps the guard for one short synchronous
+/// operation and never across an await.
 pub struct Store {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl Store {
@@ -57,12 +86,53 @@ impl Store {
 
         let conn = Connection::open(path)?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        Ok(Self { conn })
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
-    pub(crate) fn connection(&self) -> &Connection {
-        &self.conn
+    pub(crate) fn connection(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Read everything a snapshot needs inside one deferred SQLite transaction,
+    /// so a writer on another connection cannot interleave between sections,
+    /// folders, and conversations.
+    pub fn view(&self, folder: Option<&FolderId>, limit: u32) -> Result<StoreView, StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+
+        let accounts = accounts_on(&tx)?;
+        let mut sections = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            let folders = folders_on(&tx, &account.id)?;
+            sections.push(AccountFolders { account, folders });
+        }
+
+        let mut conversations = Vec::new();
+        let mut has_more_local = false;
+        let mut selected_total = 0;
+        let mut selected_cached = 0;
+        if let Some(folder) = folder {
+            let mut rows = conversations_on(&tx, folder, limit.saturating_add(1), None)?;
+            has_more_local = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            conversations = rows;
+            selected_total = folder_total_on(&tx, folder)?.unwrap_or(0);
+            selected_cached = message_count_on(&tx, folder)?;
+        }
+
+        tx.commit()?;
+        Ok(StoreView {
+            sections,
+            conversations,
+            has_more_local,
+            selected_total,
+            selected_cached,
+        })
     }
 }
 
