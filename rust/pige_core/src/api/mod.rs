@@ -24,6 +24,9 @@ use crate::mail::{
 };
 use crate::platform::{CredentialStore, Notifier, Opener, TransportFactory};
 use crate::search::{SearchHit, SearchScope};
+use crate::send::{
+    self, OutboxEntry, OutboxId, OutgoingMessage, compose::forward_message, compose::reply_message,
+};
 use crate::store::{Body, Store};
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{RemoteFolder, UidRange};
@@ -50,6 +53,14 @@ const SYNC_WINDOW: u32 = 300;
 /// shown a "message too large" state instead of fetching hundreds of MiB.
 /// This is separate from the sanitizer's 2 MiB HTML input cap.
 const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
+
+/// The result of submitting a message: the refreshed cache view plus whether it
+/// is still waiting in the outbox for a network connection.
+#[derive(Debug, Clone)]
+pub struct SendOutcome {
+    pub snapshot: ModelSnapshot,
+    pub queued: bool,
+}
 
 /// Everything the core needs from the host process. Built once per process by
 /// the desktop or Android shell and handed to [`init`].
@@ -310,6 +321,8 @@ impl AppState {
             })
             .collect();
 
+        let drafts = self.store.outbox_drafts(None).unwrap_or_default();
+
         ModelSnapshot {
             accounts,
             sections,
@@ -323,6 +336,7 @@ impl AppState {
             search_results: self.search.results.clone(),
             status: self.status.clone(),
             has_more,
+            drafts,
         }
     }
 }
@@ -1153,6 +1167,204 @@ pub fn load_images(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
     Ok(snapshot)
 }
 
+/// Build a reply draft for the newest message in a conversation. Recipients,
+/// subject, In-Reply-To/References, and the quoted body are prefilled; the UI
+/// only has to append the user's new text.
+pub fn compose_reply(thread_id: &ThreadId) -> Result<OutgoingMessage, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    let messages = state
+        .store
+        .messages_for_thread(thread_id)
+        .map_err(|error| format!("read conversation: {error}"))?;
+    let newest = messages
+        .first()
+        .ok_or_else(|| format!("unknown conversation {thread_id}"))?;
+    let account = find_account(&state.store, &newest.account_id)?;
+    let body = message_text(&state.store, newest);
+    Ok(reply_message(&account, &newest.header, &body))
+}
+
+/// Build a forward draft for the newest message in a conversation. No recipient
+/// is guessed; the subject and quoted body are prefilled.
+pub fn compose_forward(thread_id: &ThreadId) -> Result<OutgoingMessage, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    let messages = state
+        .store
+        .messages_for_thread(thread_id)
+        .map_err(|error| format!("read conversation: {error}"))?;
+    let newest = messages
+        .first()
+        .ok_or_else(|| format!("unknown conversation {thread_id}"))?;
+    let account = find_account(&state.store, &newest.account_id)?;
+    let body = message_text(&state.store, newest);
+    Ok(forward_message(&account, &newest.header, &body))
+}
+
+fn find_account(store: &Store, id: &AccountId) -> Result<Account, String> {
+    store
+        .accounts()
+        .map_err(|error| format!("read accounts: {error}"))?
+        .into_iter()
+        .find(|account| &account.id == id)
+        .ok_or_else(|| format!("unknown account {id}"))
+}
+
+fn message_text(store: &Store, message: &crate::mail::StoredMessage) -> String {
+    store
+        .body(&message.id)
+        .ok()
+        .flatten()
+        .and_then(|body| body.plain_text)
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| message.snippet.clone())
+}
+
+/// Queue a message durably, then try to flush this account's outbox. A network
+/// failure leaves the row queued and reports `queued: true`; a hard send
+/// failure (for example a rejected recipient) keeps the compose form open by
+/// returning the outbox error.
+pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> {
+    let (config, account, id, sender) = {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let account = find_account(&state.store, &message.account_id)?;
+        let id = state
+            .store
+            .insert_outbox(&message, send::OutboxState::Queued)
+            .map_err(|error| format!("queue message: {error}"))?;
+        (state.config.clone(), account, id, state.events.clone())
+    };
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+
+    let store = Store::open(database_path(&config.data_dir))
+        .map_err(|error| format!("open outbox store: {error}"))?;
+    // Both transports are required: the SMTP sender delivers and the IMAP
+    // connection performs the best-effort Sent APPEND. If either cannot be
+    // opened, the queued row waits for the next sync instead of being marked
+    // failed.
+    if let Ok(mut smtp) = config.transport.smtp(&account).await
+        && let Ok(mut imap) = config.transport.imap(&account).await
+        && let Err(error) = send::flush_outbox(&store, &account, smtp.as_mut(), imap.as_mut()).await
+    {
+        log::warn!("flush outbox for {}: {error}", account.label);
+    }
+
+    let entry = store
+        .outbox_entry(&id)
+        .map_err(|error| format!("read outbox: {error}"))?;
+    let queued = entry.as_ref().is_some_and(|entry| {
+        matches!(
+            entry.state,
+            send::OutboxState::Queued | send::OutboxState::Sending
+        )
+    });
+    let failure = entry
+        .as_ref()
+        .filter(|entry| entry.state == send::OutboxState::Failed)
+        .and_then(|entry| entry.error.clone());
+
+    let snapshot = snapshot();
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(SendOutcome { snapshot, queued })
+}
+
+/// Save a new draft. Drafts are local rows and never touch the network.
+pub fn save_draft(message: OutgoingMessage) -> Result<OutboxId, String> {
+    let sender;
+    let id;
+    {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        id = send::save_draft(&state.store, message)
+            .map_err(|error| format!("save draft: {error}"))?;
+        sender = state.events.clone();
+    }
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(id)
+}
+
+/// Replace an existing draft's fields while keeping its id.
+pub fn update_draft(id: &OutboxId, message: OutgoingMessage) -> Result<(), String> {
+    let sender;
+    {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        send::update_draft(&state.store, id, &message)
+            .map_err(|error| format!("update draft: {error}"))?;
+        sender = state.events.clone();
+    }
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(())
+}
+
+/// Delete a draft and refresh the snapshot.
+pub fn discard_draft(id: &OutboxId) -> Result<ModelSnapshot, String> {
+    let sender;
+    let snapshot;
+    {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        send::discard_draft(&state.store, id).map_err(|error| format!("discard draft: {error}"))?;
+        sender = state.events.clone();
+        snapshot = state.build_snapshot();
+    }
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot)
+}
+
+/// Drafts for the Drafts folder, newest first across every account.
+pub fn list_drafts() -> Result<Vec<OutboxEntry>, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state
+        .store
+        .outbox_drafts(None)
+        .map_err(|error| format!("list drafts: {error}"))
+}
+
+/// Drafts for one account, used by an account-scoped Drafts folder.
+pub fn list_drafts_for(account: &AccountId) -> Result<Vec<OutboxEntry>, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state
+        .store
+        .outbox_drafts(Some(account))
+        .map_err(|error| format!("list drafts: {error}"))
+}
+
+/// Load one full draft, including its body, for editing.
+pub fn draft(id: &OutboxId) -> Result<Option<OutboxEntry>, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state
+        .store
+        .outbox_entry(id)
+        .map_err(|error| format!("read draft: {error}"))
+}
+
 /// Mark every message in a conversation as read. Fired by the reader after the
 /// message has been visible for a moment.
 pub async fn mark_read(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
@@ -1543,11 +1755,29 @@ async fn sync_one(
         .await
         .map_err(|error| format!("{}: {error}", account.label))?;
 
+    // Outbox delivery shares this account's connection. A missing SMTP
+    // connection is expected offline: the rows stay queued for the next sync.
+    let mut outbox_errors = Vec::new();
+    let has_pending = store
+        .outbox_pending(&account.id)
+        .is_ok_and(|pending| !pending.is_empty());
+    if has_pending {
+        match config.transport.smtp(account).await {
+            Ok(mut smtp) => {
+                match send::flush_outbox(store, account, smtp.as_mut(), transport.as_mut()).await {
+                    Ok(outbox) => outbox_errors.extend(outbox.errors),
+                    Err(error) => outbox_errors.push(error.to_string()),
+                }
+            }
+            Err(error) => log::debug!("outbox for {} is waiting: {error}", account.label),
+        }
+    }
+
     for mail in &report.new_inbox {
         config.notifier.notify(mail);
         let _ = sender.send(CoreEvent::NewMail(mail.clone()));
     }
-    for error in &report.errors {
+    for error in report.errors.iter().chain(outbox_errors.iter()) {
         let _ = sender.send(CoreEvent::Error(format!("{}: {error}", account.label)));
     }
 

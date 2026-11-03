@@ -7,7 +7,7 @@
 use iced::advanced::{
     Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer, widget::Tree,
 };
-use iced::widget::{column, container, text, text_input};
+use iced::widget::{column, container, text, text_editor, text_input};
 use iced::{Alignment, Element, Event, Fill, Length, Rectangle, Size, Vector};
 
 use crate::Message;
@@ -63,6 +63,51 @@ fn field<'a>(
             .center_y(palette.metrics.field_height - label_style.line_height)
             .width(Fill),
     ]
+    .width(Fill)
+    .into()
+}
+
+/// A multi-line plain-text editor used by compose. The button action is the
+/// editor's own [`text_editor::Action`] so typing, selection, and paste all flow
+/// through the same widget.
+pub fn text_area<'a>(
+    label: &str,
+    content: &'a text_editor::Content,
+    height: Length,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+) -> Element<'a, Message> {
+    let palette = theme::active();
+    let label_style = palette.role(TextRole::LabelMedium);
+    let value_style = palette.role(TextRole::BodyLarge);
+
+    let editor = text_editor(content)
+        .placeholder("Write your message")
+        .on_action(on_action)
+        .height(height)
+        .size(value_style.size)
+        .line_height(value_style.line_height())
+        .font(value_style.font)
+        .padding(palette.space.sm)
+        .style(move |_, _| text_editor::Style {
+            background: palette.surface_container_high.into(),
+            border: iced::Border {
+                color: palette.outline_variant,
+                width: palette.metrics.border_width,
+                radius: palette.radius.md.into(),
+            },
+            placeholder: palette.on_surface_variant,
+            value: palette.on_surface,
+            selection: iced::Color {
+                a: palette.states.selection,
+                ..palette.primary
+            },
+        });
+
+    column![
+        styled_text(label, label_style, palette.on_surface_variant),
+        editor,
+    ]
+    .spacing(palette.space.xs)
     .width(Fill)
     .into()
 }

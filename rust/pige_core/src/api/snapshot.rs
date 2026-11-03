@@ -5,6 +5,7 @@ use crate::account::AccountId;
 use crate::html::MailDocument;
 use crate::mail::{Flags, FolderId, FolderKind, MessageId, ThreadId};
 use crate::search::{SearchHit, SearchScope};
+use crate::send::OutboxEntry;
 
 /// One account row in the navigation rail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,4 +112,6 @@ pub struct ModelSnapshot {
     pub status: SyncStatus,
     /// Whether more cached conversations exist below the current page.
     pub has_more: bool,
+    /// Locally saved drafts, newest first, for the Drafts folder.
+    pub drafts: Vec<OutboxEntry>,
 }

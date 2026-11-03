@@ -9,8 +9,10 @@ use pige_core::account::{Account, AccountId, Security};
 use pige_core::api::ModelSnapshot;
 use pige_core::mail::{FolderId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
+use pige_core::send::OutboxId;
 
 use crate::screens::accounts::AccountField;
+use crate::screens::compose::{ComposeField, ComposeSeed};
 
 /// The successful result of saving an account. `warning` carries the
 /// session-only credential notice or a failed first sync; it is shown in the
@@ -84,6 +86,22 @@ pub enum Message {
     /// Open a link from a message body.
     OpenUrl(String),
     Compose,
+    /// Start a reply or forward from the open conversation.
+    Reply,
+    Forward,
+    /// A reply/forward prefill or a saved draft arrived from the API.
+    ComposeLoaded(Result<ComposeSeed, String>),
+    /// A draft row was chosen from the Drafts folder.
+    OpenDraft(OutboxId),
+    ComposeField(ComposeField, String),
+    ComposeBody(iced::widget::text_editor::Action),
+    ComposeSend,
+    ComposeSent(Result<pige_core::api::SendOutcome, String>),
+    ComposeSaveDraft,
+    ComposeSaved(Result<OutboxId, String>),
+    ComposeDiscard,
+    ComposeDiscarded(Result<ModelSnapshot, String>),
+    ComposeClose,
     AddAccount,
     Settings,
     /// The account screen is open.

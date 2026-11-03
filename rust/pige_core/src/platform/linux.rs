@@ -14,7 +14,7 @@ use crate::platform::{
     CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, TransportFactory,
 };
 use crate::sync::NewMailSummary;
-use crate::transport::{MailTransport, SmtpSender, imap};
+use crate::transport::{MailTransport, SmtpSender, imap, smtp};
 
 /// The Secret Service service name every pige secret is filed under.
 pub const SERVICE: &str = "pige";
@@ -286,11 +286,21 @@ impl TransportFactory for LinuxTransportFactory {
     }
 
     fn smtp<'a>(&'a self, account: &'a Account) -> BoxFuture<'a, Result<Box<dyn SmtpSender>>> {
-        let label = account.label.clone();
         Box::pin(async move {
-            Err(format!(
-                "{label}: SMTP sending is not available yet (it arrives in a later update)"
-            ))
+            let password = self
+                .credentials
+                .get(&account.id)
+                .map_err(|error| format!("{}: {error}", account.label))?
+                .ok_or_else(|| {
+                    format!(
+                        "{}: no password is stored for this account; edit the account and enter it again",
+                        account.label
+                    )
+                })?;
+            let transport = smtp::connect(account, &password)
+                .await
+                .map_err(|error| format!("{}: {error}", account.label))?;
+            Ok(Box::new(transport) as Box<dyn SmtpSender>)
         })
     }
 }

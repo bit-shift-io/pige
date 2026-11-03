@@ -10,6 +10,7 @@ pub mod html;
 pub mod mail;
 pub mod platform;
 pub mod search;
+pub mod send;
 pub mod store;
 pub mod sync;
 pub mod transport;

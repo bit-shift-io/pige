@@ -3,6 +3,7 @@
 
 pub mod fake;
 pub mod imap;
+pub mod smtp;
 pub mod tls;
 
 use async_trait::async_trait;

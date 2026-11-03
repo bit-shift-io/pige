@@ -17,11 +17,11 @@ use crate::{avatar_color, initials};
 
 /// Render the reader pane for the current selection.
 pub fn reader_pane<'a>(app: &'a App) -> Element<'a, Message> {
-    let actions = vec![components::icon_button(
-        icons::MORE_VERT,
-        "More",
-        Message::Noop,
-    )];
+    let actions = vec![
+        components::icon_button(icons::REPLY, "Reply", Message::Reply),
+        components::icon_button(icons::FORWARD, "Forward", Message::Forward),
+        components::icon_button(icons::MORE_VERT, "More", Message::Noop),
+    ];
 
     let Some(detail) = app.snapshot.selected_conversation.as_ref() else {
         return container(column![

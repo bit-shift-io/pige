@@ -14,6 +14,18 @@ pub fn dialog<'a>(
     body: Element<'a, Message>,
     actions: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
+    dialog_sized(title, body, actions, theme::active().metrics.dialog_width)
+}
+
+/// A dialog with an explicit maximum width. Compose uses this so the message
+/// fields get more room than a confirmation card while still sharing the modal
+/// scrim, elevation, and action layout.
+pub fn dialog_sized<'a>(
+    title: &str,
+    body: Element<'a, Message>,
+    actions: Vec<Element<'a, Message>>,
+    max_width: f32,
+) -> Element<'a, Message> {
     let palette = theme::active();
     let title_style = palette.role(TextRole::TitleLarge);
 
@@ -35,7 +47,7 @@ pub fn dialog<'a>(
         .width(Fill),
     )
     .width(Fill)
-    .max_width(palette.metrics.dialog_width)
+    .max_width(max_width)
     .padding(palette.metrics.dialog_padding)
     .style(move |_| container::Style {
         background: Some(palette.surface_container_high.into()),

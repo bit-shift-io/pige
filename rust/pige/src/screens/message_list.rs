@@ -3,10 +3,11 @@
 use iced::widget::{column, container, scrollable};
 use iced::{Element, Fill, Length};
 use pige_core::api::SyncStatus;
+use pige_core::mail::FolderKind;
 
-use crate::app::{App, row_view};
+use crate::app::{App, account_for_folder, avatar_color, format_list_date, initials, row_view};
 use crate::components::elastic_scroll::{self, Policy};
-use crate::components::{self, ButtonVariant, PaneTone};
+use crate::components::{self, ButtonVariant, ListRow, PaneTone};
 use crate::icons;
 use crate::layout::{self, Breakpoint};
 use crate::message::Message;
@@ -48,6 +49,21 @@ pub fn list_pane<'a>(
             .style(palette.scrollable())
             .into();
         pane = pane.push(scroller);
+    } else if drafts_selected(app) {
+        let drafts = selected_drafts(app);
+        if drafts.is_empty() {
+            pane = pane.push(components::empty_state(
+                "No drafts",
+                "Messages you save as drafts appear here.",
+            ));
+        } else {
+            let scroller: Element<'a, Message> = scrollable(draft_rows(&drafts))
+                .width(Fill)
+                .height(Fill)
+                .style(palette.scrollable())
+                .into();
+            pane = pane.push(scroller);
+        }
     } else if app.snapshot.conversations.is_empty() {
         pane = pane.push(components::empty_state(empty_title(app), empty_body(app)));
     } else {
@@ -104,6 +120,78 @@ pub fn list_pane<'a>(
         .height(Fill)
         .style(components::pane_style(PaneTone::Surface))
         .into()
+}
+
+fn selected_folder_kind(app: &App) -> Option<FolderKind> {
+    let id = app.snapshot.selected_folder.as_ref()?;
+    app.snapshot
+        .sections
+        .iter()
+        .flat_map(|section| section.folders.iter())
+        .find(|folder| &folder.id == id)
+        .map(|folder| folder.kind)
+}
+
+fn drafts_selected(app: &App) -> bool {
+    selected_folder_kind(app) == Some(FolderKind::Drafts)
+}
+
+fn selected_drafts(app: &App) -> Vec<&pige_core::send::OutboxEntry> {
+    let account = app
+        .snapshot
+        .selected_folder
+        .as_ref()
+        .and_then(|folder| account_for_folder(&app.snapshot, folder));
+    app.snapshot
+        .drafts
+        .iter()
+        .filter(|draft| match &account {
+            Some(account) => &draft.message.account_id == account,
+            None => true,
+        })
+        .collect()
+}
+
+fn draft_rows<'a>(drafts: &[&'a pige_core::send::OutboxEntry]) -> Element<'a, Message> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let mut rows = column![].spacing(0).width(Fill);
+    for draft in drafts {
+        let recipient = draft
+            .message
+            .to
+            .first()
+            .map(|address| address.display_name())
+            .unwrap_or_else(|| "Draft".to_string());
+        let subject = if draft.message.subject.trim().is_empty() {
+            "(no subject)".to_string()
+        } else {
+            draft.message.subject.clone()
+        };
+        let snippet = draft
+            .message
+            .body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.chars().take(120).collect::<String>())
+            .unwrap_or_default();
+        rows = rows.push(components::list_row(
+            ListRow {
+                initials: initials(&recipient),
+                avatar_color: avatar_color(&recipient),
+                sender: recipient,
+                date: format_list_date(now, draft.updated_at),
+                subject,
+                snippet,
+                unread: false,
+                has_attachment: false,
+                count: 0,
+            },
+            Message::OpenDraft(draft.id.clone()),
+        ));
+    }
+    rows.into()
 }
 
 fn folder_title(app: &App) -> &str {

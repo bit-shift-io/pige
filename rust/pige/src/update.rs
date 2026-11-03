@@ -15,6 +15,7 @@ use crate::app::App;
 use crate::layout::Breakpoint;
 use crate::message::{AccountSaveResult, Message};
 use crate::screens::accounts::{AccountField, TestState};
+use crate::screens::compose::{ComposeSeed, ComposeState};
 
 impl App {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
@@ -284,10 +285,181 @@ impl App {
             },
             Message::Error(error) => self.error = Some(error),
             Message::DismissError => self.error = None,
-            Message::Compose | Message::Settings | Message::Noop => {}
+            Message::Compose => {
+                let account = self.selected_account.clone().or_else(|| {
+                    self.snapshot
+                        .accounts
+                        .first()
+                        .map(|account| account.id.clone())
+                });
+                match account {
+                    Some(account) => {
+                        self.drawer_open = false;
+                        self.accounts_open = false;
+                        self.compose = Some(ComposeState::new(account));
+                    }
+                    None => {
+                        self.error = Some("Add an account before composing.".to_string());
+                    }
+                }
+            }
+            Message::Reply => return self.reply_or_forward(true),
+            Message::Forward => return self.reply_or_forward(false),
+            Message::ComposeLoaded(result) => match result {
+                Ok(seed) => {
+                    self.drawer_open = false;
+                    self.accounts_open = false;
+                    self.compose = Some(ComposeState::from_message(seed.message, seed.id));
+                }
+                Err(error) => self.error = Some(error),
+            },
+            Message::OpenDraft(id) => {
+                return Task::perform(async move { api::draft(&id) }, |result| match result {
+                    Ok(Some(entry)) => Message::ComposeLoaded(Ok(ComposeSeed {
+                        id: Some(entry.id),
+                        message: entry.message,
+                    })),
+                    Ok(None) => Message::Error("Draft was not found.".to_string()),
+                    Err(error) => Message::Error(error),
+                });
+            }
+            Message::ComposeField(field, value) => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.apply_field(field, value);
+                }
+            }
+            Message::ComposeBody(action) => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.body.perform(action);
+                }
+            }
+            Message::ComposeClose => self.compose = None,
+            Message::ComposeSend => {
+                let Some(compose) = self.compose.as_mut() else {
+                    return Task::none();
+                };
+                if compose.busy {
+                    return Task::none();
+                }
+                let message = match compose.outgoing() {
+                    Ok(message) => message,
+                    Err(error) => {
+                        compose.notice = Some(error);
+                        return Task::none();
+                    }
+                };
+                if message.recipients().is_empty() {
+                    compose.notice = Some("Add at least one recipient.".to_string());
+                    return Task::none();
+                }
+                compose.busy = true;
+                compose.notice = None;
+                return Task::perform(api::send_mail(message), Message::ComposeSent);
+            }
+            Message::ComposeSent(result) => match result {
+                Ok(outcome) => {
+                    self.apply_snapshot(outcome.snapshot);
+                    self.compose = None;
+                    self.error = Some(if outcome.queued {
+                        "Message queued; it will send when you are online.".to_string()
+                    } else {
+                        "Message sent.".to_string()
+                    });
+                }
+                Err(error) => {
+                    if let Some(compose) = self.compose.as_mut() {
+                        compose.busy = false;
+                        compose.notice = Some(error.clone());
+                    }
+                    self.error = Some(error);
+                }
+            },
+            Message::ComposeSaveDraft => {
+                let Some(compose) = self.compose.as_mut() else {
+                    return Task::none();
+                };
+                if compose.busy {
+                    return Task::none();
+                }
+                let message = match compose.outgoing() {
+                    Ok(message) => message,
+                    Err(error) => {
+                        compose.notice = Some(error);
+                        return Task::none();
+                    }
+                };
+                let id = compose.id.clone();
+                compose.busy = true;
+                compose.notice = None;
+                return match id {
+                    Some(id) => Task::perform(
+                        async move {
+                            api::update_draft(&id, message)?;
+                            Ok(id)
+                        },
+                        Message::ComposeSaved,
+                    ),
+                    None => Task::perform(
+                        async move { api::save_draft(message) },
+                        Message::ComposeSaved,
+                    ),
+                };
+            }
+            Message::ComposeSaved(result) => match result {
+                Ok(_) => {
+                    self.compose = None;
+                    self.error = Some("Draft saved.".to_string());
+                }
+                Err(error) => {
+                    if let Some(compose) = self.compose.as_mut() {
+                        compose.busy = false;
+                        compose.notice = Some(error.clone());
+                    }
+                    self.error = Some(error);
+                }
+            },
+            Message::ComposeDiscard => {
+                if let Some(compose) = self.compose.take()
+                    && let Some(id) = compose.id
+                {
+                    return Task::perform(
+                        async move { api::discard_draft(&id) },
+                        Message::ComposeDiscarded,
+                    );
+                }
+            }
+            Message::ComposeDiscarded(result) => match result {
+                Ok(snapshot) => self.apply_snapshot(snapshot),
+                Err(error) => self.error = Some(error),
+            },
+            Message::Settings | Message::Noop => {}
         }
 
         Task::none()
+    }
+
+    /// Build a reply or forward prefill from the open conversation.
+    fn reply_or_forward(&mut self, reply: bool) -> Task<Message> {
+        let Some(thread_id) = self
+            .snapshot
+            .selected_conversation
+            .as_ref()
+            .map(|detail| detail.thread_id.clone())
+        else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                if reply {
+                    api::compose_reply(&thread_id)
+                } else {
+                    api::compose_forward(&thread_id)
+                }
+            },
+            |result| {
+                Message::ComposeLoaded(result.map(|message| ComposeSeed { id: None, message }))
+            },
+        )
     }
 
     fn select_folder(&mut self, folder: FolderId) -> Task<Message> {

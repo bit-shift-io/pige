@@ -17,10 +17,17 @@ impl App {
 
         let breakpoint = Breakpoint::from_width(self.size.width);
         let panes = panes(breakpoint, self.drawer_open);
-        let mut root = if self.accounts_open {
+        let base = if self.accounts_open {
             crate::screens::accounts::screen(self)
         } else {
             self.content(breakpoint, panes)
+        };
+        let mut root: Element<'_, Message> = match &self.compose {
+            Some(compose) if breakpoint == Breakpoint::Compact => {
+                crate::screens::compose::screen(self, compose)
+            }
+            Some(compose) => stack![base, crate::screens::compose::modal(self, compose)].into(),
+            None => base,
         };
 
         if self.error.is_some() {

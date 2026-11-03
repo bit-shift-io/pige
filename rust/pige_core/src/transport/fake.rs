@@ -32,12 +32,15 @@ pub struct FakeTransport {
     pub fail_select: HashSet<String>,
     /// Folder names whose `fetch_texts` returns an error (to simulate a retry).
     pub fail_fetch_texts: HashSet<String>,
+    /// Folder names whose `append` returns an error.
+    pub fail_append: HashSet<String>,
 
     pub select_calls: Vec<String>,
     pub fetch_headers_calls: Vec<(String, UidRange)>,
     pub fetch_flags_calls: Vec<(String, Vec<Uid>)>,
     pub fetch_texts_calls: Vec<(String, Vec<Uid>, usize)>,
     pub fetch_body_calls: Vec<(String, Uid)>,
+    pub append_calls: Vec<(String, Vec<u8>, Flags)>,
 
     /// Test hooks for deterministic backfill race tests: `started` receives a
     /// permit when a header fetch begins, and the fetch waits for a permit on
@@ -57,6 +60,7 @@ impl FakeTransport {
         self.fetch_flags_calls.clear();
         self.fetch_texts_calls.clear();
         self.fetch_body_calls.clear();
+        self.append_calls.clear();
     }
 
     fn current_folder(&self) -> Result<String, TransportError> {
@@ -193,10 +197,15 @@ impl MailTransport for FakeTransport {
 
     async fn append(
         &mut self,
-        _folder: &str,
-        _message: &[u8],
-        _flags: Flags,
+        folder: &str,
+        message: &[u8],
+        flags: Flags,
     ) -> Result<(), TransportError> {
+        self.append_calls
+            .push((folder.to_string(), message.to_vec(), flags));
+        if self.fail_append.contains(folder) {
+            return Err(TransportError(format!("append failed for {folder}")));
+        }
         Ok(())
     }
 }

@@ -213,11 +213,18 @@ impl Opener for FakeOpener {
     }
 }
 
-/// A transport for one account that always succeeds. Used by the factory's
-/// default SMTP path; Task 13 may extend it to record sent messages.
-#[derive(Debug, Default)]
+/// A transport for one account that always succeeds and records the raw bytes
+/// it accepted. The factory shares one log so tests can assert sends after a
+/// sync.
+#[derive(Debug, Clone, Default)]
 pub struct FakeSmtp {
-    pub sent: Vec<Vec<u8>>,
+    sent: std::sync::Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl FakeSmtp {
+    pub fn sent(&self) -> Vec<Vec<u8>> {
+        self.sent.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -228,7 +235,7 @@ impl SmtpSender for FakeSmtp {
         _recipients: &[Address],
         raw: &[u8],
     ) -> std::result::Result<(), SendError> {
-        self.sent.push(raw.to_vec());
+        self.sent.lock().unwrap().push(raw.to_vec());
         Ok(())
     }
 }
@@ -342,6 +349,7 @@ pub struct FakeTransportFactory {
     transports: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<FakeTransport>>>>,
     imap_failures: Mutex<HashSet<AccountId>>,
     smtp_failures: Mutex<HashSet<AccountId>>,
+    smtp_sent: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl FakeTransportFactory {
@@ -362,6 +370,20 @@ impl FakeTransportFactory {
 
     pub fn fail_smtp(&self, id: AccountId) {
         self.smtp_failures.lock().unwrap().insert(id);
+    }
+
+    /// Remove a previously scripted SMTP connection failure.
+    pub fn succeed_smtp(&self, id: &AccountId) {
+        self.smtp_failures.lock().unwrap().remove(id);
+    }
+
+    /// Raw messages accepted by the fake SMTP transport, oldest first.
+    pub fn sent_raw(&self) -> Vec<Vec<u8>> {
+        self.smtp_sent.lock().unwrap().clone()
+    }
+
+    pub fn clear_sent(&self) {
+        self.smtp_sent.lock().unwrap().clear();
     }
 
     /// Snapshot of the scripted transport currently registered for `id`,
@@ -392,7 +414,9 @@ impl TransportFactory for FakeTransportFactory {
             if self.smtp_failures.lock().unwrap().contains(&account.id) {
                 return Err(format!("smtp connection failed for {}", account.label));
             }
-            Ok(Box::new(FakeSmtp::default()) as Box<dyn SmtpSender>)
+            Ok(Box::new(FakeSmtp {
+                sent: self.smtp_sent.clone(),
+            }) as Box<dyn SmtpSender>)
         })
     }
 }

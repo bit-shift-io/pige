@@ -17,6 +17,7 @@ use crate::components::elastic_scroll::Motion;
 use crate::components::{FolderKind, FolderView, ListRow};
 use crate::message::Message;
 use crate::screens::accounts::AccountsState;
+use crate::screens::compose::ComposeState;
 use crate::theme;
 
 /// One folder row in an account group, carrying the id navigation needs to
@@ -64,6 +65,8 @@ pub struct App {
     pub accounts_open: bool,
     /// The account list/form/confirmation state.
     pub accounts: AccountsState,
+    /// The open compose surface, if any.
+    pub compose: Option<ComposeState>,
 }
 
 impl App {
@@ -95,6 +98,7 @@ impl App {
                 reader_expanded: false,
                 accounts_open: false,
                 accounts: AccountsState::default(),
+                compose: None,
             },
             open.map(|_| Message::Noop),
         )
