@@ -220,33 +220,7 @@ pub fn build_mime(from: &Address, message: &OutgoingMessage) -> Result<Vec<u8>, 
     let formatted = builder
         .body(message.body.clone())
         .map_err(|error| ComposeError::Build(error.to_string()))?;
-    Ok(normalize_encoded_subject(formatted.formatted()))
-}
-
-/// RFC 2047 charset names are case-insensitive, but `=?UTF-8?` is the spelling
-/// most clients emit and the one interoperability tests expect. lettre emits
-/// lowercase here; normalize only the token so the encoded words stay intact.
-fn normalize_encoded_subject(mut raw: Vec<u8>) -> Vec<u8> {
-    const PREFIX: &[u8] = b"Subject: =?";
-    let mut offset = 0;
-    while let Some(found) = raw[offset..]
-        .windows(PREFIX.len())
-        .position(|window| window.eq_ignore_ascii_case(PREFIX))
-    {
-        let start = offset + found + b"Subject: =?".len();
-        let end = raw[start..]
-            .iter()
-            .position(|byte| *byte == b'?')
-            .map(|length| start + length);
-        if let Some(end) = end
-            && raw[start..end].eq_ignore_ascii_case(b"utf-8")
-        {
-            raw[start..end].copy_from_slice(b"UTF-8");
-            break;
-        }
-        offset = start;
-    }
-    raw
+    Ok(formatted.formatted())
 }
 
 fn mailbox(address: &Address) -> Result<Mailbox, ComposeError> {

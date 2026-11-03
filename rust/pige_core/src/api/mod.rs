@@ -1246,15 +1246,25 @@ pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> 
 
     let store = Store::open(database_path(&config.data_dir))
         .map_err(|error| format!("open outbox store: {error}"))?;
-    // Both transports are required: the SMTP sender delivers and the IMAP
-    // connection performs the best-effort Sent APPEND. If either cannot be
-    // opened, the queued row waits for the next sync instead of being marked
-    // failed.
-    if let Ok(mut smtp) = config.transport.smtp(&account).await
-        && let Ok(mut imap) = config.transport.imap(&account).await
-        && let Err(error) = send::flush_outbox(&store, &account, smtp.as_mut(), imap.as_mut()).await
-    {
-        log::warn!("flush outbox for {}: {error}", account.label);
+    // SMTP delivery is the important half. IMAP is only needed for the
+    // best-effort Sent APPEND, so an unreachable IMAP connection must not keep
+    // a message queued when SMTP is available.
+    if let Ok(mut smtp) = config.transport.smtp(&account).await {
+        let result = match config.transport.imap(&account).await {
+            Ok(mut imap) => {
+                send::flush_outbox(&store, &account, smtp.as_mut(), imap.as_mut()).await
+            }
+            Err(error) => {
+                log::warn!(
+                    "IMAP unavailable for {} while sending; appending to Sent later: {error}",
+                    account.label
+                );
+                send::flush_outbox_smtp_only(&store, &account, smtp.as_mut()).await
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("flush outbox for {}: {error}", account.label);
+        }
     }
 
     let entry = store

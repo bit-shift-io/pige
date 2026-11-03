@@ -14,7 +14,7 @@ pub use compose::{
 };
 pub use outbox::{
     OutboxEntry, OutboxId, OutboxReport, OutboxState, discard_draft, drafts, flush_outbox,
-    list_outbox, queue_send, save_draft, update_draft,
+    flush_outbox_smtp_only, list_outbox, queue_send, save_draft, update_draft,
 };
 
 /// A plain-text message ready to be sent. Attachments are intentionally absent

@@ -10,8 +10,8 @@ use pige_core::{
     send::{
         OutboxId, OutboxState, OutgoingMessage,
         outbox::{
-            discard_draft, drafts, flush_outbox, list_outbox, outbox_entry, queue_send, save_draft,
-            update_draft,
+            discard_draft, drafts, flush_outbox, flush_outbox_smtp_only, list_outbox, outbox_entry,
+            queue_send, save_draft, update_draft,
         },
     },
     transport::{FakeTransport, RemoteFolder, SendError, SmtpSender},
@@ -142,6 +142,103 @@ async fn smtp_success_and_append_failure_does_not_resend() {
         .expect("third flush");
     assert_eq!(third.sent, 1);
     assert_eq!(smtp.calls.len(), 1);
+    assert_eq!(
+        outbox_entry(&store, &id).unwrap().unwrap().state,
+        OutboxState::Sent
+    );
+}
+
+#[tokio::test]
+async fn a_mime_error_fails_the_row_instead_of_retrying_forever() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    seed_account(&store);
+
+    // This passes the compose UI's lenient `local@domain` check but is rejected
+    // by lettre/email_address because the local part has consecutive dots.
+    let mut message = message("Bad recipient");
+    message.to = vec![Address::new(None, "ada..b@example.com")];
+    let id = queue_send(&store, message).await.unwrap();
+
+    let mut smtp = RecordingSmtp::default();
+    let mut imap = FakeTransport::default();
+    let report = flush_outbox(&store, &account, &mut smtp, &mut imap)
+        .await
+        .unwrap();
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.queued, 0);
+    assert!(smtp.calls.is_empty());
+    assert!(imap.append_calls.is_empty());
+    let entry = outbox_entry(&store, &id).unwrap().unwrap();
+    assert_eq!(entry.state, OutboxState::Failed);
+    assert!(entry.error.unwrap().contains("invalid address"));
+
+    // A second flush must not retry the terminal row.
+    let report = flush_outbox(&store, &account, &mut smtp, &mut imap)
+        .await
+        .unwrap();
+    assert_eq!(report.failed, 0);
+    assert!(smtp.calls.is_empty());
+}
+
+#[tokio::test]
+async fn an_empty_recipient_message_fails_permanently() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    seed_account(&store);
+
+    let mut message = message("No recipients");
+    message.to.clear();
+    message.cc.clear();
+    message.bcc.clear();
+    let id = queue_send(&store, message).await.unwrap();
+
+    let mut smtp = RecordingSmtp::default();
+    let mut imap = FakeTransport::default();
+    let report = flush_outbox(&store, &account, &mut smtp, &mut imap)
+        .await
+        .unwrap();
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.queued, 0);
+    assert!(smtp.calls.is_empty());
+    let entry = outbox_entry(&store, &id).unwrap().unwrap();
+    assert_eq!(entry.state, OutboxState::Failed);
+    assert!(entry.error.unwrap().contains("no recipients"));
+}
+
+#[tokio::test]
+async fn smtp_alone_delivers_and_leaves_only_the_append_pending() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    seed_account(&store);
+
+    let id = queue_send(&store, message("SMTP only")).await.unwrap();
+    let mut smtp = RecordingSmtp::default();
+    let report = flush_outbox_smtp_only(&store, &account, &mut smtp)
+        .await
+        .unwrap();
+
+    assert_eq!(report.sent_local, 1);
+    assert_eq!(report.errors.len(), 1);
+    assert!(report.errors[0].contains("IMAP is unavailable"));
+    assert_eq!(smtp.calls.len(), 1);
+    let entry = outbox_entry(&store, &id).unwrap().unwrap();
+    assert_eq!(entry.state, OutboxState::SentLocal);
+    assert!(entry.error.unwrap().contains("IMAP is unavailable"));
+
+    // When IMAP returns, the retry appends only; SMTP is not called again.
+    let mut imap = FakeTransport::default();
+    let report = flush_outbox(&store, &account, &mut smtp, &mut imap)
+        .await
+        .unwrap();
+    assert_eq!(report.sent, 1);
+    assert_eq!(smtp.calls.len(), 1);
+    assert_eq!(imap.append_calls.len(), 1);
     assert_eq!(
         outbox_entry(&store, &id).unwrap().unwrap().state,
         OutboxState::Sent
@@ -395,6 +492,25 @@ async fn api_sends_online_and_appends_to_sent_once() {
     // A later sync must not resend or re-append the delivered row.
     api::sync_all().await.unwrap();
     assert_eq!(harness.factory.sent_raw().len(), 1);
+}
+
+#[tokio::test]
+async fn api_reports_a_permanent_mime_failure_instead_of_queueing() {
+    let _guard = API_LOCK.lock().await;
+    let harness = ApiHarness::new();
+    let id = harness.add_account().await;
+    harness.add_transport(&id);
+
+    let mut message = api_message(id.clone());
+    message.to = vec![Address::new(None, "ada..b@example.com")];
+    let error = api::send_mail(message)
+        .await
+        .expect_err("permanent MIME failure");
+    assert!(error.contains("invalid address"), "{error}");
+
+    let entry = harness.store().outbox_items(Some(&id)).unwrap().remove(0);
+    assert_eq!(entry.state, OutboxState::Failed);
+    assert!(entry.error.unwrap().contains("invalid address"));
 }
 
 #[tokio::test]

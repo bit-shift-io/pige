@@ -357,6 +357,14 @@ mod tests {
     }
 
     #[test]
+    fn ui_validation_is_intentionally_lenient_about_domains() {
+        // The core's MIME builder is the final validator. This address passes
+        // the form but lettre rejects the consecutive dots, exercising the outbox's
+        // terminal-failure path.
+        assert!(parse_addresses("ada..b@example.com").is_ok());
+    }
+
+    #[test]
     fn compose_round_trips_addresses_and_body() {
         let message = OutgoingMessage {
             account_id: AccountId("a".into()),

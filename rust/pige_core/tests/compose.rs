@@ -141,7 +141,8 @@ fn mime_is_utf8_plain_text_with_expected_headers() {
     assert!(text.contains("Content-Type: text/plain; charset=utf-8"));
     assert!(text.contains("Content-Transfer-Encoding: "));
     assert!(text.contains("MIME-Version: 1.0"));
-    assert!(text.contains("Subject: =?UTF-8?"));
+    // RFC 2047 charset tokens are case-insensitive; lettre emits lowercase.
+    assert!(text.to_ascii_lowercase().contains("subject: =?utf-8?"));
     assert!(text.contains("From: \"Ada Lovelace\" <ada@example.com>"));
     assert!(text.contains("To: \"Charles Babbage\" <charles@example.com>"));
     assert!(text.contains("Cc: grace@example.com"));

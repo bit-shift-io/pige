@@ -16,15 +16,19 @@
 
 use std::str::FromStr;
 
+use async_trait::async_trait;
 use rusqlite::{Row, params};
 
 use crate::account::{Account, AccountId};
-use crate::mail::{Address, Flags};
+use crate::mail::{Address, Flags, Uid};
 use crate::store::{Store, StoreError};
-use crate::transport::{MailTransport, SendError, SmtpSender};
+use crate::transport::{
+    Capabilities, FlagOp, FolderState, MailTransport, RemoteFolder, RemoteMessage, SendError,
+    SmtpSender, TransportError, UidRange,
+};
 
 use super::OutgoingMessage;
-use super::compose::{ComposeError, build_mime};
+use super::compose::build_mime;
 
 /// Stable identifier for one outbox row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -377,6 +381,27 @@ pub async fn flush_outbox(
     smtp: &mut dyn SmtpSender,
     imap: &mut dyn MailTransport,
 ) -> Result<OutboxReport, SendError> {
+    flush_outbox_inner(store, account, smtp, imap).await
+}
+
+/// Deliver every pending row with SMTP only. The Sent APPEND is best-effort, so
+/// an unreachable IMAP server must not block delivery; accepted rows remain
+/// `SentLocal` until a later flush can append them.
+pub async fn flush_outbox_smtp_only(
+    store: &Store,
+    account: &Account,
+    smtp: &mut dyn SmtpSender,
+) -> Result<OutboxReport, SendError> {
+    let mut imap = UnavailableImap;
+    flush_outbox_inner(store, account, smtp, &mut imap).await
+}
+
+async fn flush_outbox_inner(
+    store: &Store,
+    account: &Account,
+    smtp: &mut dyn SmtpSender,
+    imap: &mut dyn MailTransport,
+) -> Result<OutboxReport, SendError> {
     let from = Address::new(
         Some(account.display_name.clone()).filter(|name| !name.trim().is_empty()),
         account.email.clone(),
@@ -387,7 +412,7 @@ pub async fn flush_outbox(
     for entry in pending {
         match entry.state {
             OutboxState::Queued => {
-                match flush_queued(store, account, &from, smtp, imap, &entry).await {
+                match flush_queued(store, account, &from, smtp, &mut *imap, &entry).await {
                     Ok(Outcome::Sent) => report.sent += 1,
                     Ok(Outcome::SentLocal(error)) => {
                         report.sent_local += 1;
@@ -402,7 +427,7 @@ pub async fn flush_outbox(
                 }
             }
             OutboxState::SentLocal => match entry.raw.as_deref() {
-                Some(raw) => match append_sent(store, account, imap, &entry.id, raw).await {
+                Some(raw) => match append_sent(store, account, &mut *imap, &entry.id, raw).await {
                     Ok(()) => report.sent += 1,
                     Err(message) => {
                         report.sent_local += 1;
@@ -456,7 +481,19 @@ async fn flush_queued(
 ) -> Result<Outcome, SendError> {
     let raw = match &entry.raw {
         Some(raw) => raw.clone(),
-        None => build_mime(from, &entry.message).map_err(compose_error)?,
+        None => match build_mime(from, &entry.message) {
+            Ok(raw) => raw,
+            Err(error) => {
+                // Invalid addresses and missing recipients are permanent: mark
+                // the row failed instead of retrying forever and telling the
+                // user it is merely waiting for a connection.
+                let message = error.to_string();
+                store
+                    .set_outbox_state(&entry.id, OutboxState::Failed, Some(&message))
+                    .map_err(store_error)?;
+                return Ok(Outcome::Failed(message));
+            }
+        },
     };
 
     let recipients = entry
@@ -501,8 +538,9 @@ async fn flush_queued(
 }
 
 /// Best-effort APPEND to the account's Sent folder. No Sent folder means there
-/// is nothing to retry, so the row is considered sent. A failure leaves the row
-/// in `SentLocal` and stores the error for the next flush.
+/// is nothing to retry, so the row is considered sent. A failure, including an
+/// unavailable IMAP connection, leaves the row in `SentLocal` and stores the
+/// error for the next flush.
 async fn append_sent(
     store: &Store,
     account: &Account,
@@ -542,8 +580,87 @@ async fn append_sent(
     }
 }
 
-fn compose_error(error: ComposeError) -> SendError {
-    SendError(error.to_string())
+/// A transport that fails every operation. Used by SMTP-only flushes so the
+/// shared outbox loop can keep the same `&mut dyn MailTransport` signature while
+/// leaving Sent APPENDs pending for a later sync.
+struct UnavailableImap;
+
+const IMAP_UNAVAILABLE: &str =
+    "IMAP is unavailable; the Sent copy will be appended on the next sync";
+
+fn imap_unavailable() -> TransportError {
+    TransportError(IMAP_UNAVAILABLE.to_string())
+}
+
+#[async_trait]
+impl MailTransport for UnavailableImap {
+    async fn capabilities(&mut self) -> Result<Capabilities, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn list_folders(&mut self) -> Result<Vec<RemoteFolder>, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn select(&mut self, _folder: &RemoteFolder) -> Result<FolderState, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn fetch_headers(
+        &mut self,
+        _range: UidRange,
+    ) -> Result<Vec<RemoteMessage>, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn fetch_texts(
+        &mut self,
+        _uids: &[Uid],
+        _max_bytes: usize,
+    ) -> Result<Vec<(Uid, String)>, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn fetch_body(&mut self, _uid: Uid) -> Result<Vec<u8>, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn fetch_flags(&mut self, _uids: &[Uid]) -> Result<Vec<(Uid, Flags)>, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn search(&mut self, _query: &str) -> Result<Vec<Uid>, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn store_flags(&mut self, _uids: &[Uid], _flags: FlagOp) -> Result<(), TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn move_messages(&mut self, _uids: &[Uid], _dest: &str) -> Result<(), TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn archive(
+        &mut self,
+        _uids: &[Uid],
+        _folder: &RemoteFolder,
+    ) -> Result<(), TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn trash(&mut self, _uids: &[Uid], _folder: &RemoteFolder) -> Result<(), TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn append(
+        &mut self,
+        _folder: &str,
+        _message: &[u8],
+        _flags: Flags,
+    ) -> Result<(), TransportError> {
+        Err(imap_unavailable())
+    }
 }
 
 fn store_error(error: StoreError) -> SendError {
