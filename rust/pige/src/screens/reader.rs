@@ -5,8 +5,7 @@
 
 use iced::widget::{column, container, row, scrollable, space};
 use iced::{Alignment, Element, Fill};
-use pige_core::api::ConversationDetail;
-use pige_core::html::{MailDocument, parse_html};
+use pige_core::api::{ConversationDetail, MessageBody};
 
 use crate::app::App;
 use crate::components::{self, ButtonVariant, PaneTone};
@@ -65,37 +64,45 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
             .into();
     };
 
-    // "Load images" bar above the body when remote content is blocked.
-    if latest
-        .body
-        .as_ref()
-        .is_some_and(MailDocument::has_remote_images)
-    {
-        content = content.push(load_images_bar());
-    }
-
-    // Body.
-    if let Some(doc) = &latest.body {
-        let rendered = html_view::render_document(doc, Message::OpenUrl);
-        let mut body = column![].spacing(palette.space.xs).width(Fill);
-        for element in rendered {
-            body = body.push(element);
+    // Body, or a clear state when it is unavailable.
+    match &latest.body {
+        Some(MessageBody::Document(document)) => {
+            if document.has_remote_images() {
+                content = content.push(load_images_bar());
+            }
+            let rendered = html_view::render_document(document, Message::OpenUrl);
+            let mut body = column![].spacing(palette.space.xs).width(Fill);
+            for element in rendered {
+                body = body.push(element);
+            }
+            content = content.push(
+                container(body)
+                    .width(Fill)
+                    .padding([palette.space.xs, palette.space.lg]),
+            );
         }
-        content = content.push(
-            container(body)
+        Some(MessageBody::TooLarge) => {
+            content = content.push(
+                container(components::styled_text(
+                    "This message is too large to display.",
+                    palette.role(TextRole::BodyMedium),
+                    palette.on_surface_variant,
+                ))
                 .width(Fill)
-                .padding([palette.space.xs, palette.space.lg]),
-        );
-    } else {
-        content = content.push(
-            container(components::styled_text(
-                "This message has no readable body, or it could not be loaded.",
-                palette.role(TextRole::BodyMedium),
-                palette.on_surface_variant,
-            ))
-            .width(Fill)
-            .padding(palette.space.lg),
-        );
+                .padding(palette.space.lg),
+            );
+        }
+        None => {
+            content = content.push(
+                container(components::styled_text(
+                    "This message has no readable body, or it could not be loaded.",
+                    palette.role(TextRole::BodyMedium),
+                    palette.on_surface_variant,
+                ))
+                .width(Fill)
+                .padding(palette.space.lg),
+            );
+        }
     }
 
     // Attachment chips placeholder.
@@ -245,71 +252,43 @@ fn earlier_messages<'a>(detail: &'a ConversationDetail, app: &'a App) -> Element
         .into()
 }
 
-/// Re-parse the newest message's raw HTML with remote images allowed. Remote
-/// images have no bytes yet, so they are dropped; this clears the "Load
-/// images" prompt. Pure and unit-tested.
-pub fn load_images(detail: &mut ConversationDetail) {
-    let Some(html) = detail.body_html.clone() else {
-        return;
-    };
-    let document = parse_html(&html, true);
-    if let Some(summary) = detail.messages.first_mut() {
-        summary.body = Some(document);
-    }
-    detail.body_html = None;
+/// Whether the "Load images" bar should show for a body.
+pub fn has_blocked_images(body: &Option<MessageBody>) -> bool {
+    matches!(body, Some(MessageBody::Document(document)) if document.has_remote_images())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pige_core::api::MessageSummary;
-    use pige_core::mail::{Flags, MessageId, ThreadId};
+    use pige_core::html::parse_html;
+    use pige_core::mail::{Flags, MessageId};
 
-    fn detail_with_remote_image() -> ConversationDetail {
-        let html = "<img src='https://tracker.example/p.gif'>";
-        ConversationDetail {
-            thread_id: ThreadId("thread".into()),
-            subject: "Subject".into(),
-            body_html: Some(html.to_string()),
-            messages: vec![MessageSummary {
-                id: MessageId("m1".into()),
-                sender: "Ada".into(),
-                to: String::new(),
-                date: 0,
-                snippet: String::new(),
-                flags: Flags::default(),
-                has_attachments: false,
-                body: Some(parse_html(html, false)),
-            }],
+    fn summary_with_remote_image() -> MessageSummary {
+        MessageSummary {
+            id: MessageId("m1".into()),
+            sender: "Ada".into(),
+            to: String::new(),
+            date: 0,
+            snippet: String::new(),
+            flags: Flags::default(),
+            has_attachments: false,
+            body: Some(MessageBody::Document(parse_html(
+                "<img src='https://tracker.example/p.gif'>",
+                false,
+            ))),
         }
     }
 
     #[test]
-    fn load_images_reparses_and_clears_the_remote_marker() {
-        let mut detail = detail_with_remote_image();
-        assert!(
-            detail.messages[0]
-                .body
-                .as_ref()
-                .unwrap()
-                .has_remote_images()
-        );
-        assert!(detail.body_html.is_some());
+    fn blocked_images_are_detected_only_on_documents() {
+        assert!(has_blocked_images(&summary_with_remote_image().body));
 
-        load_images(&mut detail);
+        let mut plain = summary_with_remote_image();
+        plain.body = Some(MessageBody::Document(parse_html("<p>no images</p>", false)));
+        assert!(!has_blocked_images(&plain.body));
 
-        assert!(detail.body_html.is_none());
-        let body = detail.messages[0].body.as_ref().unwrap();
-        assert!(!body.has_remote_images());
-        assert!(body.is_empty(), "remote images have no bytes to render");
-    }
-
-    #[test]
-    fn load_images_is_a_noop_for_plain_text_bodies() {
-        let mut detail = detail_with_remote_image();
-        detail.body_html = None;
-        let before = detail.messages[0].body.clone();
-        load_images(&mut detail);
-        assert_eq!(detail.messages[0].body, before);
+        assert!(!has_blocked_images(&Some(MessageBody::TooLarge)));
+        assert!(!has_blocked_images(&None));
     }
 }

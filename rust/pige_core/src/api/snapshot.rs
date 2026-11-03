@@ -55,9 +55,15 @@ pub struct ConversationDetail {
     pub thread_id: ThreadId,
     pub subject: String,
     pub messages: Vec<MessageSummary>,
-    /// Raw HTML for the newest message, used to re-parse the body when the
-    /// user opts in to remote images. `None` for plain-text bodies.
-    pub body_html: Option<String>,
+}
+
+/// The body of a message, or why it is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageBody {
+    /// The parsed document, ready to render.
+    Document(MailDocument),
+    /// The raw message exceeds the fetch cap and was not downloaded.
+    TooLarge,
 }
 
 /// One message inside a conversation.
@@ -70,9 +76,9 @@ pub struct MessageSummary {
     pub snippet: String,
     pub flags: Flags,
     pub has_attachments: bool,
-    /// The parsed body for the newest message; earlier messages carry `None`
-    /// so a conversation's ASTs are not duplicated across every row.
-    pub body: Option<MailDocument>,
+    /// The body for the newest message; earlier messages carry `None` so a
+    /// conversation's ASTs are not duplicated across every row.
+    pub body: Option<MessageBody>,
 }
 
 /// Background sync state exposed to the UI.

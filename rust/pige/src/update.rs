@@ -76,8 +76,13 @@ impl App {
                 return Task::batch([open, mark_read]);
             }
             Message::LoadImages => {
-                if let Some(detail) = self.snapshot.selected_conversation.as_mut() {
-                    crate::screens::reader::load_images(detail);
+                let thread_id = self
+                    .snapshot
+                    .selected_conversation
+                    .as_ref()
+                    .map(|detail| detail.thread_id.clone());
+                if let Some(thread_id) = thread_id {
+                    return snapshot_task(async move { api::load_images(&thread_id) });
                 }
             }
             Message::ToggleEarlier => self.reader_expanded = !self.reader_expanded,

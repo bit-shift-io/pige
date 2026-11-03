@@ -423,8 +423,15 @@ fn list_items(node: &Handle, depth: u32, ctx: &mut Ctx) -> Vec<Vec<Block>> {
 
 /// Table rows, descending through `thead`/`tbody`/`tfoot`.
 fn table_rows(node: &Handle, depth: u32, ctx: &mut Ctx) -> Vec<Vec<Vec<Inline>>> {
+    if depth >= MAX_DEPTH {
+        return Vec::new();
+    }
     let mut rows = Vec::new();
     for child in node.children.borrow().iter() {
+        ctx.nodes += 1;
+        if ctx.nodes > MAX_NODES {
+            break;
+        }
         if let NodeData::Element { name, .. } = &child.data {
             let tag = &*name.local;
             if tag == "tr" {

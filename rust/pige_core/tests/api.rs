@@ -11,7 +11,7 @@ use std::time::Duration;
 use pige_core::{
     AccountId, Address, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId, Security,
     ServerConfig, Store, StoredMessage, ThreadId, Uid,
-    api::{self, AccountInput, Config, CoreEvent, DB_FILE_NAME, SyncStatus},
+    api::{self, AccountInput, Config, CoreEvent, DB_FILE_NAME, MessageBody, SyncStatus},
     html::{Block, Inline, MailDocument},
     platform::{
         CredentialStore,
@@ -1041,14 +1041,11 @@ Content-Type: text/html; charset=utf-8\r\n\r\n\
         .expect("selected conversation");
     assert_eq!(detail.messages.len(), 1);
     let body = detail.messages[0].body.as_ref().expect("body present");
-    assert!(!body.is_empty());
-    assert!(mail_doc_text(body).contains("Hello"));
-    assert!(
-        detail
-            .body_html
-            .as_deref()
-            .is_some_and(|html| html.contains("Hello"))
-    );
+    let MessageBody::Document(doc) = body else {
+        panic!("expected a parsed document, got {body:?}");
+    };
+    assert!(!doc.is_empty());
+    assert!(mail_doc_text(doc).contains("Hello"));
 
     // The body was fetched exactly once and then cached.
     let first = harness
@@ -1062,11 +1059,10 @@ Content-Type: text/html; charset=utf-8\r\n\r\n\
     let reopened = api::open_conversation(&ThreadId("thread-body".to_string()))
         .await
         .expect("reopen conversation");
-    assert!(
-        reopened.selected_conversation.unwrap().messages[0]
-            .body
-            .is_some()
-    );
+    assert!(matches!(
+        reopened.selected_conversation.unwrap().messages[0].body,
+        Some(MessageBody::Document(_))
+    ));
     let second = harness
         .factory
         .transport(&account_id)
@@ -1076,6 +1072,54 @@ Content-Type: text/html; charset=utf-8\r\n\r\n\
         second.fetch_body_calls.len(),
         1,
         "second open must read the cached body"
+    );
+}
+
+#[tokio::test]
+async fn oversized_body_is_not_fetched_or_cached() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account_id, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    let mut message = stored_message(&inbox, 1);
+    message.thread_id = ThreadId("thread-huge".to_string());
+    message.header.size = 20 * 1024 * 1024; // 20 MiB, over the 10 MiB cap
+    store.upsert_message(&message).unwrap();
+
+    harness.factory.add_transport(
+        account_id.clone(),
+        inbox_transport(vec![remote_message(1, "huge", "sender@example.com")]),
+    );
+
+    let snapshot = api::open_conversation(&ThreadId("thread-huge".to_string()))
+        .await
+        .expect("open conversation");
+    let detail = snapshot
+        .selected_conversation
+        .as_ref()
+        .expect("selected conversation");
+    assert_eq!(detail.messages[0].body, Some(MessageBody::TooLarge));
+
+    // No fetch was attempted and no body was cached.
+    let transport = harness
+        .factory
+        .transport(&account_id)
+        .await
+        .expect("shared transport");
+    assert!(transport.fetch_body_calls.is_empty());
+    assert!(
+        harness
+            .open_store()
+            .body(&detail.messages[0].id)
+            .unwrap()
+            .is_none()
     );
 }
 

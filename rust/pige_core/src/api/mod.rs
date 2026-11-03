@@ -30,7 +30,7 @@ use crate::transport::{RemoteFolder, UidRange};
 pub use events::{CoreEvent, subscribe};
 pub use snapshot::{
     AccountSection, AccountSummary, ConversationDetail, ConversationSummary, FolderSummary,
-    MessageSummary, ModelSnapshot, SyncStatus,
+    MessageBody, MessageSummary, ModelSnapshot, SyncStatus,
 };
 
 /// Database filename inside [`Config::data_dir`].
@@ -41,6 +41,11 @@ const INITIAL_PAGE: u32 = 300;
 const PAGE_SIZE: u32 = 100;
 /// Headers fetched per folder on a first sync.
 const SYNC_WINDOW: u32 = 300;
+/// The largest raw message body the reader will download, in bytes. Messages
+/// whose cached `RFC822.SIZE` exceeds this cap are opened without a body and
+/// shown a "message too large" state instead of fetching hundreds of MiB.
+/// This is separate from the sanitizer's 2 MiB HTML input cap.
+const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
 
 /// Everything the core needs from the host process. Built once per process by
 /// the desktop or Android shell and handed to [`init`].
@@ -553,11 +558,12 @@ pub async fn load_older_unified() -> Result<ModelSnapshot, String> {
 /// message's body (from cache or through the account's transport), and install
 /// the resulting [`ConversationDetail`] as the selected conversation.
 ///
-/// A missing or unreachable body degrades to `body: None` rather than failing
-/// the whole reader, so the reader always renders its chrome even offline.
+/// A body over [`MAX_BODY_BYTES`] is opened without a fetch and marked
+/// [`MessageBody::TooLarge`]; a missing or unreachable body degrades to
+/// `body: None` so the reader always renders its chrome even offline.
 pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
-    // Phase 1: read the conversation and decide whether the body is cached.
-    let (messages, config, account, folder, cached, events) = {
+    // Phase 1: read the conversation, its cached body, and the fetch decision.
+    let (messages, config, account, folder, cached, too_large, events) = {
         let guard = lock_state();
         let state = guard
             .as_ref()
@@ -587,39 +593,84 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             .store
             .body(&messages[0].id)
             .map_err(|error| format!("read cached body: {error}"))?;
+        let too_large = messages[0].header.size > MAX_BODY_BYTES;
         (
             messages,
             state.config.clone(),
             account,
             folder,
             cached,
+            too_large,
             state.events.clone(),
         )
     };
 
-    // Phase 2: resolve the newest message's body outside the lock.
-    let resolved = match cached {
-        Some(cached) => Some(cached),
-        None => match fetch_and_cache_body(&config, &account, &folder, &messages[0]).await {
-            Ok(body) => Some(body),
+    // Phase 2: fetch raw bytes only when uncached and under the size cap.
+    let fetched = if cached.is_none() && !too_large {
+        match fetch_body_bytes(&config, &account, &folder, &messages[0]).await {
+            Ok(raw) => Some(raw),
             Err(error) => {
                 log::warn!("open conversation {thread_id}: {error}");
                 None
             }
-        },
+        }
+    } else {
+        None
     };
-    let body_doc = resolved.as_ref().and_then(document_from_body);
-    let body_html = resolved.as_ref().and_then(|body| body.html.clone());
-    let detail = build_conversation_detail(thread_id, &messages, body_doc, body_html);
 
-    // Phase 3: install the detail and emit a snapshot.
+    // Phase 3: cache and build the detail under the lock, using the shared
+    // store handle rather than opening a second connection.
     let snapshot = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let body = resolve_body(
+            &state.store,
+            &messages[0].id,
+            cached,
+            fetched.as_deref(),
+            too_large,
+        );
+        let detail = build_conversation_detail(thread_id, &messages, body);
         state.selected_conversation = Some(detail);
         state.build_snapshot()
+    };
+    let _ = events.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot)
+}
+
+/// Re-parse the newest message's cached HTML with remote images allowed. Remote
+/// images have no bytes to fetch, so they are dropped, clearing the "Load
+/// images" prompt.
+pub fn load_images(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
+    let (events, snapshot) = {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let messages = state
+            .store
+            .messages_for_thread(thread_id)
+            .map_err(|error| format!("read conversation: {error}"))?;
+        let Some(newest) = messages.first() else {
+            return Err(format!("unknown conversation {thread_id}"));
+        };
+        if let Some(body) = state
+            .store
+            .body(&newest.id)
+            .map_err(|error| format!("read cached body: {error}"))?
+            && let Some(html) = body.html
+        {
+            let document = parse_html(&html, true);
+            if let Some(detail) = state.selected_conversation.as_mut()
+                && let Some(summary) = detail.messages.first_mut()
+            {
+                summary.body = Some(MessageBody::Document(document));
+            }
+        }
+        let snapshot = state.build_snapshot();
+        (state.events.clone(), snapshot)
     };
     let _ = events.send(CoreEvent::SnapshotChanged);
     Ok(snapshot)
@@ -671,13 +722,13 @@ pub fn open_url(url: &str) -> Result<(), String> {
     state.config.opener.open_url(url)
 }
 
-/// Fetch the raw body of a message and cache its extracted text.
-async fn fetch_and_cache_body(
+/// Fetch the raw bytes of a message through the account's transport.
+async fn fetch_body_bytes(
     config: &Config,
     account: &Account,
     folder: &Folder,
     message: &StoredMessage,
-) -> Result<Body, String> {
+) -> Result<Vec<u8>, String> {
     let mut transport = config
         .transport
         .imap(account)
@@ -692,24 +743,42 @@ async fn fetch_and_cache_body(
         .select(&remote)
         .await
         .map_err(|error| format!("select {}: {error}", folder.name))?;
-    let raw = transport
+    transport
         .fetch_body(message.uid)
         .await
-        .map_err(|error| format!("fetch body {}: {error}", message.uid))?;
+        .map_err(|error| format!("fetch body {}: {error}", message.uid))
+}
 
-    let (html, plain_text) = extract_body_parts(&raw);
-
-    let store = Store::open(database_path(&config.data_dir))
-        .map_err(|error| format!("open body store: {error}"))?;
+/// Resolve the newest message's body: too-large wins, then the cached body,
+/// then a freshly fetched raw message. Fetched bodies with no text are left
+/// uncached so a later retry can succeed.
+fn resolve_body(
+    store: &Store,
+    message_id: &MessageId,
+    cached: Option<Body>,
+    fetched: Option<&[u8]>,
+    too_large: bool,
+) -> Option<MessageBody> {
+    if too_large {
+        return Some(MessageBody::TooLarge);
+    }
+    if let Some(body) = cached {
+        return document_from_body(&body).map(MessageBody::Document);
+    }
+    let raw = fetched?;
+    let (html, plain_text) = extract_body_parts(raw);
     let body = Body {
-        plain_text,
-        html,
+        plain_text: plain_text.clone(),
+        html: html.clone(),
         fetched_at: now_unix(),
     };
-    store
-        .upsert_body(&message.id, &body)
-        .map_err(|error| format!("cache body: {error}"))?;
-    Ok(body)
+    let document = document_from_body(&body);
+    if document.is_some()
+        && let Err(error) = store.upsert_body(message_id, &body)
+    {
+        log::warn!("cache body {message_id}: {error}");
+    }
+    document.map(MessageBody::Document)
 }
 
 /// Extract the HTML and plain-text bodies from a raw RFC 5322 message.
@@ -736,8 +805,7 @@ fn document_from_body(body: &Body) -> Option<MailDocument> {
 fn build_conversation_detail(
     thread_id: &ThreadId,
     messages: &[StoredMessage],
-    body_doc: Option<MailDocument>,
-    body_html: Option<String>,
+    body: Option<MessageBody>,
 ) -> ConversationDetail {
     let subject = messages
         .first()
@@ -754,7 +822,7 @@ fn build_conversation_detail(
             snippet: message.snippet.clone(),
             flags: message.flags,
             has_attachments: message.has_attachments,
-            body: if index == 0 { body_doc.clone() } else { None },
+            body: if index == 0 { body.clone() } else { None },
         })
         .collect();
 
@@ -762,7 +830,6 @@ fn build_conversation_detail(
         thread_id: thread_id.clone(),
         subject,
         messages: summaries,
-        body_html,
     }
 }
 
