@@ -9,9 +9,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::mail::{Address, MessageId, sender_display};
+use crate::search::{SearchHit, SearchScope, fts_query};
 use crate::store::{Store, StoreError};
-
-pub use crate::search::{SearchHit, SearchScope, fts_query};
 
 impl Store {
     /// Search cached mail, newest matching message per conversation first.
@@ -53,8 +52,9 @@ pub(crate) fn search_on(
                  m.subject AS subject,
                  m.from_json AS from_json,
                  m.date AS date,
+                 m.id AS message_id,
                  ROW_NUMBER() OVER (
-                     PARTITION BY f.thread_id ORDER BY m.date DESC, m.uid DESC
+                     PARTITION BY f.thread_id ORDER BY m.date DESC, m.uid DESC, m.id DESC
                  ) AS rank
              FROM message_fts f
              JOIN messages m ON m.id = f.message_id
@@ -65,7 +65,7 @@ pub(crate) fn search_on(
          SELECT thread_id, account_id, subject, from_json, date
          FROM matches
          WHERE rank = 1
-         ORDER BY date DESC, thread_id
+         ORDER BY date DESC, thread_id, message_id DESC
          LIMIT ?4",
     )?;
     let mut rows = stmt.query(params![fts, account, folder, i64::from(limit)])?;
@@ -121,14 +121,19 @@ pub(crate) fn index_message_on(
     let from: Vec<Address> = decode_addresses(&from_json, "messages.from_json")?;
     let to: Vec<Address> = decode_addresses(&to_json, "messages.to_json")?;
     let cc: Vec<Address> = decode_addresses(&cc_json, "messages.cc_json")?;
-    let body: Option<String> = conn
+    let body = conn
         .query_row(
-            "SELECT plain_text FROM bodies WHERE message_id = ?1",
+            "SELECT plain_text, html FROM bodies WHERE message_id = ?1",
             [&message_id.0],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
         )
         .optional()?
-        .flatten();
+        .and_then(|(plain_text, html)| body_search_text(plain_text, html));
 
     conn.execute(
         "INSERT INTO message_fts (
@@ -173,6 +178,17 @@ fn sender_of(from_json: &str) -> Result<String, StoreError> {
         from_json,
         "messages.from_json",
     )?))
+}
+
+/// Prefer the MIME plain-text part; for HTML-only mail, derive visible text
+/// from the same sanitized AST the reader renders. Raw markup is never stored.
+fn body_search_text(plain_text: Option<String>, html: Option<String>) -> Option<String> {
+    plain_text
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            html.map(|html| crate::html::parse_html(&html, false).visible_text())
+                .filter(|text| !text.trim().is_empty())
+        })
 }
 
 fn decode_addresses(raw: &str, field: &'static str) -> Result<Vec<Address>, StoreError> {

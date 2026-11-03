@@ -135,7 +135,12 @@ impl App {
         let completed = query.clone();
         let completed_scope = scope.clone();
         Task::perform(
-            async move { api::search_mail(&query, scope).await },
+            async move {
+                // Coalesce typing bursts; a later keystroke supersedes this
+                // request through the API generation guard.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                api::search_mail(&query, scope).await
+            },
             move |result| Message::SearchResults {
                 query: completed.clone(),
                 scope: completed_scope.clone(),

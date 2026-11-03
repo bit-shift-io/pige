@@ -409,7 +409,13 @@ fn migration_from_v1_creates_fts_and_backfills_existing_mail() {
     // Rewind the database to the v1 shape: no FTS table, version 1 recorded.
     {
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("DROP TABLE message_fts;").unwrap();
+        conn.execute_batch(
+            "DROP TABLE message_fts;
+             DROP TRIGGER IF EXISTS message_fts_message_delete;
+             DROP TRIGGER IF EXISTS message_fts_thread_update;
+             DROP TRIGGER IF EXISTS message_fts_body_delete;",
+        )
+        .unwrap();
         conn.execute(
             "UPDATE meta SET value = '1' WHERE key = 'schema_version'",
             [],
@@ -420,7 +426,6 @@ fn migration_from_v1_creates_fts_and_backfills_existing_mail() {
     let store = Store::open(&db).expect("reopen store");
     store.migrate().expect("migrate v1 to v2");
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 2);
 
     let subject = search(&store, "historical", &SearchScope::AllAccounts, 20).unwrap();
     assert_eq!(subject.len(), 1);
@@ -553,6 +558,63 @@ fn merging_threads_moves_search_hits_to_the_survivor() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].thread_id, ThreadId("thread-winner".into()));
     assert_eq!(hits[0].date, 200);
+}
+
+#[test]
+fn html_only_body_is_searchable_without_indexing_markup() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account("personal", "ada@example.com", 0);
+    store.upsert_account(&account).unwrap();
+    let inbox = folder("inbox", &account.id, "INBOX", FolderKind::Inbox);
+    store.upsert_folder(&inbox).unwrap();
+    let stored = message(
+        &inbox,
+        1,
+        "thread",
+        "HTML issue",
+        "Ada",
+        "ada@example.com",
+        100,
+    );
+    seed_message(&store, &stored);
+
+    store
+        .upsert_body(
+            &stored.id,
+            &Body {
+                plain_text: None,
+                html: Some(
+                    "<p>The <b>visible</b> needle</p><script>hiddenmarker</script>".to_string(),
+                ),
+                fetched_at: 1,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        search(&store, "visible", &SearchScope::AllAccounts, 20)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        search(&store, "needle", &SearchScope::AllAccounts, 20)
+            .unwrap()
+            .len(),
+        1
+    );
+    // Markup and stripped script content are not visible text.
+    assert!(
+        search(&store, "hiddenmarker", &SearchScope::AllAccounts, 20)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        search(&store, "b", &SearchScope::AllAccounts, 20)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

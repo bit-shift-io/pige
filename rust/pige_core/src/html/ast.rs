@@ -22,6 +22,84 @@ impl MailDocument {
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
+
+    /// Plain visible text for search indexing. Walks every nested block and
+    /// inline run, including link labels, list items, quotes, table cells, and
+    /// image alt text. Styling and markup are discarded; this is never raw
+    /// HTML.
+    pub fn visible_text(&self) -> String {
+        let mut parts = Vec::new();
+        for block in &self.blocks {
+            collect_block_text(block, &mut parts);
+        }
+        parts
+            .into_iter()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn collect_block_text(block: &Block, parts: &mut Vec<String>) {
+    match block {
+        Block::Paragraph(inlines)
+        | Block::Heading {
+            content: inlines, ..
+        } => {
+            let text = inline_text(inlines);
+            if !text.trim().is_empty() {
+                parts.push(text);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for block in item {
+                    collect_block_text(block, parts);
+                }
+            }
+        }
+        Block::Quote(blocks) => {
+            for block in blocks {
+                collect_block_text(block, parts);
+            }
+        }
+        Block::Pre(text) => {
+            if !text.trim().is_empty() {
+                parts.push(text.clone());
+            }
+        }
+        Block::Rule => {}
+        Block::Table(rows) => {
+            for row in rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|cell| inline_text(cell))
+                    .filter(|cell| !cell.trim().is_empty())
+                    .collect();
+                if !cells.is_empty() {
+                    parts.push(cells.join(" "));
+                }
+            }
+        }
+        Block::Image { alt, .. } => {
+            if !alt.trim().is_empty() {
+                parts.push(alt.clone());
+            }
+        }
+    }
+}
+
+fn inline_text(inlines: &[Inline]) -> String {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text { text: run, .. } => text.push_str(run),
+            Inline::Link { content, .. } => text.push_str(&inline_text(content)),
+            Inline::Image { alt, .. } => text.push_str(alt),
+        }
+    }
+    text
 }
 
 /// A block-level element in a mail body.
@@ -126,5 +204,62 @@ impl InlineStyle {
             strike: self.strike || other.strike,
             code: self.code || other.code,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(value: &str) -> Inline {
+        Inline::Text {
+            text: value.to_string(),
+            style: InlineStyle::default(),
+        }
+    }
+
+    #[test]
+    fn visible_text_walks_nested_blocks_and_link_labels() {
+        let document = MailDocument {
+            blocks: vec![
+                Block::Heading {
+                    level: 1,
+                    content: vec![text("Report")],
+                },
+                Block::Paragraph(vec![
+                    text("Read the "),
+                    Inline::Link {
+                        content: vec![text("details")],
+                        href: "https://example.com".into(),
+                    },
+                ]),
+                Block::Quote(vec![Block::Paragraph(vec![text("quoted line")])]),
+                Block::List {
+                    ordered: false,
+                    items: vec![vec![Block::Paragraph(vec![text("first item")])]],
+                },
+                Block::Table(vec![vec![vec![text("cell one")], vec![text("cell two")]]]),
+                Block::Pre("preformatted".into()),
+                Block::Image {
+                    src: ImageSource::Remote("https://example.com/x.png".into()),
+                    alt: "chart".into(),
+                },
+                Block::Rule,
+            ],
+        };
+
+        let text = document.visible_text();
+        for expected in [
+            "Report",
+            "Read the details",
+            "quoted line",
+            "first item",
+            "cell one cell two",
+            "preformatted",
+            "chart",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        assert!(!text.contains("https://example.com"));
     }
 }

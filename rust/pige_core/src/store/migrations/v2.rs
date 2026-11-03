@@ -36,7 +36,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS message_fts_body_delete
 AFTER DELETE ON bodies
 BEGIN
-    DELETE FROM message_fts WHERE message_id = old.message_id;
+    UPDATE message_fts SET body = NULL WHERE message_id = old.message_id;
 END;
 "#;
 

@@ -7,9 +7,7 @@ mod folders;
 mod messages;
 mod migrations;
 mod schema;
-pub mod search;
-
-pub use search::{SearchHit, SearchScope, fts_query};
+mod search;
 
 use std::fmt;
 use std::path::Path;

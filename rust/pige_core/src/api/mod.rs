@@ -83,16 +83,48 @@ struct AppState {
     unified_selected: bool,
     conversation_limit: u32,
     selected_conversation: Option<ConversationDetail>,
-    /// Last search query, scope, and results, mirrored into snapshots so a
-    /// CoreEvent refresh can redraw the search screen without repeating work.
-    search_query: String,
-    search_scope: SearchScope,
-    search_results: Vec<SearchHit>,
+    /// Last search query, scope, results, and the generation used to reject
+    /// slower completions from an older query.
+    search: SearchState,
     /// `Some(true/false)` once a server backfill has probed for older mail;
     /// `None` means fall back to comparing the server total with the cache.
     server_more: Option<bool>,
     status: SyncStatus,
     events: broadcast::Sender<CoreEvent>,
+}
+
+/// Search state shared between the API and snapshots. Every new request takes a
+/// generation; only the completion matching the newest generation is committed.
+#[derive(Debug, Default)]
+struct SearchState {
+    generation: u64,
+    query: String,
+    scope: SearchScope,
+    results: Vec<SearchHit>,
+}
+
+impl SearchState {
+    fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    /// Commit a completed search unless a newer one has started.
+    fn complete(
+        &mut self,
+        generation: u64,
+        query: String,
+        scope: SearchScope,
+        results: Vec<SearchHit>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.query = query;
+        self.scope = scope;
+        self.results = results;
+        true
+    }
 }
 
 impl AppState {
@@ -129,9 +161,9 @@ impl AppState {
                     return ModelSnapshot {
                         status: self.status.clone(),
                         unified_selected: self.unified_selected,
-                        search_query: self.search_query.clone(),
-                        search_scope: self.search_scope.clone(),
-                        search_results: self.search_results.clone(),
+                        search_query: self.search.query.clone(),
+                        search_scope: self.search.scope.clone(),
+                        search_results: self.search.results.clone(),
                         ..ModelSnapshot::default()
                     };
                 }
@@ -203,9 +235,9 @@ impl AppState {
             selected_folder,
             conversations,
             selected_conversation: self.selected_conversation.clone(),
-            search_query: self.search_query.clone(),
-            search_scope: self.search_scope.clone(),
-            search_results: self.search_results.clone(),
+            search_query: self.search.query.clone(),
+            search_scope: self.search.scope.clone(),
+            search_results: self.search.results.clone(),
             status: self.status.clone(),
             has_more,
         }
@@ -263,9 +295,7 @@ pub fn init(config: Config) -> Result<(), String> {
         unified_selected: false,
         conversation_limit: INITIAL_PAGE,
         selected_conversation: None,
-        search_query: String::new(),
-        search_scope: SearchScope::AllAccounts,
-        search_results: Vec::new(),
+        search: SearchState::default(),
         server_more: None,
         status: SyncStatus::Idle,
         events: sender.clone(),
@@ -297,12 +327,17 @@ pub fn is_initialized() -> bool {
 /// and announced with [`CoreEvent::SearchChanged`].
 pub async fn search_mail(query: &str, scope: SearchScope) -> Result<Vec<SearchHit>, String> {
     let query = query.trim().to_string();
-    let (data_dir, sender) = {
-        let guard = lock_state();
+    let (data_dir, sender, generation) = {
+        let mut guard = lock_state();
         let state = guard
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
-        (state.config.data_dir.clone(), state.events.clone())
+        let generation = state.search.begin();
+        (
+            state.config.data_dir.clone(),
+            state.events.clone(),
+            generation,
+        )
     };
 
     let hits = if query.is_empty() {
@@ -320,15 +355,17 @@ pub async fn search_mail(query: &str, scope: SearchScope) -> Result<Vec<SearchHi
         .map_err(|error| format!("search task: {error}"))??
     };
 
-    {
+    let applied = {
         let mut guard = lock_state();
-        if let Some(state) = guard.as_mut() {
-            state.search_query = query;
-            state.search_scope = scope;
-            state.search_results = hits.clone();
-        }
+        guard.as_mut().is_some_and(|state| {
+            state
+                .search
+                .complete(generation, query, scope, hits.clone())
+        })
+    };
+    if applied {
+        let _ = sender.send(CoreEvent::SearchChanged);
     }
-    let _ = sender.send(CoreEvent::SearchChanged);
     Ok(hits)
 }
 
@@ -1160,4 +1197,60 @@ fn finish_sync(attempted: usize, outcome: SyncOutcome) -> SyncStatus {
         state.ensure_selection();
     }
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(thread: &str) -> SearchHit {
+        SearchHit {
+            thread_id: ThreadId(thread.into()),
+            account_id: AccountId("account".into()),
+            subject: thread.into(),
+            sender: "sender".into(),
+            date: 1,
+        }
+    }
+
+    #[test]
+    fn an_older_search_completion_cannot_replace_newer_state() {
+        let mut search = SearchState::default();
+        let older = search.begin();
+        let newer = search.begin();
+
+        assert!(!search.complete(
+            older,
+            "older".into(),
+            SearchScope::AllAccounts,
+            vec![hit("older")],
+        ));
+        assert_eq!(search.query, "");
+        assert!(search.results.is_empty());
+
+        assert!(search.complete(
+            newer,
+            "newer".into(),
+            SearchScope::Folder(FolderId("folder".into())),
+            vec![hit("newer")],
+        ));
+        assert_eq!(search.query, "newer");
+        assert_eq!(search.scope, SearchScope::Folder(FolderId("folder".into())));
+        assert_eq!(search.results[0].thread_id, ThreadId("newer".into()));
+    }
+
+    #[test]
+    fn the_latest_search_completion_commits_its_results() {
+        let mut search = SearchState::default();
+        let generation = search.begin();
+
+        assert!(search.complete(
+            generation,
+            "query".into(),
+            SearchScope::AllAccounts,
+            vec![hit("thread")],
+        ));
+        assert_eq!(search.query, "query");
+        assert_eq!(search.results.len(), 1);
+    }
 }

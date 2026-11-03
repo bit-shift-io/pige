@@ -100,11 +100,19 @@ impl App {
     /// place for both event-driven and tick refreshes.
     pub(crate) fn apply_snapshot(&mut self, snapshot: ModelSnapshot) {
         self.selected_account = selection_account(&snapshot);
-        if !self.search.is_empty() && snapshot.search_query == self.search {
+        if snapshot_matches_search(&snapshot, &self.search, &self.search_scope) {
             self.search_results = snapshot.search_results.clone();
         }
         self.snapshot = snapshot;
     }
+}
+
+/// Whether a snapshot describes the current query and scope. Comparing the
+/// trimmed query prevents old result sets from surviving whitespace edits or a
+/// scope-chip change.
+fn snapshot_matches_search(snapshot: &ModelSnapshot, query: &str, scope: &SearchScope) -> bool {
+    let query = query.trim();
+    !query.is_empty() && snapshot.search_query == query && &snapshot.search_scope == scope
 }
 
 /// Open the temporary dev cache and return its first snapshot.
@@ -377,6 +385,7 @@ mod tests {
 
     use pige_core::api::{AccountSection, FolderSummary, ModelSnapshot};
     use pige_core::mail::{FolderId, ThreadId};
+    use pige_core::search::{SearchHit, SearchScope};
 
     #[test]
     fn initials_use_first_and_last_words() {
@@ -519,5 +528,35 @@ mod tests {
         assert!(row.has_attachment);
         assert_eq!(row.count, 3);
         assert!(!row.date.is_empty());
+    }
+
+    #[test]
+    fn snapshots_only_apply_to_the_matching_trimmed_query_and_scope() {
+        let folder = SearchScope::Folder(FolderId("inbox".into()));
+        let snapshot = ModelSnapshot {
+            search_query: "cats".into(),
+            search_scope: folder.clone(),
+            search_results: vec![SearchHit {
+                thread_id: ThreadId("thread".into()),
+                account_id: AccountId("personal".into()),
+                subject: "Cats".into(),
+                sender: "Ada".into(),
+                date: 1,
+            }],
+            ..ModelSnapshot::default()
+        };
+
+        assert!(snapshot_matches_search(&snapshot, "  cats  ", &folder));
+        assert!(!snapshot_matches_search(
+            &snapshot,
+            "cats",
+            &SearchScope::AllAccounts
+        ));
+        assert!(!snapshot_matches_search(&snapshot, "dogs", &folder));
+        assert!(!snapshot_matches_search(
+            &snapshot,
+            "   ",
+            &SearchScope::AllAccounts
+        ));
     }
 }
