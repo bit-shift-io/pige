@@ -17,7 +17,7 @@ class MainActivity : IcedActivity() {
         window.setFormat(PixelFormat.RGBA_8888)
     }
 
-    /// Older back dispatch; IcedActivity handles predictive back through iced.
+    // Older back dispatch; IcedActivity handles predictive back through iced.
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         onBackPressedEvent()
