@@ -413,6 +413,25 @@ children; depth and total node limits prevent pathological messages.
 
 ### UI and layout
 
+The UI is assembled from a small in-repo component kit, the way qlaunch does it,
+not from one-off widgets per screen.
+
+- `theme.rs` is the only source of colours, spacing, radii, typography, and
+  elevation. It resolves a light or dark `Palette` once; components never branch
+  on platform or hardcode a token.
+- `components/` exposes builders with explicit props: `button`, `icon_button`,
+  `text_field`, `search_field`, `chip`, `avatar`, `list_row`, `app_bar`,
+  `snackbar`, `dialog`, `empty_state`, `attachment_chip`, `folder_row`, and
+  `section_header`.
+- Screens compose those builders and contain only layout and state glue. A screen
+  may not hardcode a colour, font size, radius, or spacing value.
+- Custom-drawn pieces iced lacks — measured label, scroll fade, elastic scroll,
+  pull-to-refresh, reorder list — also live in the kit, adapted from qlaunch.
+- Components take plain view-model data, not whole `ModelSnapshot`s, so they are
+  reusable across screens and testable without a renderer.
+- Theme switching swaps the resolved palette; no widget is reimplemented for
+  light or dark.
+
 Breakpoints are in logical points, not physical pixels, with pure helpers in
 `layout.rs`:
 
