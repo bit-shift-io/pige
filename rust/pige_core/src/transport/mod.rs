@@ -2,6 +2,8 @@
 //! to talk to a mail server, plus the scripted in-memory fake used by tests.
 
 pub mod fake;
+pub mod imap;
+pub mod tls;
 
 use async_trait::async_trait;
 
