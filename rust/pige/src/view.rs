@@ -17,7 +17,11 @@ impl App {
 
         let breakpoint = Breakpoint::from_width(self.size.width);
         let panes = panes(breakpoint, self.drawer_open);
-        let mut root = self.content(breakpoint, panes);
+        let mut root = if self.accounts_open {
+            crate::screens::accounts::screen(self)
+        } else {
+            self.content(breakpoint, panes)
+        };
 
         if self.error.is_some() {
             root = stack![root, self.error_overlay()].into();

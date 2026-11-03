@@ -1,5 +1,7 @@
 //! Account configuration: identity, credentials kind, and server endpoints.
 
+pub mod presets;
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};

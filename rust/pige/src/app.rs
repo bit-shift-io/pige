@@ -11,12 +11,12 @@ use pige_core::api::{
     self, ConversationSummary as CoreConversationSummary, FolderSummary, ModelSnapshot,
 };
 use pige_core::mail::{FolderId, FolderKind as CoreFolderKind};
-use pige_core::platform::fake::{FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory};
 use pige_core::search::{SearchHit, SearchScope};
 
 use crate::components::elastic_scroll::Motion;
 use crate::components::{FolderKind, FolderView, ListRow};
 use crate::message::Message;
+use crate::screens::accounts::AccountsState;
 use crate::theme;
 
 /// One folder row in an account group, carrying the id navigation needs to
@@ -60,15 +60,17 @@ pub struct App {
     pub(crate) error: Option<String>,
     /// Whether the reader's earlier-message section is expanded.
     pub(crate) reader_expanded: bool,
+    /// Whether the full-window account screen is showing.
+    pub accounts_open: bool,
+    /// The account list/form/confirmation state.
+    pub accounts: AccountsState,
 }
 
 impl App {
-    /// Build the shell around the process-wide cache.
-    ///
-    /// The platform adapters are temporary: Task 12 replaces them with the
-    /// real Linux keychain, notification and opener implementations. Until
-    /// then a per-process temp directory and the in-memory fakes let the shell
-    /// run without pretending credentials are persisted.
+    /// Build the shell around the process-wide cache. On Linux the core gets
+    /// the Secret Service credential store, `xdg-open`, and real IMAP; other
+    /// targets still use the in-memory adapters until their platform layer
+    /// lands.
     pub fn new() -> (Self, Task<Message>) {
         let (_id, open) = window::open(window::Settings {
             size: Size::new(900.0, 700.0),
@@ -91,6 +93,8 @@ impl App {
                 list_motion: Motion::new(),
                 error: init_error,
                 reader_expanded: false,
+                accounts_open: false,
+                accounts: AccountsState::default(),
             },
             open.map(|_| Message::Noop),
         )
@@ -115,23 +119,13 @@ fn snapshot_matches_search(snapshot: &ModelSnapshot, query: &str, scope: &Search
     !query.is_empty() && snapshot.search_query == query && &snapshot.search_scope == scope
 }
 
-/// Open the temporary dev cache and return its first snapshot.
+/// Open the on-disk cache and return its first snapshot.
 fn initialize_api() -> (ModelSnapshot, Option<String>) {
     if api::is_initialized() {
         return (api::snapshot(), None);
     }
 
-    let root = std::env::temp_dir().join(format!("pige-dev-{}", std::process::id()));
-    let config = api::Config {
-        data_dir: root.join("data"),
-        cache_dir: root.join("cache"),
-        credentials: Arc::new(FakeCredentials::new()),
-        notifier: Arc::new(FakeNotifier::new()),
-        opener: Arc::new(FakeOpener::new()),
-        transport: Arc::new(FakeTransportFactory::new()),
-    };
-
-    match api::init(config) {
+    match api::init(platform_config()) {
         Ok(()) => (api::snapshot(), None),
         Err(error) => {
             log::error!("initialize pige api: {error}");
@@ -141,6 +135,63 @@ fn initialize_api() -> (ModelSnapshot, Option<String>) {
             )
         }
     }
+}
+
+/// The real Linux platform: XDG data/cache directories, Secret Service
+/// passwords, `xdg-open`, and the TLS IMAP transport. SMTP sending is wired by
+/// a later task; the factory reports that clearly instead of pretending.
+#[cfg(target_os = "linux")]
+fn platform_config() -> api::Config {
+    use pige_core::platform::{
+        CredentialStore,
+        linux::{LinuxCredentials, LinuxNotifier, LinuxOpener, LinuxTransportFactory},
+    };
+
+    let credentials: Arc<dyn CredentialStore> = Arc::new(LinuxCredentials::new());
+    api::Config {
+        data_dir: xdg_dir("XDG_DATA_HOME", ".local/share"),
+        cache_dir: xdg_dir("XDG_CACHE_HOME", ".cache"),
+        credentials: credentials.clone(),
+        notifier: Arc::new(LinuxNotifier::new()),
+        opener: Arc::new(LinuxOpener::new()),
+        transport: Arc::new(LinuxTransportFactory::new(credentials)),
+    }
+}
+
+/// Non-Linux targets keep the temporary in-memory adapters until their own
+/// platform layer is implemented. The Android bridge arrives in Task 16.
+#[cfg(not(target_os = "linux"))]
+fn platform_config() -> api::Config {
+    use pige_core::platform::fake::{
+        FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
+    };
+
+    let root = std::env::temp_dir().join(format!("pige-dev-{}", std::process::id()));
+    api::Config {
+        data_dir: root.join("data"),
+        cache_dir: root.join("cache"),
+        credentials: Arc::new(FakeCredentials::new()),
+        notifier: Arc::new(FakeNotifier::new()),
+        opener: Arc::new(FakeOpener::new()),
+        transport: Arc::new(FakeTransportFactory::new()),
+    }
+}
+
+/// Resolve `$XDG_*_HOME/pige`, falling back to the XDG default under `$HOME`.
+/// A process-scoped temp directory keeps the shell usable if `HOME` is unset.
+#[cfg(target_os = "linux")]
+fn xdg_dir(variable: &str, fallback: &str) -> std::path::PathBuf {
+    if let Some(value) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(value).join("pige");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(home).join(fallback).join("pige");
+    }
+    let leaf = fallback.rsplit('/').next().unwrap_or("data");
+    std::env::temp_dir()
+        .join(format!("pige-dev-{}", std::process::id()))
+        .join(leaf)
+        .join("pige")
 }
 
 pub(crate) fn selection_account(snapshot: &ModelSnapshot) -> Option<AccountId> {

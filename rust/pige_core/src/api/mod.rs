@@ -66,6 +66,7 @@ pub struct Config {
 /// User-supplied fields when adding an account. The id and sort order are
 /// assigned by the core; the password goes to the credential store, never to
 /// SQLite.
+#[derive(Debug, Clone)]
 pub struct AccountInput {
     pub label: String,
     pub email: String,
@@ -74,6 +75,73 @@ pub struct AccountInput {
     pub password: String,
     pub imap: ServerConfig,
     pub smtp: ServerConfig,
+}
+
+impl AccountInput {
+    /// Validate the fields needed to create an account. The UI calls this via
+    /// [`test_account`], and `add_account` re-checks it so no shell can bypass
+    /// the rules.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_password(true)
+    }
+
+    /// Edits may leave the password blank to keep the stored secret.
+    fn validate_for_edit(&self) -> Result<(), String> {
+        self.validate_with_password(false)
+    }
+
+    fn validate_with_password(&self, require_password: bool) -> Result<(), String> {
+        if self.label.trim().is_empty() {
+            return Err("Account label is required".to_string());
+        }
+        let email = self.email.trim();
+        if email.is_empty() {
+            return Err("Email address is required".to_string());
+        }
+        let Some((local, domain)) = email.split_once('@') else {
+            return Err("Email address is not valid".to_string());
+        };
+        if local.is_empty() || domain.is_empty() || domain.contains('@') {
+            return Err("Email address is not valid".to_string());
+        }
+        if self.username.trim().is_empty() {
+            return Err("Username is required".to_string());
+        }
+        if require_password && self.password.is_empty() {
+            return Err("Password is required".to_string());
+        }
+        if self.imap.host.trim().is_empty() {
+            return Err("IMAP host is required".to_string());
+        }
+        if self.imap.port == 0 {
+            return Err("IMAP port is required".to_string());
+        }
+        if self.smtp.host.trim().is_empty() {
+            return Err("SMTP host is required".to_string());
+        }
+        if self.smtp.port == 0 {
+            return Err("SMTP port is required".to_string());
+        }
+        Ok(())
+    }
+
+    fn into_account(self, id: AccountId, sort_order: i64) -> Account {
+        Account {
+            id,
+            label: self.label.trim().to_string(),
+            email: self.email.trim().to_string(),
+            display_name: self.display_name.trim().to_string(),
+            username: if self.username.trim().is_empty() {
+                self.email.trim().to_string()
+            } else {
+                self.username.trim().to_string()
+            },
+            imap: self.imap,
+            smtp: self.smtp,
+            auth: AuthKind::Password,
+            sort_order,
+        }
+    }
 }
 
 struct AppState {
@@ -372,6 +440,23 @@ pub async fn search_mail(query: &str, scope: SearchScope) -> Result<Vec<SearchHi
 /// Persist an account and its password. The password is written through the
 /// platform credential store; the SQLite row contains no secret.
 pub async fn add_account(input: AccountInput) -> Result<ModelSnapshot, String> {
+    add_account_inner(input, false).await
+}
+
+/// Add an account whose password can only live for this process. The UI calls
+/// this after [`add_account`] fails with
+/// [`crate::platform::credentials_unavailable`], and must show a warning that
+/// the password will not survive a restart. Nothing is written to SQLite.
+pub async fn add_account_with_session(input: AccountInput) -> Result<ModelSnapshot, String> {
+    add_account_inner(input, true).await
+}
+
+async fn add_account_inner(
+    input: AccountInput,
+    session_only: bool,
+) -> Result<ModelSnapshot, String> {
+    input.validate()?;
+
     let sender;
     let snapshot;
     {
@@ -386,29 +471,12 @@ pub async fn add_account(input: AccountInput) -> Result<ModelSnapshot, String> {
             .map_err(|error| format!("read accounts: {error}"))?
             .len() as i64;
         let id = AccountId::new();
-        let account = Account {
-            id: id.clone(),
-            label: input.label,
-            email: input.email.clone(),
-            display_name: input.display_name,
-            username: if input.username.is_empty() {
-                input.email
-            } else {
-                input.username
-            },
-            imap: input.imap,
-            smtp: input.smtp,
-            auth: AuthKind::Password,
-            sort_order,
-        };
+        let account = input.clone().into_account(id.clone(), sort_order);
 
-        state
-            .config
-            .credentials
-            .set(&id, &input.password)
+        set_secret(state, &id, &input.password, session_only)
             .map_err(|error| format!("store password: {error}"))?;
         if let Err(error) = state.store.upsert_account(&account) {
-            if let Err(rollback) = state.config.credentials.delete(&id) {
+            if let Err(rollback) = delete_secret(state, &id, session_only) {
                 log::error!(
                     "rollback credential for {id} after account insert failure: {rollback}"
                 );
@@ -426,6 +494,247 @@ pub async fn add_account(input: AccountInput) -> Result<ModelSnapshot, String> {
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
     Ok(snapshot)
+}
+
+/// Update an existing account's label, identity, servers, and optionally its
+/// password. An empty password keeps the stored secret.
+pub async fn update_account(id: &AccountId, input: AccountInput) -> Result<ModelSnapshot, String> {
+    update_account_inner(id, input, false).await
+}
+
+/// Session-only counterpart to [`update_account`] for machines without Secret
+/// Service.
+pub async fn update_account_with_session(
+    id: &AccountId,
+    input: AccountInput,
+) -> Result<ModelSnapshot, String> {
+    update_account_inner(id, input, true).await
+}
+
+async fn update_account_inner(
+    id: &AccountId,
+    input: AccountInput,
+    session_only: bool,
+) -> Result<ModelSnapshot, String> {
+    input.validate_for_edit()?;
+
+    let sender;
+    let snapshot;
+    {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+
+        let existing = state
+            .store
+            .accounts()
+            .map_err(|error| format!("read accounts: {error}"))?
+            .into_iter()
+            .find(|account| &account.id == id)
+            .ok_or_else(|| format!("unknown account {id}"))?;
+
+        let previous_secret = if input.password.is_empty() {
+            None
+        } else {
+            state.config.credentials.get(id).ok().flatten()
+        };
+        if !input.password.is_empty() {
+            set_secret(state, id, &input.password, session_only)
+                .map_err(|error| format!("store password: {error}"))?;
+        }
+
+        let account = input.into_account(id.clone(), existing.sort_order);
+        if let Err(error) = state.store.upsert_account(&account) {
+            if let Some(secret) = previous_secret
+                && let Err(rollback) = set_secret(state, id, &secret, session_only)
+            {
+                log::error!(
+                    "rollback credential for {id} after account update failure: {rollback}"
+                );
+                return Err(format!(
+                    "store account: {error}; credential rollback failed: {rollback}"
+                ));
+            }
+            return Err(format!("store account: {error}"));
+        }
+
+        state.ensure_selection();
+        sender = state.events.clone();
+        snapshot = state.build_snapshot();
+    }
+
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot)
+}
+
+/// Change only an account's display label. Labels are presentation data, so
+/// this never touches credentials or cached mail.
+pub async fn rename_account(id: &AccountId, label: &str) -> Result<ModelSnapshot, String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("Account label is required".to_string());
+    }
+
+    let sender;
+    let snapshot;
+    {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let mut account = state
+            .store
+            .accounts()
+            .map_err(|error| format!("read accounts: {error}"))?
+            .into_iter()
+            .find(|account| &account.id == id)
+            .ok_or_else(|| format!("unknown account {id}"))?;
+        account.label = label.to_string();
+        state
+            .store
+            .upsert_account(&account)
+            .map_err(|error| format!("store account: {error}"))?;
+        state.ensure_selection();
+        sender = state.events.clone();
+        snapshot = state.build_snapshot();
+    }
+
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot)
+}
+
+/// Remove an account, its stored password, and every cached row that belongs
+/// to it. The credential is deleted before the SQLite row so a failed removal
+/// never leaves a secret behind for an account the user can no longer see; if
+/// the database delete then fails, the secret is restored.
+pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
+    let sender;
+    let snapshot;
+    {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+
+        state
+            .store
+            .accounts()
+            .map_err(|error| format!("read accounts: {error}"))?
+            .into_iter()
+            .find(|account| &account.id == id)
+            .ok_or_else(|| format!("unknown account {id}"))?;
+
+        let previous_secret = state.config.credentials.get(id).ok().flatten();
+        state
+            .config
+            .credentials
+            .delete(id)
+            .map_err(|error| format!("delete password: {error}"))?;
+        if let Err(error) = state.config.credentials.delete_session(id) {
+            log::warn!("clear session password for {id}: {error}");
+        }
+
+        if let Err(error) = state.store.remove_account(id) {
+            if let Some(secret) = previous_secret
+                && let Err(restore) = state.config.credentials.set(id, &secret)
+                && let Err(session_restore) = state.config.credentials.set_session(id, &secret)
+            {
+                log::error!(
+                    "restore credential for {id} after account removal failure: {restore}; {session_restore}"
+                );
+                return Err(format!(
+                    "remove account: {error}; credential restore failed: {restore}"
+                ));
+            }
+            return Err(format!("remove account: {error}"));
+        }
+
+        // Clear any selection that pointed at the removed account, then pick
+        // the unified inbox again when other accounts remain.
+        let selected_still_exists = match state.selected_folder.as_ref() {
+            Some(folder) => state
+                .store
+                .accounts()
+                .map(|accounts| {
+                    accounts.into_iter().any(|account| {
+                        state.store.folders(&account.id).is_ok_and(|folders| {
+                            folders.iter().any(|candidate| &candidate.id == folder)
+                        })
+                    })
+                })
+                .unwrap_or(false),
+            None => false,
+        };
+        if !selected_still_exists {
+            state.selected_folder = None;
+        }
+        state.selected_conversation = None;
+        state.server_more = None;
+        state.conversation_limit = INITIAL_PAGE;
+        state.ensure_selection();
+
+        sender = state.events.clone();
+        snapshot = state.build_snapshot();
+    }
+
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot)
+}
+
+/// Full configuration for one account, for the account editor. The password is
+/// intentionally absent because it lives only in the credential store.
+pub fn account(id: &AccountId) -> Result<Account, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state
+        .store
+        .accounts()
+        .map_err(|error| format!("read accounts: {error}"))?
+        .into_iter()
+        .find(|account| &account.id == id)
+        .ok_or_else(|| format!("unknown account {id}"))
+}
+
+/// Open a real IMAP connection with the supplied settings and password without
+/// persisting an account. Validation errors and connection failures are both
+/// returned as user-facing strings.
+pub async fn test_account(input: &AccountInput) -> Result<(), String> {
+    input.validate()?;
+    let account = input.clone().into_account(AccountId::new(), 0);
+    let config = {
+        let guard = lock_state();
+        guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?
+            .config
+            .clone()
+    };
+
+    config
+        .transport
+        .imap_with_password(&account, &input.password)
+        .await
+        .map_err(|error| format!("Connection test failed: {error}"))?;
+    Ok(())
+}
+
+fn set_secret(state: &AppState, id: &AccountId, secret: &str, session: bool) -> Result<(), String> {
+    if session {
+        state.config.credentials.set_session(id, secret)
+    } else {
+        state.config.credentials.set(id, secret)
+    }
+}
+
+fn delete_secret(state: &AppState, id: &AccountId, session: bool) -> Result<(), String> {
+    if session {
+        state.config.credentials.delete_session(id)
+    } else {
+        state.config.credentials.delete(id)
+    }
 }
 
 /// Sync every account. One failing account emits an error but never stops the

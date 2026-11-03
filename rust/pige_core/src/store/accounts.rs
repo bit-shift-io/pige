@@ -56,6 +56,15 @@ impl Store {
         let conn = self.connection();
         accounts_on(&conn)
     }
+
+    /// Delete an account and, through `ON DELETE CASCADE`, every folder,
+    /// message, thread, cached body, attachment, and outbox row that belongs to
+    /// it. The FTS triggers remove the account's search entries as messages go.
+    pub fn remove_account(&self, id: &AccountId) -> Result<(), StoreError> {
+        let conn = self.connection();
+        conn.execute("DELETE FROM accounts WHERE id = ?1", [&id.0])?;
+        Ok(())
+    }
 }
 
 pub(crate) fn accounts_on(conn: &Connection) -> Result<Vec<Account>, StoreError> {

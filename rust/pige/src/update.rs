@@ -5,13 +5,16 @@ use std::time::Duration;
 
 use iced::window;
 use iced::{Subscription, Task};
-use pige_core::api::{self, ModelSnapshot};
+use pige_core::account::AccountId;
+use pige_core::api::{self, AccountInput, ModelSnapshot};
 use pige_core::mail::FolderId;
+use pige_core::platform::credentials_unavailable;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::app::App;
 use crate::layout::Breakpoint;
-use crate::message::Message;
+use crate::message::{AccountSaveResult, Message};
+use crate::screens::accounts::{AccountField, TestState};
 
 impl App {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
@@ -110,9 +113,170 @@ impl App {
                     self.error = Some(error);
                 }
             }
+            Message::OpenAccounts => {
+                self.drawer_open = false;
+                self.accounts_open = true;
+                self.accounts.open(&self.snapshot);
+            }
+            Message::AddAccount => {
+                self.drawer_open = false;
+                self.accounts_open = true;
+                self.accounts.open(&self.snapshot);
+                // First run goes straight to the form; afterwards the screen
+                // shows the list so labels and removals are one click away.
+                if self.snapshot.accounts.is_empty() {
+                    self.accounts.start_new();
+                }
+            }
+            Message::CloseAccounts => {
+                self.accounts_open = false;
+                self.accounts.close_form();
+                self.accounts.confirm_remove = None;
+            }
+            Message::AccountNew => self.accounts.start_new(),
+            Message::AccountEdit(id) => match api::account(&id) {
+                Ok(account) => self.accounts.edit(&account),
+                Err(error) => self.error = Some(error),
+            },
+            Message::AccountCancel => self.accounts.close_form(),
+            Message::AccountFieldChanged(field, value) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    let old_email = form.email.clone();
+                    form.apply_field(field, value);
+                    if field == AccountField::Email
+                        && (form.username.is_empty() || form.username == old_email)
+                    {
+                        form.username = form.email.clone();
+                    }
+                }
+            }
+            Message::AccountPresetChanged(preset) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.choose_preset(preset);
+                }
+            }
+            Message::AccountImapSecurityChanged(security) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.imap_security = security;
+                    form.test = TestState::Idle;
+                }
+            }
+            Message::AccountSmtpSecurityChanged(security) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.smtp_security = security;
+                    form.test = TestState::Idle;
+                }
+            }
+            Message::AccountTest => {
+                let Some(form) = self.accounts.form.as_mut() else {
+                    return Task::none();
+                };
+                if form.busy {
+                    return Task::none();
+                }
+                let input = match form.to_input() {
+                    Ok(input) => input,
+                    Err(error) => {
+                        form.test = TestState::Failed(error);
+                        return Task::none();
+                    }
+                };
+                form.busy = true;
+                form.test = TestState::Testing;
+                return Task::perform(
+                    async move { api::test_account(&input).await },
+                    Message::AccountTested,
+                );
+            }
+            Message::AccountTested(result) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.busy = false;
+                    form.test = match result {
+                        Ok(()) => TestState::Passed,
+                        Err(error) => TestState::Failed(error),
+                    };
+                }
+            }
+            Message::AccountSave => {
+                let Some(form) = self.accounts.form.as_mut() else {
+                    return Task::none();
+                };
+                if form.busy {
+                    return Task::none();
+                }
+                let input = match form.to_input() {
+                    Ok(input) => input,
+                    Err(error) => {
+                        form.test = TestState::Failed(error);
+                        return Task::none();
+                    }
+                };
+                let editing = form.editing.clone();
+                form.busy = true;
+                form.test = TestState::Testing;
+                return Task::perform(save_account(editing, input), Message::AccountSaved);
+            }
+            Message::AccountSaved(result) => match result {
+                Ok(result) => {
+                    self.apply_snapshot(result.snapshot);
+                    self.accounts.close_form();
+                    self.accounts_open = false;
+                    if let Some(warning) = result.warning {
+                        self.error = Some(warning);
+                    }
+                }
+                Err(error) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.test = TestState::Failed(error.clone());
+                    }
+                    self.error = Some(error);
+                }
+            },
+            Message::AccountRemove(id) => self.accounts.confirm_remove = Some(id),
+            Message::AccountRemoveConfirmed(id) => {
+                self.accounts.confirm_remove = None;
+                return Task::perform(
+                    async move { api::remove_account(&id).await },
+                    Message::AccountRemoved,
+                );
+            }
+            Message::AccountRemoveCancelled => self.accounts.confirm_remove = None,
+            Message::AccountRemoved(result) => match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    self.accounts.open(&self.snapshot);
+                    self.accounts.notice = Some("Account removed.".to_string());
+                }
+                Err(error) => self.error = Some(error),
+            },
+            Message::AccountLabelDraft(id, value) => {
+                self.accounts.label_drafts.insert(id, value);
+            }
+            Message::AccountLabelCommit(id) => {
+                let Some(label) = self.accounts.label_drafts.get(&id).cloned() else {
+                    return Task::none();
+                };
+                if label.trim().is_empty() {
+                    self.error = Some("Account label is required".to_string());
+                    return Task::none();
+                }
+                return Task::perform(
+                    async move { api::rename_account(&id, &label).await },
+                    Message::AccountLabelRenamed,
+                );
+            }
+            Message::AccountLabelRenamed(result) => match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    self.accounts.open(&self.snapshot);
+                    self.accounts.notice = Some("Account label updated.".to_string());
+                }
+                Err(error) => self.error = Some(error),
+            },
             Message::Error(error) => self.error = Some(error),
             Message::DismissError => self.error = None,
-            Message::Compose | Message::AddAccount | Message::Settings | Message::Noop => {}
+            Message::Compose | Message::Settings | Message::Noop => {}
         }
 
         Task::none()
@@ -156,6 +320,52 @@ impl App {
             iced::time::every(Duration::from_secs(30)).map(|_| Message::Tick),
         ])
     }
+}
+
+/// Test, then create or update, then kick off the first sync. The account is
+/// saved even if the first sync fails, but the failure becomes a warning so the
+/// user knows the mailbox has no mail yet.
+async fn save_account(
+    editing: Option<AccountId>,
+    input: AccountInput,
+) -> Result<AccountSaveResult, String> {
+    api::test_account(&input).await?;
+
+    let mut warning = None;
+    let snapshot = match editing.clone() {
+        Some(id) => match api::update_account(&id, input.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) if credentials_unavailable(&error) => {
+                warning = Some(session_only_warning());
+                api::update_account_with_session(&id, input.clone()).await?
+            }
+            Err(error) => return Err(error),
+        },
+        None => match api::add_account(input.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) if credentials_unavailable(&error) => {
+                warning = Some(session_only_warning());
+                api::add_account_with_session(input.clone()).await?
+            }
+            Err(error) => return Err(error),
+        },
+    };
+
+    let id = editing.or_else(|| snapshot.accounts.last().map(|account| account.id.clone()));
+    if let Some(id) = id
+        && let Err(error) = api::sync_account(&id).await
+    {
+        warning = Some(match warning {
+            Some(warning) => format!("{warning} The first sync failed: {error}"),
+            None => format!("Account saved, but the first sync failed: {error}"),
+        });
+    }
+
+    Ok(AccountSaveResult { snapshot, warning })
+}
+
+fn session_only_warning() -> String {
+    "Secret Service is unavailable. The account password is kept for this session only and will not be saved after pige exits.".to_string()
 }
 
 fn snapshot_task(

@@ -39,7 +39,7 @@ pub use buttons::{ButtonVariant, button, icon_button};
 pub use chips::{attachment_chip, chip, format_size};
 pub use chrome::{app_bar, empty_state, snackbar};
 pub use dialog::dialog;
-pub use fields::{search_field, text_field};
+pub use fields::{password_field, search_field, text_field};
 pub use rows::{FolderKind, FolderView, ListRow, folder_row, list_row, section_header};
 
 /// A collapsible account header: the label, unread roll-up and the account's

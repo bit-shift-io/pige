@@ -24,12 +24,33 @@ pub fn text_field<'a>(
     value: &'a str,
     on_input: impl Fn(String) -> Message + 'a,
 ) -> Element<'a, Message> {
+    field(label, value, false, on_input)
+}
+
+/// The same field with every typed character masked. Used for account
+/// passwords; the value never leaves the UI state except through the API's
+/// credential call.
+pub fn password_field<'a>(
+    label: &str,
+    value: &'a str,
+    on_input: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    field(label, value, true, on_input)
+}
+
+fn field<'a>(
+    label: &str,
+    value: &'a str,
+    secure: bool,
+    on_input: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
     let palette = theme::active();
     let label_style = palette.role(TextRole::LabelMedium);
     let value_style = palette.role(TextRole::BodyLarge);
 
     let input = text_input(label, value)
         .on_input(on_input)
+        .secure(secure)
         .size(value_style.size)
         .line_height(value_style.line_height())
         .font(value_style.font)

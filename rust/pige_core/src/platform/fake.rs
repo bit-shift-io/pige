@@ -17,15 +17,17 @@ use crate::transport::{
     SendError, SmtpSender, TransportError, UidRange,
 };
 
-use super::{CredentialStore, Notifier, Opener, Result, TransportFactory};
+use super::{CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, TransportFactory};
 
 /// In-memory password store.
 #[derive(Debug, Default)]
 pub struct FakeCredentials {
     secrets: Mutex<HashMap<AccountId, String>>,
+    session: Mutex<HashMap<AccountId, String>>,
     deleted: Mutex<Vec<AccountId>>,
     fail_next_set: AtomicBool,
     fail_delete: AtomicBool,
+    unavailable: AtomicBool,
 }
 
 impl FakeCredentials {
@@ -33,14 +35,24 @@ impl FakeCredentials {
         Self::default()
     }
 
-    /// Convenience for tests that inspect what was persisted.
+    /// Convenience for tests that inspect what was persisted, including the
+    /// session-only fallback.
     pub fn secret(&self, id: &AccountId) -> Option<String> {
-        self.secrets.lock().unwrap().get(id).cloned()
+        if let Some(secret) = self.secrets.lock().unwrap().get(id).cloned() {
+            return Some(secret);
+        }
+        self.session.lock().unwrap().get(id).cloned()
     }
 
     /// Make the next `set` call fail.
     pub fn fail_next_set(&self) {
         self.fail_next_set.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every persistent `set`/`get` call report no storage access, as if
+    /// Secret Service were not running. Session fallback still works.
+    pub fn fail_unavailable(&self) {
+        self.unavailable.store(true, Ordering::SeqCst);
     }
 
     /// Make every `delete` call fail.
@@ -51,14 +63,27 @@ impl FakeCredentials {
     pub fn deleted(&self) -> Vec<AccountId> {
         self.deleted.lock().unwrap().clone()
     }
+
+    fn unavailable_error() -> String {
+        CredentialsUnavailable("fake Secret Service is not running".to_string()).into_message()
+    }
 }
 
 impl CredentialStore for FakeCredentials {
     fn get(&self, id: &AccountId) -> Result<Option<String>> {
-        Ok(self.secrets.lock().unwrap().get(id).cloned())
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Ok(self.session.lock().unwrap().get(id).cloned());
+        }
+        if let Some(secret) = self.secrets.lock().unwrap().get(id).cloned() {
+            return Ok(Some(secret));
+        }
+        Ok(self.session.lock().unwrap().get(id).cloned())
     }
 
     fn set(&self, id: &AccountId, secret: &str) -> Result<()> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(Self::unavailable_error());
+        }
         if self.fail_next_set.swap(false, Ordering::SeqCst) {
             return Err("fake credential set failed".to_string());
         }
@@ -75,6 +100,20 @@ impl CredentialStore for FakeCredentials {
             return Err("fake credential delete failed".to_string());
         }
         self.secrets.lock().unwrap().remove(id);
+        self.session.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    fn set_session(&self, id: &AccountId, secret: &str) -> Result<()> {
+        self.session
+            .lock()
+            .unwrap()
+            .insert(id.clone(), secret.to_string());
+        Ok(())
+    }
+
+    fn delete_session(&self, id: &AccountId) -> Result<()> {
+        self.session.lock().unwrap().remove(id);
         Ok(())
     }
 }

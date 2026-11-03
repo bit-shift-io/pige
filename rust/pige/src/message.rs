@@ -4,10 +4,22 @@
 //! describe what happened, never how to reach the network.
 
 use iced::Size;
-use pige_core::account::AccountId;
+use pige_core::account::presets::ProviderPreset;
+use pige_core::account::{AccountId, Security};
 use pige_core::api::ModelSnapshot;
 use pige_core::mail::{FolderId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
+
+use crate::screens::accounts::AccountField;
+
+/// The successful result of saving an account. `warning` carries the
+/// session-only credential notice or a failed first sync; it is shown in the
+/// shell snackbar after the account screen closes.
+#[derive(Debug, Clone)]
+pub struct AccountSaveResult {
+    pub snapshot: ModelSnapshot,
+    pub warning: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 // A snapshot is deliberately passed by value: it is the authoritative view
@@ -53,6 +65,27 @@ pub enum Message {
     Compose,
     AddAccount,
     Settings,
+    /// The account screen is open.
+    OpenAccounts,
+    CloseAccounts,
+    AccountNew,
+    AccountEdit(AccountId),
+    AccountCancel,
+    AccountFieldChanged(AccountField, String),
+    AccountPresetChanged(ProviderPreset),
+    AccountImapSecurityChanged(Security),
+    AccountSmtpSecurityChanged(Security),
+    AccountTest,
+    AccountTested(Result<(), String>),
+    AccountSave,
+    AccountSaved(Result<AccountSaveResult, String>),
+    AccountRemove(AccountId),
+    AccountRemoveConfirmed(AccountId),
+    AccountRemoveCancelled,
+    AccountRemoved(Result<ModelSnapshot, String>),
+    AccountLabelDraft(AccountId, String),
+    AccountLabelCommit(AccountId),
+    AccountLabelRenamed(Result<ModelSnapshot, String>),
     Error(String),
     DismissError,
     Noop,
