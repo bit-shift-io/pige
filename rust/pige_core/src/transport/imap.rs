@@ -3,6 +3,7 @@
 use async_imap::Session;
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::TryStreamExt;
 
 use crate::account::Account;
@@ -17,6 +18,27 @@ use super::tls::{self, TlsStream};
 /// A [`MailTransport`] backed by a live IMAP connection.
 pub struct ImapTransport {
     session: Session<TlsStream>,
+    /// Lazily-fetched raw capability set, cached so commands that need to
+    /// branch on capabilities don't re-send `CAPABILITY` every time.
+    capabilities: Option<async_imap::types::Capabilities>,
+}
+
+impl ImapTransport {
+    /// Fetch the server capabilities once and cache them for the connection.
+    async fn ensure_capabilities(&mut self) -> Result<(), TransportError> {
+        if self.capabilities.is_none() {
+            let capabilities = self.session.capabilities().await.map_err(transport_err)?;
+            self.capabilities = Some(capabilities);
+        }
+        Ok(())
+    }
+
+    /// Whether the cached capability set contains `name`.
+    fn has_capability(&self, name: &str) -> bool {
+        self.capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.has_str(name))
+    }
 }
 
 /// Connect to `account`'s IMAP server using password authentication and the
@@ -32,7 +54,10 @@ pub async fn connect(account: &Account, password: &str) -> Result<ImapTransport,
         .login(username, password)
         .await
         .map_err(|(e, _)| TransportError(format!("login {}: {e}", account.imap.host)))?;
-    Ok(ImapTransport { session })
+    Ok(ImapTransport {
+        session,
+        capabilities: None,
+    })
 }
 
 /// Classify a mailbox from its LIST name and attributes.
@@ -69,10 +94,10 @@ pub fn classify_folder(name: &str, attributes: &[&str]) -> FolderKind {
 #[async_trait]
 impl MailTransport for ImapTransport {
     async fn capabilities(&mut self) -> Result<Capabilities, TransportError> {
-        let capabilities = self.session.capabilities().await.map_err(transport_err)?;
+        self.ensure_capabilities().await?;
         Ok(Capabilities {
-            gmail: capabilities.has_str("X-GM-EXT-1"),
-            move_ext: capabilities.has_str("MOVE"),
+            gmail: self.has_capability("X-GM-EXT-1"),
+            move_ext: self.has_capability("MOVE"),
         })
     }
 
@@ -86,10 +111,13 @@ impl MailTransport for ImapTransport {
 
         let mut folders = Vec::new();
         while let Some(name) = names.try_next().await.map_err(transport_err)? {
+            // Folder names arrive modified-UTF-7 encoded; decode before
+            // classifying or persisting so display and matching are correct.
+            let decoded = decode_modified_utf7(name.name());
             let attributes: Vec<&str> = name.attributes().iter().map(attribute_str).collect();
-            let kind = classify_folder(name.name(), &attributes);
+            let kind = classify_folder(&decoded, &attributes);
             folders.push(RemoteFolder {
-                name: name.name().to_string(),
+                name: decoded,
                 delimiter: name.delimiter().map(str::to_string),
                 kind,
             });
@@ -100,7 +128,7 @@ impl MailTransport for ImapTransport {
     async fn select(&mut self, folder: &RemoteFolder) -> Result<FolderState, TransportError> {
         let mailbox = self
             .session
-            .select(&folder.name)
+            .select(encode_modified_utf7(&folder.name))
             .await
             .map_err(transport_err)?;
         Ok(FolderState {
@@ -124,19 +152,18 @@ impl MailTransport for ImapTransport {
 
         let mut messages = Vec::new();
         while let Some(fetch) = stream.try_next().await.map_err(transport_err)? {
-            let uid = fetch
-                .uid
-                .map(Uid)
-                .ok_or_else(|| TransportError("FETCH response missing UID".to_string()))?;
-            let header_bytes = fetch.header().ok_or_else(|| {
-                TransportError(format!("FETCH response for UID {uid} missing header"))
-            })?;
-            let mut header = crate::mail::parse_header_block(header_bytes)
-                .map_err(|e| TransportError(format!("header parse for UID {uid}: {e}")))?;
+            let Some(uid) = fetch.uid else { continue };
+            let Some(header_bytes) = fetch.header() else {
+                continue;
+            };
+            // One malformed header must not abort the whole batch.
+            let Ok(mut header) = crate::mail::parse_header_block(header_bytes) else {
+                continue;
+            };
             let size = fetch.size.unwrap_or(0);
             header.size = size;
             messages.push(RemoteMessage {
-                uid,
+                uid: Uid(uid),
                 header,
                 flags: flags_from_fetch(&fetch),
                 size,
@@ -240,15 +267,17 @@ impl MailTransport for ImapTransport {
             return Ok(());
         }
         let set = uid_set(uids);
-        if self.capabilities().await?.move_ext {
+        let dest = encode_modified_utf7(dest);
+        self.ensure_capabilities().await?;
+        if self.has_capability("MOVE") {
             self.session
-                .uid_mv(&set, dest)
+                .uid_mv(&set, &dest)
                 .await
                 .map_err(transport_err)?;
         } else {
             // Fall back to COPY + mark deleted + EXPUNGE for servers without MOVE.
             self.session
-                .uid_copy(&set, dest)
+                .uid_copy(&set, &dest)
                 .await
                 .map_err(transport_err)?;
             {
@@ -260,9 +289,24 @@ impl MailTransport for ImapTransport {
                 futures::pin_mut!(store);
                 while store.try_next().await.map_err(transport_err)?.is_some() {}
             }
-            let expunge = self.session.expunge().await.map_err(transport_err)?;
-            futures::pin_mut!(expunge);
-            while expunge.try_next().await.map_err(transport_err)?.is_some() {}
+            // Only a plain EXPUNGE removes every \Deleted message in the
+            // mailbox; with UIDPLUS, scope it to the UIDs we actually moved.
+            match expunge_set(self.has_capability("UIDPLUS"), uids) {
+                Some(set) => {
+                    let expunge = self
+                        .session
+                        .uid_expunge(&set)
+                        .await
+                        .map_err(transport_err)?;
+                    futures::pin_mut!(expunge);
+                    while expunge.try_next().await.map_err(transport_err)?.is_some() {}
+                }
+                None => {
+                    let expunge = self.session.expunge().await.map_err(transport_err)?;
+                    futures::pin_mut!(expunge);
+                    while expunge.try_next().await.map_err(transport_err)?.is_some() {}
+                }
+            }
         }
         Ok(())
     }
@@ -290,7 +334,12 @@ impl MailTransport for ImapTransport {
         let flag_string = flags_to_imap(flags);
         let flag_argument = (!flag_string.is_empty()).then(|| format!("({flag_string})"));
         self.session
-            .append(folder, flag_argument.as_deref(), None, message)
+            .append(
+                encode_modified_utf7(folder),
+                flag_argument.as_deref(),
+                None,
+                message,
+            )
             .await
             .map_err(transport_err)?;
         Ok(())
@@ -308,6 +357,15 @@ fn uid_set(uids: &[Uid]) -> String {
         .map(|uid| uid.0.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Choose the EXPUNGE to use after a copy-then-delete fallback move.
+///
+/// With UIDPLUS the expunge is scoped to exactly the moved UIDs (returned as a
+/// sequence set); without it we must fall back to a plain `EXPUNGE`, which
+/// removes every `\Deleted` message in the mailbox.
+fn expunge_set(uidplus: bool, uids: &[Uid]) -> Option<String> {
+    if uidplus { Some(uid_set(uids)) } else { None }
 }
 
 /// Map async-imap [`Flag`]s into the packed [`Flags`] domain type, ignoring
@@ -366,5 +424,124 @@ fn attribute_str<'a>(attribute: &'a NameAttribute<'_>) -> &'a str {
         NameAttribute::Trash => "\\Trash",
         NameAttribute::Extension(s) => s.as_ref(),
         _ => "",
+    }
+}
+
+/// Decode a mailbox name from RFC 3501/6855 modified UTF-7.
+///
+/// Printable ASCII passes through unchanged; `&-` is a literal `&`; each
+/// `&...-` run is modified BASE64 (`,` for `/`) encoding UTF-16BE code units.
+/// Invalid sequences are kept verbatim rather than corrupting the name.
+fn decode_modified_utf7(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        match after.find('-') {
+            Some(0) => {
+                out.push('&');
+                rest = &after[1..];
+            }
+            Some(end) => {
+                let encoded = &after[..end];
+                match decode_modified_base64(encoded) {
+                    Some(decoded) => out.push_str(&decoded),
+                    None => {
+                        out.push('&');
+                        out.push_str(encoded);
+                        out.push('-');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                out.push_str(after);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Encode a mailbox name into RFC 3501/6855 modified UTF-7 for the wire.
+fn encode_modified_utf7(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut run: Vec<u16> = Vec::new();
+    for ch in input.chars() {
+        if ch == '&' {
+            flush_modified_base64(&mut run, &mut out);
+            out.push_str("&-");
+        } else if matches!(ch, ' '..='~') {
+            flush_modified_base64(&mut run, &mut out);
+            out.push(ch);
+        } else {
+            let mut buf = [0u16; 2];
+            run.extend_from_slice(ch.encode_utf16(&mut buf));
+        }
+    }
+    flush_modified_base64(&mut run, &mut out);
+    out
+}
+
+/// Decode one modified BASE64 run into a UTF-8 string.
+fn decode_modified_base64(encoded: &str) -> Option<String> {
+    let normalized = encoded.replace(',', "/");
+    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(normalized.as_bytes())
+        .ok()?;
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = (0..bytes.len())
+        .step_by(2)
+        .map(|i| u16::from_be_bytes([bytes[i], bytes[i + 1]]))
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
+/// Emit any pending UTF-16 units as a modified BASE64 `&...-` run.
+fn flush_modified_base64(run: &mut Vec<u16>, out: &mut String) {
+    if run.is_empty() {
+        return;
+    }
+    let bytes: Vec<u8> = run.iter().flat_map(|unit| unit.to_be_bytes()).collect();
+    let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes);
+    out.push('&');
+    out.push_str(&encoded.replace('/', ","));
+    out.push('-');
+    run.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_modified_utf7_decodes_german_and_passes_ascii_through() {
+        assert_eq!(decode_modified_utf7("Gel&APY-scht"), "Gelöscht");
+        assert_eq!(decode_modified_utf7("INBOX"), "INBOX");
+        assert_eq!(decode_modified_utf7("A&-B"), "A&B");
+    }
+
+    #[test]
+    fn modified_utf7_round_trips() {
+        for name in ["Gelöscht", "Entwürfe", "🗑️ Trash", "INBOX", "A&B/Ordner"] {
+            assert_eq!(decode_modified_utf7(&encode_modified_utf7(name)), name);
+        }
+    }
+
+    #[test]
+    fn expunge_is_scoped_to_moved_uids_only_with_uidplus() {
+        assert_eq!(
+            expunge_set(true, &[Uid(3), Uid(7)]),
+            Some("3,7".to_string())
+        );
+        assert_eq!(expunge_set(false, &[Uid(3), Uid(7)]), None);
     }
 }

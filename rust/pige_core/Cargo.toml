@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 async-trait = "0.1"
+base64 = "0.23"
 futures = "0.3"
 log = "0.4"
 mail-parser = "1"
