@@ -6,7 +6,7 @@
 use iced::widget::{column, container, row, scrollable, space};
 use iced::{Alignment, Element, Fill};
 use pige_core::account::AccountId;
-use pige_core::api::{self, ConversationDetail, MessageBody};
+use pige_core::api::{self, ConversationDetail, MessageBody, MessageSummary};
 use pige_core::mail::FolderKind;
 use pige_core::transport::Capabilities;
 
@@ -283,8 +283,11 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
         }
     }
 
-    // Attachment chips placeholder.
-    if latest.has_attachments {
+    // One chip per real attachment. Rows cached before attachment metadata was
+    // stored keep the generic chip until their body is fetched again.
+    if !latest.attachments.is_empty() {
+        content = content.push(attachment_chips(latest));
+    } else if latest.has_attachments {
         content = content.push(attachments_placeholder());
     }
 
@@ -384,6 +387,24 @@ fn load_images_bar<'a>() -> Element<'a, Message> {
         .into()
 }
 
+/// One attachment chip per MIME part. Tapping asks the core to download (if
+/// needed), cache, and open the file through the platform opener.
+fn attachment_chips<'a>(message: &'a MessageSummary) -> Element<'a, Message> {
+    let palette = theme::active();
+    let mut chips = column![].spacing(palette.space.xs).width(Fill);
+    for attachment in &message.attachments {
+        chips = chips.push(components::attachment_chip(
+            &attachment.filename,
+            attachment.size,
+            Message::OpenAttachment(message.id.clone(), attachment.part_id.clone()),
+        ));
+    }
+    container(chips)
+        .width(Fill)
+        .padding([palette.space.xs, palette.space.lg])
+        .into()
+}
+
 /// A placeholder row of attachment chips (real attachments land in Task 15).
 fn attachments_placeholder<'a>() -> Element<'a, Message> {
     let palette = theme::active();
@@ -438,7 +459,6 @@ pub fn has_blocked_images(body: &Option<MessageBody>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pige_core::api::MessageSummary;
     use pige_core::html::parse_html;
     use pige_core::mail::{Flags, MessageId};
 
@@ -451,6 +471,7 @@ mod tests {
             snippet: String::new(),
             flags: Flags::default(),
             has_attachments: false,
+            attachments: Vec::new(),
             body: Some(MessageBody::Document(parse_html(
                 "<img src='https://tracker.example/p.gif'>",
                 false,

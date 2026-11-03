@@ -2,6 +2,7 @@
 //! platform-specific code belongs in this module.
 
 pub mod address;
+pub mod attachment;
 pub mod message;
 pub mod parse;
 pub mod thread;
@@ -12,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use address::{Address, sender_display};
+pub use attachment::{
+    AttachmentDisposition, AttachmentError, AttachmentPart, MAX_ATTACHMENT_BYTES, attachment_bytes,
+    cache_attachment, check_attachment_size, extract_attachments, safe_attachment_filename,
+};
 pub use message::{Conversation, Flags, MessageHeader, StoredMessage};
 pub use parse::{ParseError, decode_rfc2047, normalized_subject, parse_flags, parse_header_block};
 pub use thread::ThreadAssigner;

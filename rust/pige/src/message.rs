@@ -7,7 +7,7 @@ use iced::Size;
 use pige_core::account::presets::ProviderPreset;
 use pige_core::account::{Account, AccountId, Security};
 use pige_core::api::ModelSnapshot;
-use pige_core::mail::{FolderId, ThreadId};
+use pige_core::mail::{FolderId, MessageId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
 
@@ -105,6 +105,8 @@ pub enum Message {
     ConfirmDelete,
     /// Open a link from a message body.
     OpenUrl(String),
+    /// Download (if needed) and open one attachment from the reader.
+    OpenAttachment(MessageId, String),
     Compose,
     /// Start a reply or forward from the open conversation.
     Reply,

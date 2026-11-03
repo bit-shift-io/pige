@@ -3,6 +3,7 @@
 //! shape of an existing database.
 
 mod v2;
+mod v3;
 
 use rusqlite::OptionalExtension;
 
@@ -17,7 +18,8 @@ impl Store {
     /// instead of being silently modified.
     ///
     /// Versions are applied stepwise. v1 is the original cache schema; v2 adds
-    /// the FTS5 index and backfills every message already cached.
+    /// the FTS5 index and backfills every message already cached; v3 records
+    /// attachment disposition for the reader's attachment chips.
     pub fn migrate(&self) -> Result<(), StoreError> {
         let mut version = self.existing_schema_version()?.unwrap_or(0);
         if version == SCHEMA_VERSION {
@@ -40,6 +42,10 @@ impl Store {
         if version < 2 {
             v2::apply(&tx)?;
             version = 2;
+        }
+        if version < 3 {
+            v3::apply(&tx)?;
+            version = 3;
         }
 
         debug_assert_eq!(version, SCHEMA_VERSION);

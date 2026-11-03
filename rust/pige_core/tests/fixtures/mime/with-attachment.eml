@@ -1,0 +1,20 @@
+From: Ada Lovelace <ada@example.com>
+To: Grace Hopper <grace@example.com>
+Subject: Quarterly report
+Date: Tue, 03 Nov 2026 10:00:00 +0000
+Message-ID: <report@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="pige-mixed"
+
+--pige-mixed
+Content-Type: text/plain; charset=utf-8
+
+Please find the report attached.
+
+--pige-mixed
+Content-Type: application/pdf; name="report.pdf"
+Content-Disposition: attachment; filename="report.pdf"
+Content-Transfer-Encoding: base64
+
+aGVsbG8gYXR0YWNobWVudAo=
+--pige-mixed--

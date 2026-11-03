@@ -148,6 +148,15 @@ impl App {
                     self.error = Some(error);
                 }
             }
+            Message::OpenAttachment(message, part) => {
+                return Task::perform(
+                    async move { api::open_attachment(&message, &part).await },
+                    |result| match result {
+                        Ok(_) => Message::Noop,
+                        Err(error) => Message::Error(error),
+                    },
+                );
+            }
             Message::OpenAccounts => {
                 self.drawer_open = false;
                 self.accounts_open = true;

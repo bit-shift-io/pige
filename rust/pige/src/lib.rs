@@ -10,6 +10,7 @@ pub mod html_view;
 pub mod icons;
 pub mod layout;
 pub mod message;
+mod platform;
 pub mod screens;
 pub mod theme;
 pub mod update;

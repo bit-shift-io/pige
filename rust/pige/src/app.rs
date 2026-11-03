@@ -1,7 +1,6 @@
 //! Application state and the pure presentation helpers the shell builds on.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iced::window;
@@ -135,7 +134,7 @@ fn initialize_api() -> (ModelSnapshot, Option<String>) {
         return (api::snapshot(), None);
     }
 
-    match api::init(platform_config()) {
+    match api::init(crate::platform::config()) {
         Ok(()) => (api::snapshot(), None),
         Err(error) => {
             log::error!("initialize pige api: {error}");
@@ -145,63 +144,6 @@ fn initialize_api() -> (ModelSnapshot, Option<String>) {
             )
         }
     }
-}
-
-/// The real Linux platform: XDG data/cache directories, Secret Service
-/// passwords, `xdg-open`, and the TLS IMAP transport. SMTP sending is wired by
-/// a later task; the factory reports that clearly instead of pretending.
-#[cfg(target_os = "linux")]
-fn platform_config() -> api::Config {
-    use pige_core::platform::{
-        CredentialStore,
-        linux::{LinuxCredentials, LinuxNotifier, LinuxOpener, LinuxTransportFactory},
-    };
-
-    let credentials: Arc<dyn CredentialStore> = Arc::new(LinuxCredentials::new());
-    api::Config {
-        data_dir: xdg_dir("XDG_DATA_HOME", ".local/share"),
-        cache_dir: xdg_dir("XDG_CACHE_HOME", ".cache"),
-        credentials: credentials.clone(),
-        notifier: Arc::new(LinuxNotifier::new()),
-        opener: Arc::new(LinuxOpener::new()),
-        transport: Arc::new(LinuxTransportFactory::new(credentials)),
-    }
-}
-
-/// Non-Linux targets keep the temporary in-memory adapters until their own
-/// platform layer is implemented. The Android bridge arrives in Task 16.
-#[cfg(not(target_os = "linux"))]
-fn platform_config() -> api::Config {
-    use pige_core::platform::fake::{
-        FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
-    };
-
-    let root = std::env::temp_dir().join(format!("pige-dev-{}", std::process::id()));
-    api::Config {
-        data_dir: root.join("data"),
-        cache_dir: root.join("cache"),
-        credentials: Arc::new(FakeCredentials::new()),
-        notifier: Arc::new(FakeNotifier::new()),
-        opener: Arc::new(FakeOpener::new()),
-        transport: Arc::new(FakeTransportFactory::new()),
-    }
-}
-
-/// Resolve `$XDG_*_HOME/pige`, falling back to the XDG default under `$HOME`.
-/// A process-scoped temp directory keeps the shell usable if `HOME` is unset.
-#[cfg(target_os = "linux")]
-fn xdg_dir(variable: &str, fallback: &str) -> std::path::PathBuf {
-    if let Some(value) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
-        return std::path::PathBuf::from(value).join("pige");
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return std::path::PathBuf::from(home).join(fallback).join("pige");
-    }
-    let leaf = fallback.rsplit('/').next().unwrap_or("data");
-    std::env::temp_dir()
-        .join(format!("pige-dev-{}", std::process::id()))
-        .join(leaf)
-        .join("pige")
 }
 
 pub(crate) fn selection_account(snapshot: &ModelSnapshot) -> Option<AccountId> {

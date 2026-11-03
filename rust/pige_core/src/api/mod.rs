@@ -21,7 +21,8 @@ use tokio::sync::broadcast;
 use crate::account::{Account, AccountId, AuthKind, ServerConfig};
 use crate::html::{MailDocument, parse_html, plain_text_document};
 use crate::mail::{
-    Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner, ThreadId, Uid,
+    AttachmentPart, Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner,
+    ThreadId, Uid, attachment_bytes, cache_attachment, check_attachment_size, extract_attachments,
     sender_display, thread::participants_of,
 };
 use crate::platform::{CredentialStore, Notifier, Opener, TransportFactory};
@@ -1138,7 +1139,15 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             fetched.as_deref(),
             too_large,
         );
-        let detail = build_conversation_detail(thread_id, &account.id, &messages, body);
+        let attachments = match state.store.attachments(&messages[0].id) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                log::warn!("read attachments {}: {error}", messages[0].id);
+                Vec::new()
+            }
+        };
+        let detail =
+            build_conversation_detail(thread_id, &account.id, &messages, body, attachments);
         state.selected_conversation = Some(detail);
         state.build_snapshot()
     };
@@ -1436,6 +1445,125 @@ pub fn open_url(url: &str) -> Result<(), String> {
     state.config.opener.open_url(url)
 }
 
+/// Fetch, cache, and open one attachment through the platform opener.
+///
+/// Cached bytes are reused across opens. The first open fetches the raw
+/// message, extracts the requested part, writes it below
+/// `cache_dir/attachments`, records the metadata and cache path, and only then
+/// hands the file to [`Opener::open_file`]. Parts over
+/// [`crate::mail::MAX_ATTACHMENT_BYTES`] are rejected before they are written.
+pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf, String> {
+    let (config, account, folder, stored_message, stored_part, cached_path) = {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+
+        let stored_message = state
+            .store
+            .message(message)
+            .map_err(|error| format!("read message: {error}"))?
+            .ok_or_else(|| format!("unknown message {message}"))?;
+        let account = find_account(&state.store, &stored_message.account_id)?;
+        let folder = state
+            .store
+            .folders(&account.id)
+            .map_err(|error| format!("read folders: {error}"))?
+            .into_iter()
+            .find(|folder| folder.id == stored_message.folder_id)
+            .ok_or_else(|| "message folder is not cached".to_string())?;
+
+        let stored = state
+            .store
+            .attachment(message, part)
+            .map_err(|error| format!("read attachment: {error}"))?;
+        let cached_path = stored
+            .as_ref()
+            .and_then(|attachment| attachment.cached_path.as_deref())
+            .and_then(|path| verified_cached_attachment(&state.config.cache_dir, path));
+        let stored_part = stored.map(|attachment| attachment.part);
+
+        (
+            state.config.clone(),
+            account,
+            folder,
+            stored_message,
+            stored_part,
+            cached_path,
+        )
+    };
+
+    let path = match cached_path {
+        Some(path) => path,
+        None => {
+            // Reject a previously known oversized part before downloading the
+            // whole message again.
+            if let Some(part) = &stored_part {
+                check_attachment_size(part.size).map_err(|error| error.to_string())?;
+            }
+
+            let raw = fetch_body_bytes(&config, &account, &folder, &stored_message).await?;
+            let parts = extract_attachments(&raw);
+            let part_meta = parts
+                .iter()
+                .find(|candidate| candidate.part_id == part)
+                .cloned()
+                .ok_or_else(|| format!("attachment part {part} is not present in the message"))?;
+            let bytes = attachment_bytes(&raw, &part_meta.part_id).ok_or_else(|| {
+                format!("attachment part {} could not be decoded", part_meta.part_id)
+            })?;
+            check_attachment_size(bytes.len() as u64).map_err(|error| error.to_string())?;
+
+            let path = cache_attachment(&config.cache_dir, message, &part_meta, &bytes)
+                .map_err(|error| error.to_string())?;
+
+            {
+                let guard = lock_state();
+                let state = guard
+                    .as_ref()
+                    .ok_or_else(|| "pige api is not initialized".to_string())?;
+                state
+                    .store
+                    .store_attachments(message, &parts)
+                    .map_err(|error| format!("store attachment metadata: {error}"))?;
+                state
+                    .store
+                    .set_attachment_cached_path(message, &part_meta.part_id, &path)
+                    .map_err(|error| format!("store attachment path: {error}"))?;
+            }
+
+            path
+        }
+    };
+
+    let opener = {
+        let guard = lock_state();
+        guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?
+            .config
+            .opener
+            .clone()
+    };
+    opener.open_file(&path)?;
+    Ok(path)
+}
+
+/// Accept a recorded cache path only when it still resolves to a regular file
+/// below the attachments directory. This keeps a stale or tampered row from
+/// handing an arbitrary file to the platform opener.
+fn verified_cached_attachment(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let root = cache_dir.join("attachments");
+    if !path.starts_with(&root) || !path.is_file() {
+        return None;
+    }
+    let canonical_root = std::fs::canonicalize(&root).ok()?;
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    canonical_path
+        .starts_with(&canonical_root)
+        .then(|| path.to_path_buf())
+}
+
 /// Fetch the raw bytes of a message through the account's transport.
 async fn fetch_body_bytes(
     config: &Config,
@@ -1480,6 +1608,10 @@ fn resolve_body(
         return document_from_body(&body).map(MessageBody::Document);
     }
     let raw = fetched?;
+    let parts = extract_attachments(raw);
+    if let Err(error) = store.store_attachments(message_id, &parts) {
+        log::warn!("cache attachments {message_id}: {error}");
+    }
     let (html, plain_text) = extract_body_parts(raw);
     let body = Body {
         plain_text: plain_text.clone(),
@@ -1521,6 +1653,7 @@ fn build_conversation_detail(
     account_id: &AccountId,
     messages: &[StoredMessage],
     body: Option<MessageBody>,
+    attachments: Vec<AttachmentPart>,
 ) -> ConversationDetail {
     let subject = messages
         .first()
@@ -1536,7 +1669,12 @@ fn build_conversation_detail(
             date: message.header.date,
             snippet: message.snippet.clone(),
             flags: message.flags,
-            has_attachments: message.has_attachments,
+            has_attachments: message.has_attachments || (index == 0 && !attachments.is_empty()),
+            attachments: if index == 0 {
+                attachments.clone()
+            } else {
+                Vec::new()
+            },
             body: if index == 0 { body.clone() } else { None },
         })
         .collect();

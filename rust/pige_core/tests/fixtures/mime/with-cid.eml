@@ -1,0 +1,21 @@
+From: Ada Lovelace <ada@example.com>
+To: Grace Hopper <grace@example.com>
+Subject: Inline logo
+Date: Tue, 03 Nov 2026 10:05:00 +0000
+Message-ID: <logo@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="pige-related"; type="text/html"
+
+--pige-related
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>Hello <img src="cid:logo@example.com" alt="logo"></p></body></html>
+
+--pige-related
+Content-Type: image/png; name="logo.png"
+Content-Disposition: inline; filename="logo.png"
+Content-ID: <logo@example.com>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgo=
+--pige-related--

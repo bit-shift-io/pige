@@ -3,7 +3,7 @@
 
 use crate::account::AccountId;
 use crate::html::MailDocument;
-use crate::mail::{Flags, FolderId, FolderKind, MessageId, ThreadId};
+use crate::mail::{AttachmentPart, Flags, FolderId, FolderKind, MessageId, ThreadId};
 use crate::search::{SearchHit, SearchScope};
 use crate::send::OutboxEntry;
 use crate::transport::Capabilities;
@@ -85,6 +85,9 @@ pub struct MessageSummary {
     pub snippet: String,
     pub flags: Flags,
     pub has_attachments: bool,
+    /// Metadata for the newest message's user-visible attachments, in MIME
+    /// order. Earlier messages carry an empty list until their bodies load.
+    pub attachments: Vec<AttachmentPart>,
     /// The body for the newest message; earlier messages carry `None` so a
     /// conversation's ASTs are not duplicated across every row.
     pub body: Option<MessageBody>,
