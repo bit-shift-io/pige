@@ -5,7 +5,9 @@
 //! the sync worker and under unit tests on every platform.
 
 pub mod account;
+pub mod api;
 pub mod mail;
+pub mod platform;
 pub mod store;
 pub mod sync;
 pub mod transport;
