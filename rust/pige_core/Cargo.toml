@@ -24,7 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 webpki-roots = "0.26"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 rusqlite = { version = "0.41", features = ["bundled"] }

@@ -24,6 +24,7 @@ use super::{CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, T
 pub struct FakeCredentials {
     secrets: Mutex<HashMap<AccountId, String>>,
     session: Mutex<HashMap<AccountId, String>>,
+    session_only: Mutex<HashSet<AccountId>>,
     deleted: Mutex<Vec<AccountId>>,
     fail_next_set: AtomicBool,
     fail_delete: AtomicBool,
@@ -42,6 +43,13 @@ impl FakeCredentials {
             return Some(secret);
         }
         self.session.lock().unwrap().get(id).cloned()
+    }
+
+    /// The persistent half of the fake store, ignoring any session fallback.
+    /// Tests use this to prove an unreachable keyring was not silently
+    /// reported as deleted.
+    pub fn persistent_secret(&self, id: &AccountId) -> Option<String> {
+        self.secrets.lock().unwrap().get(id).cloned()
     }
 
     /// Make the next `set` call fail.
@@ -91,6 +99,8 @@ impl CredentialStore for FakeCredentials {
             .lock()
             .unwrap()
             .insert(id.clone(), secret.to_string());
+        self.session.lock().unwrap().remove(id);
+        self.session_only.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -99,12 +109,36 @@ impl CredentialStore for FakeCredentials {
         if self.fail_delete.load(Ordering::SeqCst) {
             return Err("fake credential delete failed".to_string());
         }
-        self.secrets.lock().unwrap().remove(id);
+
+        let was_session_only = self.session_only.lock().unwrap().remove(id);
         self.session.lock().unwrap().remove(id);
+
+        if self.unavailable.load(Ordering::SeqCst) {
+            if was_session_only {
+                return Ok(());
+            }
+            return Err(Self::unavailable_error());
+        }
+
+        self.secrets.lock().unwrap().remove(id);
         Ok(())
     }
 
     fn set_session(&self, id: &AccountId, secret: &str) -> Result<()> {
+        self.session
+            .lock()
+            .unwrap()
+            .insert(id.clone(), secret.to_string());
+        // A persistent secret may already exist for this account (for example
+        // it was stored by an earlier process). Only mark it session-only when
+        // this store knows there is no persistent copy.
+        if !self.secrets.lock().unwrap().contains_key(id) {
+            self.session_only.lock().unwrap().insert(id.clone());
+        }
+        Ok(())
+    }
+
+    fn set_transient(&self, id: &AccountId, secret: &str) -> Result<()> {
         self.session
             .lock()
             .unwrap()
@@ -114,6 +148,7 @@ impl CredentialStore for FakeCredentials {
 
     fn delete_session(&self, id: &AccountId) -> Result<()> {
         self.session.lock().unwrap().remove(id);
+        self.session_only.lock().unwrap().remove(id);
         Ok(())
     }
 }

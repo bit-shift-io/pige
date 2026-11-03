@@ -66,7 +66,7 @@ pub struct Config {
 /// User-supplied fields when adding an account. The id and sort order are
 /// assigned by the core; the password goes to the credential store, never to
 /// SQLite.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AccountInput {
     pub label: String,
     pub email: String,
@@ -75,6 +75,21 @@ pub struct AccountInput {
     pub password: String,
     pub imap: ServerConfig,
     pub smtp: ServerConfig,
+}
+
+impl std::fmt::Debug for AccountInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountInput")
+            .field("label", &self.label)
+            .field("email", &self.email)
+            .field("display_name", &self.display_name)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("imap", &self.imap)
+            .field("smtp", &self.smtp)
+            .finish()
+    }
 }
 
 impl AccountInput {
@@ -440,6 +455,15 @@ pub async fn search_mail(query: &str, scope: SearchScope) -> Result<Vec<SearchHi
 /// Persist an account and its password. The password is written through the
 /// platform credential store; the SQLite row contains no secret.
 pub async fn add_account(input: AccountInput) -> Result<ModelSnapshot, String> {
+    add_account_and_id(input)
+        .await
+        .map(|(_, snapshot)| snapshot)
+}
+
+/// Add an account and return its freshly assigned id alongside the snapshot.
+/// Callers that immediately sync the new account use the id instead of
+/// guessing from list order, which can tie after a removal.
+pub async fn add_account_and_id(input: AccountInput) -> Result<(AccountId, ModelSnapshot), String> {
     add_account_inner(input, false).await
 }
 
@@ -448,35 +472,55 @@ pub async fn add_account(input: AccountInput) -> Result<ModelSnapshot, String> {
 /// [`crate::platform::credentials_unavailable`], and must show a warning that
 /// the password will not survive a restart. Nothing is written to SQLite.
 pub async fn add_account_with_session(input: AccountInput) -> Result<ModelSnapshot, String> {
+    add_account_with_session_and_id(input)
+        .await
+        .map(|(_, snapshot)| snapshot)
+}
+
+/// Session-only counterpart to [`add_account_and_id`].
+pub async fn add_account_with_session_and_id(
+    input: AccountInput,
+) -> Result<(AccountId, ModelSnapshot), String> {
     add_account_inner(input, true).await
 }
 
 async fn add_account_inner(
     input: AccountInput,
     session_only: bool,
-) -> Result<ModelSnapshot, String> {
+) -> Result<(AccountId, ModelSnapshot), String> {
     input.validate()?;
 
     let sender;
-    let snapshot;
+    let result;
     {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
 
-        let sort_order = state
+        let accounts = state
             .store
             .accounts()
-            .map_err(|error| format!("read accounts: {error}"))?
-            .len() as i64;
+            .map_err(|error| format!("read accounts: {error}"))?;
+        // len() can tie after a removal because sort_order is user-editable
+        // data in later tasks. A strict max + 1 keeps new accounts at the end.
+        let sort_order = accounts
+            .iter()
+            .map(|account| account.sort_order)
+            .max()
+            .map_or(0, |maximum| maximum.saturating_add(1));
         let id = AccountId::new();
         let account = input.clone().into_account(id.clone(), sort_order);
+        let target = if session_only {
+            SecretTarget::SessionOnly
+        } else {
+            SecretTarget::Persistent
+        };
 
-        set_secret(state, &id, &input.password, session_only)
+        set_secret(state, &id, &input.password, target)
             .map_err(|error| format!("store password: {error}"))?;
         if let Err(error) = state.store.upsert_account(&account) {
-            if let Err(rollback) = delete_secret(state, &id, session_only) {
+            if let Err(rollback) = delete_secret(state, &id, target) {
                 log::error!(
                     "rollback credential for {id} after account insert failure: {rollback}"
                 );
@@ -489,11 +533,11 @@ async fn add_account_inner(
 
         state.ensure_selection();
         sender = state.events.clone();
-        snapshot = state.build_snapshot();
+        result = (id, state.build_snapshot());
     }
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
-    Ok(snapshot)
+    Ok(result)
 }
 
 /// Update an existing account's label, identity, servers, and optionally its
@@ -534,27 +578,39 @@ async fn update_account_inner(
             .find(|account| &account.id == id)
             .ok_or_else(|| format!("unknown account {id}"))?;
 
-        let previous_secret = if input.password.is_empty() {
-            None
+        let wrote_secret = !input.password.is_empty();
+        let target = if session_only {
+            SecretTarget::Transient
         } else {
-            state.config.credentials.get(id).ok().flatten()
+            SecretTarget::Persistent
         };
-        if !input.password.is_empty() {
-            set_secret(state, id, &input.password, session_only)
+        let previous_secret = if wrote_secret {
+            state.config.credentials.get(id).ok().flatten()
+        } else {
+            None
+        };
+        if wrote_secret {
+            set_secret(state, id, &input.password, target)
                 .map_err(|error| format!("store password: {error}"))?;
         }
 
         let account = input.into_account(id.clone(), existing.sort_order);
         if let Err(error) = state.store.upsert_account(&account) {
-            if let Some(secret) = previous_secret
-                && let Err(rollback) = set_secret(state, id, &secret, session_only)
-            {
-                log::error!(
-                    "rollback credential for {id} after account update failure: {rollback}"
-                );
-                return Err(format!(
-                    "store account: {error}; credential rollback failed: {rollback}"
-                ));
+            if wrote_secret {
+                // Restore the secret we replaced. With no previous secret, the
+                // newly written one must be removed instead of left orphaned.
+                let rollback = match previous_secret {
+                    Some(secret) => set_secret(state, id, &secret, target),
+                    None => delete_secret(state, id, target),
+                };
+                if let Err(rollback) = rollback {
+                    log::error!(
+                        "rollback credential for {id} after account update failure: {rollback}"
+                    );
+                    return Err(format!(
+                        "store account: {error}; credential rollback failed: {rollback}"
+                    ));
+                }
             }
             return Err(format!("store account: {error}"));
         }
@@ -721,19 +777,35 @@ pub async fn test_account(input: &AccountInput) -> Result<(), String> {
     Ok(())
 }
 
-fn set_secret(state: &AppState, id: &AccountId, secret: &str, session: bool) -> Result<(), String> {
-    if session {
-        state.config.credentials.set_session(id, secret)
-    } else {
-        state.config.credentials.set(id, secret)
+#[derive(Clone, Copy)]
+enum SecretTarget {
+    Persistent,
+    /// A brand-new account that never had a persistent secret.
+    SessionOnly,
+    /// A replacement for an existing account while the OS store is down; an
+    /// older persistent secret may still exist and must not be forgotten.
+    Transient,
+}
+
+fn set_secret(
+    state: &AppState,
+    id: &AccountId,
+    secret: &str,
+    target: SecretTarget,
+) -> Result<(), String> {
+    match target {
+        SecretTarget::Persistent => state.config.credentials.set(id, secret),
+        SecretTarget::SessionOnly => state.config.credentials.set_session(id, secret),
+        SecretTarget::Transient => state.config.credentials.set_transient(id, secret),
     }
 }
 
-fn delete_secret(state: &AppState, id: &AccountId, session: bool) -> Result<(), String> {
-    if session {
-        state.config.credentials.delete_session(id)
-    } else {
-        state.config.credentials.delete(id)
+fn delete_secret(state: &AppState, id: &AccountId, target: SecretTarget) -> Result<(), String> {
+    match target {
+        SecretTarget::Persistent => state.config.credentials.delete(id),
+        SecretTarget::SessionOnly | SecretTarget::Transient => {
+            state.config.credentials.delete_session(id)
+        }
     }
 }
 

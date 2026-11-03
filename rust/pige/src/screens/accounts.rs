@@ -47,7 +47,7 @@ pub enum TestState {
 }
 
 /// Form data for adding or editing one account.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AccountForm {
     pub editing: Option<AccountId>,
     pub label: String,
@@ -64,6 +64,29 @@ pub struct AccountForm {
     pub smtp_security: Security,
     pub test: TestState,
     pub busy: bool,
+}
+
+impl std::fmt::Debug for AccountForm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountForm")
+            .field("editing", &self.editing)
+            .field("label", &self.label)
+            .field("email", &self.email)
+            .field("display_name", &self.display_name)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("preset", &self.preset)
+            .field("imap_host", &self.imap_host)
+            .field("imap_port", &self.imap_port)
+            .field("imap_security", &self.imap_security)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_security", &self.smtp_security)
+            .field("test", &self.test)
+            .field("busy", &self.busy)
+            .finish()
+    }
 }
 
 impl AccountForm {
@@ -426,7 +449,7 @@ fn form_view<'a>(form: &'a AccountForm) -> Element<'a, Message> {
             Message::AccountFieldChanged(AccountField::Username, value)
         }),
         components::password_field("Password", &form.password, |value| {
-            Message::AccountFieldChanged(AccountField::Password, value)
+            Message::AccountPasswordChanged(crate::message::Password::new(value))
         }),
         styled(
             if form.editing.is_some() {

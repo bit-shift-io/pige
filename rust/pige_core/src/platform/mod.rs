@@ -59,6 +59,14 @@ pub trait CredentialStore: Send + Sync {
         Err("this credential store does not support session-only passwords".to_string())
     }
 
+    /// Store a process-memory secret without marking the account as having no
+    /// persistent credential. Used when editing an existing account while the
+    /// OS store is unavailable: an older persistent secret may still exist, so
+    /// removal must not treat the account as session-only.
+    fn set_transient(&self, id: &AccountId, secret: &str) -> Result<()> {
+        self.set_session(id, secret)
+    }
+
     fn delete_session(&self, id: &AccountId) -> Result<()> {
         let _ = id;
         Ok(())

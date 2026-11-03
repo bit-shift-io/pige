@@ -134,7 +134,10 @@ impl App {
                 self.accounts.confirm_remove = None;
             }
             Message::AccountNew => self.accounts.start_new(),
-            Message::AccountEdit(id) => match api::account(&id) {
+            Message::AccountEdit(id) => {
+                return Task::perform(async move { api::account(&id) }, Message::AccountLoaded);
+            }
+            Message::AccountLoaded(result) => match result {
                 Ok(account) => self.accounts.edit(&account),
                 Err(error) => self.error = Some(error),
             },
@@ -148,6 +151,11 @@ impl App {
                     {
                         form.username = form.email.clone();
                     }
+                }
+            }
+            Message::AccountPasswordChanged(password) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.apply_field(AccountField::Password, password.into_inner());
                 }
             }
             Message::AccountPresetChanged(preset) => {
@@ -332,29 +340,29 @@ async fn save_account(
     api::test_account(&input).await?;
 
     let mut warning = None;
-    let snapshot = match editing.clone() {
-        Some(id) => match api::update_account(&id, input.clone()).await {
-            Ok(snapshot) => snapshot,
+    let (id, snapshot) = match editing {
+        Some(id) => {
+            let snapshot = match api::update_account(&id, input.clone()).await {
+                Ok(snapshot) => snapshot,
+                Err(error) if credentials_unavailable(&error) => {
+                    warning = Some(session_only_warning());
+                    api::update_account_with_session(&id, input.clone()).await?
+                }
+                Err(error) => return Err(error),
+            };
+            (id, snapshot)
+        }
+        None => match api::add_account_and_id(input.clone()).await {
+            Ok(added) => added,
             Err(error) if credentials_unavailable(&error) => {
                 warning = Some(session_only_warning());
-                api::update_account_with_session(&id, input.clone()).await?
-            }
-            Err(error) => return Err(error),
-        },
-        None => match api::add_account(input.clone()).await {
-            Ok(snapshot) => snapshot,
-            Err(error) if credentials_unavailable(&error) => {
-                warning = Some(session_only_warning());
-                api::add_account_with_session(input.clone()).await?
+                api::add_account_with_session_and_id(input.clone()).await?
             }
             Err(error) => return Err(error),
         },
     };
 
-    let id = editing.or_else(|| snapshot.accounts.last().map(|account| account.id.clone()));
-    if let Some(id) = id
-        && let Err(error) = api::sync_account(&id).await
-    {
+    if let Err(error) = api::sync_account(&id).await {
         warning = Some(match warning {
             Some(warning) => format!("{warning} The first sync failed: {error}"),
             None => format!("Account saved, but the first sync failed: {error}"),

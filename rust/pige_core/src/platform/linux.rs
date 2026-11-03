@@ -1,9 +1,9 @@
 //! Linux platform adapters: Secret Service credentials, `xdg-open`, and the
 //! real IMAP transport. Notifications stay a no-op until Task 17 adds D-Bus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
 use futures::future::BoxFuture;
@@ -30,6 +30,14 @@ pub const SERVICE: &str = "pige";
 pub struct LinuxCredentials {
     service: String,
     session: Mutex<HashMap<AccountId, String>>,
+    /// Accounts this process has successfully read or written through Secret
+    /// Service. They can never be treated as session-only.
+    persistent: Mutex<HashSet<AccountId>>,
+    /// Accounts whose only credential is the in-memory session password. This
+    /// is deliberately separate from having a session string: an account can
+    /// briefly hold both a persistent keyring secret and a session secret, and
+    /// that must never make an unreachable keyring look successfully deleted.
+    session_only: Mutex<HashSet<AccountId>>,
 }
 
 impl LinuxCredentials {
@@ -37,11 +45,25 @@ impl LinuxCredentials {
         Self {
             service: SERVICE.to_string(),
             session: Mutex::new(HashMap::new()),
+            persistent: Mutex::new(HashSet::new()),
+            session_only: Mutex::new(HashSet::new()),
         }
     }
 
     fn session(&self) -> MutexGuard<'_, HashMap<AccountId, String>> {
         self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn persistent(&self) -> MutexGuard<'_, HashSet<AccountId>> {
+        self.persistent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn session_only(&self) -> MutexGuard<'_, HashSet<AccountId>> {
+        self.session_only
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -61,7 +83,10 @@ impl CredentialStore for LinuxCredentials {
     fn get(&self, id: &AccountId) -> Result<Option<String>> {
         match self.entry(id) {
             Ok(entry) => match entry.get_password() {
-                Ok(secret) => Ok(Some(secret)),
+                Ok(secret) => {
+                    self.persistent().insert(id.clone());
+                    Ok(Some(secret))
+                }
                 Err(keyring::Error::NoEntry) => Ok(self.session().get(id).cloned()),
                 Err(keyring::Error::NoStorageAccess(cause)) => {
                     if let Some(secret) = self.session().get(id).cloned() {
@@ -89,23 +114,40 @@ impl CredentialStore for LinuxCredentials {
             .map_err(|error| keyring_error("open keyring entry", error))?;
         entry
             .set_password(secret)
-            .map_err(|error| keyring_error("store password in keyring", error))
+            .map_err(|error| keyring_error("store password in keyring", error))?;
+        // A persistent write supersedes any session fallback for this account.
+        self.persistent().insert(id.clone());
+        self.session().remove(id);
+        self.session_only().remove(id);
+        Ok(())
     }
 
     fn delete(&self, id: &AccountId) -> Result<()> {
-        let removed = self.session().remove(id);
+        let known_persistent = self.persistent().contains(id);
+        let was_session_only = self.session_only().remove(id) && !known_persistent;
+        self.session().remove(id);
+
         match self.entry(id) {
             Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                // The session had no Secret Service; deleting the in-memory
-                // secret above is the whole cleanup.
-                Err(keyring::Error::NoStorageAccess(_)) if removed.is_some() => Ok(()),
+                Ok(()) | Err(keyring::Error::NoEntry) => {
+                    self.persistent().remove(id);
+                    Ok(())
+                }
+                // Only an account known to have no persistent entry may be
+                // treated as fully cleaned up while Secret Service is down.
+                Err(keyring::Error::NoStorageAccess(_)) if was_session_only => {
+                    self.persistent().remove(id);
+                    Ok(())
+                }
                 Err(keyring::Error::NoStorageAccess(cause)) => {
                     Err(CredentialsUnavailable(cause.to_string()).into_message())
                 }
                 Err(error) => Err(format!("delete password from keyring: {error}")),
             },
-            Err(keyring::Error::NoStorageAccess(_)) if removed.is_some() => Ok(()),
+            Err(keyring::Error::NoStorageAccess(_)) if was_session_only => {
+                self.persistent().remove(id);
+                Ok(())
+            }
             Err(keyring::Error::NoStorageAccess(cause)) => {
                 Err(CredentialsUnavailable(cause.to_string()).into_message())
             }
@@ -115,11 +157,20 @@ impl CredentialStore for LinuxCredentials {
 
     fn set_session(&self, id: &AccountId, secret: &str) -> Result<()> {
         self.session().insert(id.clone(), secret.to_string());
+        if !self.persistent().contains(id) {
+            self.session_only().insert(id.clone());
+        }
+        Ok(())
+    }
+
+    fn set_transient(&self, id: &AccountId, secret: &str) -> Result<()> {
+        self.session().insert(id.clone(), secret.to_string());
         Ok(())
     }
 
     fn delete_session(&self, id: &AccountId) -> Result<()> {
         self.session().remove(id);
+        self.session_only().remove(id);
         Ok(())
     }
 }
@@ -148,11 +199,19 @@ impl LinuxOpener {
     }
 
     fn open(target: &std::ffi::OsStr) -> Result<()> {
-        Command::new("xdg-open")
+        let mut child = Command::new("xdg-open")
             .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
-            .map(|_child| ())
-            .map_err(|error| format!("xdg-open: {error}"))
+            .map_err(|error| format!("xdg-open: {error}"))?;
+        // Reap the short-lived launcher off the UI thread. Dropping a Child
+        // without waiting would leave a zombie on Unix.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
 }
 

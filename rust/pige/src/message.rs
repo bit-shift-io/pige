@@ -5,7 +5,7 @@
 
 use iced::Size;
 use pige_core::account::presets::ProviderPreset;
-use pige_core::account::{AccountId, Security};
+use pige_core::account::{Account, AccountId, Security};
 use pige_core::api::ModelSnapshot;
 use pige_core::mail::{FolderId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
@@ -19,6 +19,27 @@ use crate::screens::accounts::AccountField;
 pub struct AccountSaveResult {
     pub snapshot: ModelSnapshot,
     pub warning: Option<String>,
+}
+
+/// A password in flight through the update loop. Its `Debug` implementation
+/// never prints the secret, so logging a message cannot leak it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Password(String);
+
+impl Password {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Password(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +91,10 @@ pub enum Message {
     CloseAccounts,
     AccountNew,
     AccountEdit(AccountId),
+    AccountLoaded(Result<Account, String>),
     AccountCancel,
     AccountFieldChanged(AccountField, String),
+    AccountPasswordChanged(Password),
     AccountPresetChanged(ProviderPreset),
     AccountImapSecurityChanged(Security),
     AccountSmtpSecurityChanged(Security),

@@ -949,19 +949,7 @@ async fn add_account_keeps_password_out_of_sqlite() {
     );
 
     let needle = b"secret-Personal";
-    let db = std::fs::read(harness.db_path()).unwrap();
-    assert!(
-        !contains_bytes(&db, needle),
-        "password leaked into the database"
-    );
-
-    let wal_path = harness.db_path().with_extension("db-wal");
-    if let Ok(wal) = std::fs::read(wal_path) {
-        assert!(
-            !contains_bytes(&wal, needle),
-            "password leaked into the WAL"
-        );
-    }
+    assert_no_secret_in_dir(&harness.dir.path().join("data"), needle);
 }
 
 #[tokio::test]
@@ -1250,6 +1238,25 @@ fn api_sync_futures_are_send() {
 #[test]
 fn store_is_send_and_sync() {
     assert_send_sync::<Store>();
+}
+
+fn assert_no_secret_in_dir(dir: &std::path::Path, needle: &[u8]) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+        panic!("read data dir {}: {error}", dir.display());
+    });
+    for entry in entries {
+        let entry = entry.expect("data dir entry");
+        let path = entry.path();
+        if path.is_dir() {
+            assert_no_secret_in_dir(&path, needle);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            assert!(
+                !contains_bytes(&bytes, needle),
+                "password leaked into {}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
