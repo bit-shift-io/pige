@@ -395,3 +395,84 @@ async fn existing_folder_keeps_its_id_across_syncs() {
     assert_eq!(folders.len(), 1);
     assert_eq!(folders[0].id, id1);
 }
+
+#[tokio::test]
+async fn reset_sync_inserts_mail_but_emits_no_new_mail_summaries() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    store.upsert_account(&account).unwrap();
+
+    let mut fake = FakeTransport {
+        folders: vec![folder("INBOX", FolderKind::Inbox)],
+        messages: HashMap::from([(
+            "INBOX".to_string(),
+            vec![
+                msg(1, "old-one", "a@example.com"),
+                msg(2, "old-two", "b@example.com"),
+            ],
+        )]),
+        states: HashMap::from([("INBOX".to_string(), state(1, 3))]),
+        ..FakeTransport::default()
+    };
+
+    sync_account(&store, &account, &mut fake, 10).await.unwrap();
+
+    // UIDVALIDITY rotates; the same UIDs reappear with new content.
+    fake.messages.insert(
+        "INBOX".to_string(),
+        vec![
+            msg(1, "new-one", "x@example.com"),
+            msg(2, "new-two", "y@example.com"),
+        ],
+    );
+    fake.states.insert("INBOX".to_string(), state(2, 3));
+
+    let report = sync_account(&store, &account, &mut fake, 10).await.unwrap();
+    assert!(report.errors.is_empty());
+    assert_eq!(report.synced_folders, 1);
+    assert_eq!(report.new_inbox.len(), 0); // no re-notification after a reset
+
+    let folders = store.folders(&account.id).unwrap();
+    let messages = store.messages(&folders[0].id, 20, None).unwrap();
+    assert_eq!(messages.len(), 2);
+    let subjects: Vec<&str> = messages.iter().map(|m| m.header.subject.as_str()).collect();
+    assert!(subjects.contains(&"new-one"));
+    assert!(subjects.contains(&"new-two"));
+}
+
+#[tokio::test]
+async fn retry_after_partial_failure_preserves_thread_id() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    store.upsert_account(&account).unwrap();
+
+    let mut fake = FakeTransport {
+        folders: vec![folder("INBOX", FolderKind::Inbox)],
+        messages: HashMap::from([("INBOX".to_string(), vec![msg(1, "one", "a@example.com")])]),
+        states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+        fail_fetch_texts: HashSet::from(["INBOX".to_string()]),
+        ..FakeTransport::default()
+    };
+
+    // First sync inserts the header, then fails fetching the snippet.
+    let first = sync_account(&store, &account, &mut fake, 10).await.unwrap();
+    assert_eq!(first.synced_folders, 0);
+    assert_eq!(first.errors.len(), 1);
+
+    let folders = store.folders(&account.id).unwrap();
+    let thread_before = store.messages(&folders[0].id, 10, None).unwrap()[0]
+        .thread_id
+        .clone();
+
+    // Retry succeeds and must not rewrite the message's thread id.
+    fake.fail_fetch_texts.clear();
+    let second = sync_account(&store, &account, &mut fake, 10).await.unwrap();
+    assert!(second.errors.is_empty());
+    assert_eq!(second.synced_folders, 1);
+
+    let messages = store.messages(&folders[0].id, 10, None).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].thread_id, thread_before);
+}

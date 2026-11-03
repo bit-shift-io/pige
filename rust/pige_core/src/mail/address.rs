@@ -29,6 +29,23 @@ impl Address {
             _ => self.email.clone(),
         }
     }
+
+    /// The display name when present, otherwise the bare email address.
+    pub fn display_name(&self) -> String {
+        self.name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.email.clone())
+    }
+}
+
+/// The display name of the first address in a list, used for conversation rows
+/// and new-mail notifications. Empty when the list has no addresses.
+pub fn sender_display(addresses: &[Address]) -> String {
+    addresses
+        .first()
+        .map(Address::display_name)
+        .unwrap_or_default()
 }
 
 impl fmt::Display for Address {

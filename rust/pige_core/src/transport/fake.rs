@@ -26,6 +26,8 @@ pub struct FakeTransport {
     pub capabilities: Capabilities,
     /// Folder names whose `select` returns an error.
     pub fail_select: HashSet<String>,
+    /// Folder names whose `fetch_texts` returns an error (to simulate a retry).
+    pub fail_fetch_texts: HashSet<String>,
 
     pub select_calls: Vec<String>,
     pub fetch_headers_calls: Vec<(String, UidRange)>,
@@ -108,6 +110,9 @@ impl MailTransport for FakeTransport {
         let folder = self.current_folder()?;
         self.fetch_texts_calls
             .push((folder.clone(), uids.to_vec(), max_bytes));
+        if self.fail_fetch_texts.contains(&folder) {
+            return Err(TransportError(format!("fetch_texts failed for {folder}")));
+        }
         let texts = self.texts.get(&folder);
         Ok(uids
             .iter()

@@ -217,14 +217,5 @@ fn message_from_row(row: &Row<'_>) -> Result<StoredMessage, StoreError> {
 
 fn sender_from_json(raw: &str) -> Result<String, StoreError> {
     let addresses: Vec<Address> = decode_json(raw, "messages.from_json")?;
-    Ok(addresses
-        .first()
-        .map(|address| {
-            address
-                .name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| address.email.clone())
-        })
-        .unwrap_or_default())
+    Ok(crate::mail::sender_display(&addresses))
 }

@@ -10,7 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use address::Address;
+pub use address::{Address, sender_display};
 pub use message::{Conversation, Flags, MessageHeader, StoredMessage};
 pub use parse::{ParseError, decode_rfc2047, normalized_subject, parse_flags, parse_header_block};
 

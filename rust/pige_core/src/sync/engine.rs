@@ -2,7 +2,7 @@
 
 use crate::account::{Account, AccountId};
 use crate::mail::{
-    Folder, FolderId, FolderKind, MessageHeader, MessageId, StoredMessage, ThreadId, Uid,
+    Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadId, Uid, sender_display,
 };
 use crate::store::{Store, StoreError};
 use crate::transport::{MailTransport, RemoteFolder, RemoteMessage, TransportError, UidRange};
@@ -176,15 +176,22 @@ async fn sync_folder(
     for message in &fetched {
         let id = MessageId::new();
         // Until Task 10 installs real threading, each message gets its own
-        // thread id so the conversation list still works.
-        let thread_id = ThreadId(id.0.clone());
+        // thread id so the conversation list still works. The id is derived
+        // deterministically so a retry after a partial failure keeps the same
+        // thread id instead of rewriting it on the upsert conflict.
+        let thread_id =
+            temporary_thread_id(&account_id, &folder_id, state.uidvalidity, message.uid);
+        let mut header = message.header.clone();
+        // The transport-reported RFC822.SIZE is authoritative over the size the
+        // header parser leaves at 0.
+        header.size = message.size;
         let stored = StoredMessage {
             id,
             account_id: account_id.clone(),
             folder_id: folder_id.clone(),
             uid: message.uid,
             uidvalidity: state.uidvalidity,
-            header: message.header.clone(),
+            header,
             flags: message.flags,
             thread_id,
             snippet: String::new(),
@@ -235,6 +242,9 @@ async fn sync_folder(
     let all = store
         .messages(&folder_id, u32::MAX, None)
         .map_err(|e| format!("read {}: {e}", remote.name))?;
+    // Unread is derived from cached messages only, so it undercounts when
+    // `window` is smaller than the folder's total; `FolderState` carries no
+    // server unread count.
     let unread = all.iter().filter(|m| !m.flags.seen).count() as u32;
     store
         .upsert_folder(&Folder {
@@ -251,7 +261,9 @@ async fn sync_folder(
         .map_err(|e| format!("store {}: {e}", remote.name))?;
 
     // Newly-arrived inbox messages become notification summaries, newest first.
-    if remote.kind != FolderKind::Inbox {
+    // A reset (UIDVALIDITY rotation) re-inserts messages the user already saw,
+    // so suppress notifications in that case.
+    if remote.kind != FolderKind::Inbox || reset {
         return Ok(Vec::new());
     }
     let mut sorted = inserted;
@@ -262,23 +274,20 @@ async fn sync_folder(
             account_id: account_id.clone(),
             folder_id: folder_id.clone(),
             thread_id: m.thread_id.clone(),
-            from: sender(&m.header),
+            from: sender_display(&m.header.from),
             subject: m.header.subject.clone(),
         })
         .collect())
 }
 
-/// Render a message's first sender for summaries and notifications.
-fn sender(header: &MessageHeader) -> String {
-    header
-        .from
-        .first()
-        .map(|address| {
-            address
-                .name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| address.email.clone())
-        })
-        .unwrap_or_default()
+/// Temporary per-message thread id, stable across retries: derived from the
+/// message's natural key so a re-insert after a partial failure keeps it. Task
+/// 10 replaces this with real threading.
+fn temporary_thread_id(
+    account: &AccountId,
+    folder: &FolderId,
+    uidvalidity: u32,
+    uid: Uid,
+) -> ThreadId {
+    ThreadId(format!("{account}:{folder}:{uidvalidity}:{}", uid.0))
 }
