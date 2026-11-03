@@ -8,6 +8,8 @@ pub mod components;
 pub mod fonts;
 pub mod html_view;
 pub mod icons;
+#[cfg(target_os = "android")]
+mod jni;
 pub mod layout;
 pub mod message;
 mod platform;
@@ -62,19 +64,6 @@ fn android_main(app: iced_android::AndroidApp) {
     if let Err(error) = run() {
         log::error!("iced failed: {error}");
     }
-}
-
-/// The Back button, from `MainActivity.onBackPressed`. Wiring it into the
-/// drawer/reader/list state machine needs a channel from the JNI thread back
-/// into iced; Task 16 owns that bridge, so this stays a no-op for now. Adapted
-/// from qlaunch's `Java_bitshift_qlaunch_MainActivity_onBackPressedEvent`.
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_bitshift_pige_MainActivity_onBackPressedEvent(
-    _env: jni::JNIEnv,
-    _this: jni::objects::JObject,
-) {
-    log::info!("back pressed (no-op)");
 }
 
 #[cfg(test)]

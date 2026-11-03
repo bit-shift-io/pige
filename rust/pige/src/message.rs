@@ -85,6 +85,8 @@ pub enum Message {
     ToggleEarlier,
     /// The reader toolbar: return to the list (deselect the conversation).
     ConversationBack,
+    /// The Android Back button/gesture. Closes the innermost surface.
+    Back,
     /// The reader toolbar: archive the open conversation.
     ArchiveConversation,
     /// The reader toolbar: move the open conversation to Trash.

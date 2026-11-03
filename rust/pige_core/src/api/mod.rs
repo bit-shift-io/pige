@@ -34,7 +34,7 @@ use crate::store::{Body, Store};
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{Capabilities, RemoteFolder, UidRange};
 
-pub use events::{CoreEvent, subscribe};
+pub use events::{CoreEvent, back_pressed, subscribe};
 pub use mutations::{
     RECONNECT_ERROR, archive_available, archive_thread, delete_permanently, move_thread, set_read,
     trash_thread,

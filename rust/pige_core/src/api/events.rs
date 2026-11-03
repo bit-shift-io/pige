@@ -29,6 +29,8 @@ pub enum CoreEvent {
         new_mail: usize,
     },
     NewMail(NewMailSummary),
+    /// The platform's Back gesture/button asked the UI to move back.
+    BackPressed,
     /// A recoverable failure, already formatted for display.
     Error(String),
 }
@@ -44,4 +46,10 @@ pub(crate) fn sender() -> &'static broadcast::Sender<CoreEvent> {
 /// Subscribe to core events. Multiple UI/platform subscribers are supported.
 pub fn subscribe() -> broadcast::Receiver<CoreEvent> {
     sender().subscribe()
+}
+
+/// Ask the running UI to handle Back. Best-effort: with no subscriber (for
+/// example a WorkManager process with no window) the event is dropped.
+pub fn back_pressed() {
+    let _ = sender().send(CoreEvent::BackPressed);
 }

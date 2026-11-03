@@ -110,6 +110,23 @@ impl App {
             }
             Message::ToggleEarlier => self.reader_expanded = !self.reader_expanded,
             Message::ConversationBack => return self.reader_back(),
+            Message::Back => {
+                if self.delete_confirm_open {
+                    self.delete_confirm_open = false;
+                } else if self.move_picker_open {
+                    self.move_picker_open = false;
+                } else if self.compose.is_some() {
+                    self.compose = None;
+                } else if self.accounts_open {
+                    self.accounts_open = false;
+                    self.accounts.close_form();
+                    self.accounts.confirm_remove = None;
+                } else if self.drawer_open {
+                    self.drawer_open = false;
+                } else if self.snapshot.selected_conversation.is_some() {
+                    return self.reader_back();
+                }
+            }
             Message::ArchiveConversation => {
                 if let Some(thread) = self.open_thread() {
                     return snapshot_task(async move { api::archive_thread(&thread).await });
@@ -560,6 +577,20 @@ impl App {
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             Subscription::run(core_events),
             iced::time::every(Duration::from_secs(30)).map(|_| Message::Tick),
+            // Android 13+ stops calling `onBackPressed` once
+            // `enableOnBackInvokedCallback` is set; iced_android registers the
+            // system callback and reports the gesture as a `BrowserBack` key
+            // press instead (see its `nativeBack`). Map it to the same Back
+            // message the `nativeBack`/`onBackPressedEvent` JNI exports use so
+            // the gesture closes the innermost surface. Desktop never emits
+            // `BrowserBack`.
+            iced::keyboard::listen().filter_map(|event| match event {
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::BrowserBack),
+                    ..
+                } => Some(Message::Back),
+                _ => None,
+            }),
         ])
     }
 }
@@ -631,6 +662,7 @@ fn core_events() -> impl iced::futures::Stream<Item = Message> {
                     Ok(event) => {
                         let message = match event {
                             api::CoreEvent::Error(error) => Message::Error(error),
+                            api::CoreEvent::BackPressed => Message::Back,
                             _ => Message::Snapshot(api::snapshot()),
                         };
                         if output.send(message).await.is_err() {

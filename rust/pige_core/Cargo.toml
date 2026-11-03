@@ -27,6 +27,9 @@ webpki-roots = "0.26"
 [target.'cfg(not(target_os = "android"))'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 [dev-dependencies]
 rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"

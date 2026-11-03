@@ -1,8 +1,8 @@
 //! Host-platform wiring for the desktop shell.
 //!
 //! The core owns the platform traits; this module chooses concrete adapters and
-//! the per-user data/cache directories. Android's `FileProvider` and JNI
-//! bridge arrive in Task 16.
+//! the per-user data/cache directories. Linux uses XDG/Secret Service; Android
+//! uses app-private storage, the Keystore, and the JNI bridge.
 
 use std::sync::Arc;
 
@@ -28,9 +28,42 @@ pub(crate) fn config() -> api::Config {
     }
 }
 
-/// Non-Linux targets keep the temporary in-memory adapters until their own
-/// platform layer is implemented.
-#[cfg(not(target_os = "linux"))]
+/// The real Android platform: app-private storage from `PigeBridge`, Android
+/// Keystore credentials, the notification bridge, `Intent`/`FileProvider`
+/// opening, and the TLS IMAP transport.
+#[cfg(target_os = "android")]
+pub(crate) fn config() -> api::Config {
+    use pige_core::platform::{
+        CredentialStore,
+        android::{AndroidCredentials, AndroidNotifier, AndroidOpener, AndroidPaths},
+    };
+
+    let paths = AndroidPaths::load().unwrap_or_else(|error| {
+        // Never guess a directory for mail data or credentials. An empty path
+        // makes `api::init` fail and the shell shows that error instead of
+        // silently writing somewhere else.
+        log::error!("android storage paths unavailable: {error}");
+        AndroidPaths {
+            data_dir: std::path::PathBuf::new(),
+            cache_dir: std::path::PathBuf::new(),
+        }
+    });
+    let credentials: Arc<dyn CredentialStore> = Arc::new(AndroidCredentials::new());
+    api::Config {
+        data_dir: paths.data_dir,
+        cache_dir: paths.cache_dir.clone(),
+        credentials: credentials.clone(),
+        notifier: Arc::new(AndroidNotifier::new()),
+        opener: Arc::new(AndroidOpener::new(paths.cache_dir)),
+        transport: Arc::new(pige_core::platform::android::AndroidTransportFactory::new(
+            credentials,
+        )),
+    }
+}
+
+/// Non-Linux, non-Android targets keep the temporary in-memory adapters until
+/// their own platform layer is implemented.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn config() -> api::Config {
     use pige_core::platform::fake::{
         FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,

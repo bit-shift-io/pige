@@ -2,9 +2,12 @@
 //! itself. Desktop, Android, and test adapters implement these traits and are
 //! injected through [`crate::api::Config`]; nothing here depends on a UI.
 
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod fake;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod opener;
 
 use std::path::Path;
 

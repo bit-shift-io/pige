@@ -3284,6 +3284,7 @@ dependencies = [
  "base64",
  "futures",
  "html5ever 0.39.0",
+ "jni 0.21.1",
  "keyring",
  "lettre",
  "log",
