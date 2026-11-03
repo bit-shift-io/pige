@@ -83,6 +83,26 @@ pub enum Message {
     LoadImages,
     /// The reader's earlier-message section was toggled.
     ToggleEarlier,
+    /// The reader toolbar: return to the list (deselect the conversation).
+    ConversationBack,
+    /// The reader toolbar: archive the open conversation.
+    ArchiveConversation,
+    /// The reader toolbar: move the open conversation to Trash.
+    TrashConversation,
+    /// The reader toolbar: mark the open conversation unread.
+    MarkUnread,
+    /// The reader toolbar: open the "Move to folder" picker.
+    OpenMovePicker,
+    /// The reader toolbar: dismiss the "Move to folder" picker.
+    CloseMovePicker,
+    /// The reader toolbar: move the conversation to a chosen folder.
+    MoveConversation(FolderId),
+    /// The reader toolbar: open the permanent-delete confirmation dialog.
+    OpenDeleteConfirm,
+    /// The reader toolbar: cancel the permanent-delete confirmation.
+    CancelDeleteConfirm,
+    /// The reader toolbar: confirm the permanent delete.
+    ConfirmDelete,
     /// Open a link from a message body.
     OpenUrl(String),
     Compose,

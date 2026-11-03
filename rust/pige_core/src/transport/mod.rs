@@ -71,9 +71,18 @@ pub struct SendError(pub String);
 
 /// Async surface for talking to a mail server. Kept object-safe so the sync
 /// engine and mutations can be exercised against a scripted [`FakeTransport`]
-/// without any network. `capabilities`, `archive`, `trash`, and the mutation
-/// methods are unused by the read path but keep the trait complete for the IMAP
-/// implementation and the move/delete mutations.
+/// without any network. `capabilities` and the mutation methods are unused by
+/// the read path but keep the trait complete for the IMAP implementation and
+/// the move/delete mutations.
+///
+/// Move/archive/trash are expressed as three primitives so the API can branch
+/// on [`Capabilities`] (Gmail labels vs. the generic `MOVE`/`COPY` fallback):
+/// - [`MailTransport::move_messages`] — a server-side `MOVE` (or a generic
+///   COPY + delete + expunge fallback inside the transport).
+/// - [`MailTransport::copy_messages`] — a bare `COPY`, which on Gmail adds a
+///   label without removing the source.
+/// - [`MailTransport::delete_messages`] — mark `\Deleted` and expunge, which on
+///   Gmail removes the source label.
 #[async_trait]
 pub trait MailTransport: Send {
     async fn capabilities(&mut self) -> Result<Capabilities, TransportError>;
@@ -93,9 +102,15 @@ pub trait MailTransport: Send {
     async fn fetch_flags(&mut self, uids: &[Uid]) -> Result<Vec<(Uid, Flags)>, TransportError>;
     async fn search(&mut self, query: &str) -> Result<Vec<Uid>, TransportError>;
     async fn store_flags(&mut self, uids: &[Uid], flags: FlagOp) -> Result<(), TransportError>;
+    /// Move messages to `dest`, removing them from the currently selected
+    /// mailbox. Implementors use `MOVE` when available and fall back to COPY +
+    /// `\Deleted` + expunge otherwise.
     async fn move_messages(&mut self, uids: &[Uid], dest: &str) -> Result<(), TransportError>;
-    async fn archive(&mut self, uids: &[Uid], folder: &RemoteFolder) -> Result<(), TransportError>;
-    async fn trash(&mut self, uids: &[Uid], folder: &RemoteFolder) -> Result<(), TransportError>;
+    /// Copy messages to `dest` without removing them from the source mailbox.
+    async fn copy_messages(&mut self, uids: &[Uid], dest: &str) -> Result<(), TransportError>;
+    /// Mark messages `\Deleted` and expunge them from the currently selected
+    /// mailbox.
+    async fn delete_messages(&mut self, uids: &[Uid]) -> Result<(), TransportError>;
     async fn append(
         &mut self,
         folder: &str,

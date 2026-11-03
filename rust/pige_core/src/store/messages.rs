@@ -172,6 +172,36 @@ impl Store {
         Ok(())
     }
 
+    /// Remove cached rows by local id, recomputing the threads they belonged to.
+    /// The FTS triggers drop the matching search rows as the messages go.
+    pub fn delete_messages(&self, ids: &[MessageId]) -> Result<usize, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let mut affected: HashSet<ThreadId> = HashSet::new();
+        let mut deleted = 0;
+        for id in ids {
+            let thread: Option<String> = tx
+                .query_row(
+                    "SELECT thread_id FROM messages WHERE id = ?1",
+                    [&id.0],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            deleted += tx.execute("DELETE FROM messages WHERE id = ?1", [&id.0])?;
+            if let Some(thread) = thread {
+                affected.insert(ThreadId(thread));
+            }
+        }
+        for thread in affected {
+            recompute_thread_on(&tx, &thread)?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Every cached header for one account, across folders. Bodies live in a
     /// separate table, so this is safe to use for rebuilding the thread index.
     pub fn messages_for_account(

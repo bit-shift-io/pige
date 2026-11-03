@@ -5,7 +5,10 @@
 
 use iced::widget::{column, container, row, scrollable, space};
 use iced::{Alignment, Element, Fill};
-use pige_core::api::{ConversationDetail, MessageBody};
+use pige_core::account::AccountId;
+use pige_core::api::{self, ConversationDetail, MessageBody};
+use pige_core::mail::FolderKind;
+use pige_core::transport::Capabilities;
 
 use crate::app::App;
 use crate::components::{self, ButtonVariant, PaneTone};
@@ -17,15 +20,11 @@ use crate::{avatar_color, initials};
 
 /// Render the reader pane for the current selection.
 pub fn reader_pane<'a>(app: &'a App) -> Element<'a, Message> {
-    let actions = vec![
-        components::icon_button(icons::REPLY, "Reply", Message::Reply),
-        components::icon_button(icons::FORWARD, "Forward", Message::Forward),
-        components::icon_button(icons::MORE_VERT, "More", Message::Noop),
-    ];
+    let (leading, actions) = toolbar(app);
 
     let Some(detail) = app.snapshot.selected_conversation.as_ref() else {
         return container(column![
-            components::app_bar("Conversation", None, actions),
+            components::app_bar("Conversation", leading, actions),
             components::empty_state(
                 "No conversation selected",
                 "Choose a message from the list to read it here."
@@ -39,13 +38,192 @@ pub fn reader_pane<'a>(app: &'a App) -> Element<'a, Message> {
 
     let body = conversation_body(detail, app);
     container(column![
-        components::app_bar("Conversation", None, actions),
+        components::app_bar("Conversation", leading, actions),
         body,
     ])
     .width(Fill)
     .height(Fill)
     .style(components::pane_style(PaneTone::Surface))
     .into()
+}
+
+/// The reader's toolbar: a back button plus the mutation actions available for
+/// the open conversation's account and current folder.
+fn toolbar(app: &App) -> (Option<Element<'_, Message>>, Vec<Element<'_, Message>>) {
+    let Some(detail) = app.snapshot.selected_conversation.as_ref() else {
+        return (None, Vec::new());
+    };
+    let leading = Some(components::icon_button(
+        icons::ARROW_BACK,
+        "Back",
+        Message::ConversationBack,
+    ));
+
+    let Some(context) = reader_context(app, &detail.account_id) else {
+        return (leading, Vec::new());
+    };
+
+    let archive = api::archive_available(
+        &context.capabilities,
+        context.current_kind,
+        context.has_archive,
+    );
+    let trash = context.has_trash && context.current_kind != FolderKind::Trash;
+    let permanent = context.current_kind == FolderKind::Trash || !context.has_trash;
+    let read = detail
+        .messages
+        .first()
+        .map(|message| message.flags.seen)
+        .unwrap_or(true);
+
+    let mut actions = Vec::new();
+    if archive {
+        actions.push(components::icon_button(
+            icons::ARCHIVE,
+            "Archive",
+            Message::ArchiveConversation,
+        ));
+    }
+    if trash {
+        actions.push(components::icon_button(
+            icons::DELETE,
+            "Delete",
+            Message::TrashConversation,
+        ));
+    } else if permanent {
+        actions.push(components::icon_button(
+            icons::DELETE,
+            "Delete permanently",
+            Message::OpenDeleteConfirm,
+        ));
+    }
+    if read {
+        actions.push(components::icon_button(
+            icons::MARK_UNREAD,
+            "Mark unread",
+            Message::MarkUnread,
+        ));
+    }
+    actions.push(components::icon_button(
+        icons::REPLY,
+        "Reply",
+        Message::Reply,
+    ));
+    actions.push(components::icon_button(
+        icons::FORWARD,
+        "Forward",
+        Message::Forward,
+    ));
+    actions.push(components::icon_button(
+        icons::MORE_VERT,
+        "More",
+        Message::OpenMovePicker,
+    ));
+    (leading, actions)
+}
+
+/// The capabilities and special-folder availability for the open conversation.
+struct ReaderContext {
+    capabilities: Capabilities,
+    current_kind: FolderKind,
+    has_archive: bool,
+    has_trash: bool,
+}
+
+fn reader_context(app: &App, account_id: &AccountId) -> Option<ReaderContext> {
+    let section = app
+        .snapshot
+        .sections
+        .iter()
+        .find(|section| &section.account_id == account_id)?;
+    let current_kind = app
+        .snapshot
+        .selected_folder
+        .as_ref()
+        .and_then(|folder| {
+            section
+                .folders
+                .iter()
+                .find(|candidate| &candidate.id == folder)
+        })
+        .map(|folder| folder.kind)
+        .unwrap_or(FolderKind::Inbox);
+    Some(ReaderContext {
+        capabilities: section.capabilities,
+        current_kind,
+        has_archive: section
+            .folders
+            .iter()
+            .any(|folder| folder.kind == FolderKind::Archive),
+        has_trash: section
+            .folders
+            .iter()
+            .any(|folder| folder.kind == FolderKind::Trash),
+    })
+}
+
+/// The "Move to folder" picker, listing the current account's other folders.
+pub fn move_picker_modal<'a>(app: &'a App) -> Element<'a, Message> {
+    let Some(detail) = app.snapshot.selected_conversation.as_ref() else {
+        return space().into();
+    };
+    let Some(section) = app
+        .snapshot
+        .sections
+        .iter()
+        .find(|section| section.account_id == detail.account_id)
+    else {
+        return space().into();
+    };
+    let palette = theme::active();
+    let current = app.snapshot.selected_folder.as_ref();
+    let mut list = column![].spacing(palette.space.xs).width(Fill);
+    let mut any = false;
+    for folder in &section.folders {
+        if current == Some(&folder.id) {
+            continue;
+        }
+        any = true;
+        list = list.push(components::button(
+            folder.name.clone(),
+            ButtonVariant::Text,
+            Message::MoveConversation(folder.id.clone()),
+        ));
+    }
+    if !any {
+        list = list.push(components::styled_text(
+            "No other folders to move to.".to_string(),
+            palette.role(TextRole::BodyMedium),
+            palette.on_surface_variant,
+        ));
+    }
+    components::dialog(
+        "Move to folder",
+        list.into(),
+        vec![components::button(
+            "Cancel",
+            ButtonVariant::Text,
+            Message::CloseMovePicker,
+        )],
+    )
+}
+
+/// The permanent-delete confirmation dialog.
+pub fn delete_confirm_modal<'a>() -> Element<'a, Message> {
+    let palette = theme::active();
+    let body = components::styled_text(
+        "This permanently deletes the conversation and cannot be undone.".to_string(),
+        palette.role(TextRole::BodyMedium),
+        palette.on_surface_variant,
+    );
+    components::dialog(
+        "Delete permanently?",
+        body.into(),
+        vec![
+            components::button("Cancel", ButtonVariant::Text, Message::CancelDeleteConfirm),
+            components::button("Delete", ButtonVariant::Danger, Message::ConfirmDelete),
+        ],
+    )
 }
 
 /// The scrollable reader content for one conversation.

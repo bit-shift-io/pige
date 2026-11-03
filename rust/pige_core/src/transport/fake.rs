@@ -41,6 +41,14 @@ pub struct FakeTransport {
     pub fetch_texts_calls: Vec<(String, Vec<Uid>, usize)>,
     pub fetch_body_calls: Vec<(String, Uid)>,
     pub append_calls: Vec<(String, Vec<u8>, Flags)>,
+    /// Mutation call recordings: (selected folder, uids, ...).
+    pub store_flags_calls: Vec<(String, Vec<Uid>, FlagOp)>,
+    pub move_calls: Vec<(String, Vec<Uid>, String)>,
+    pub copy_calls: Vec<(String, Vec<Uid>, String)>,
+    pub delete_calls: Vec<(String, Vec<Uid>)>,
+    /// When true, every mutation (`store_flags`, `move_messages`,
+    /// `copy_messages`, `delete_messages`) fails, to exercise rollback.
+    pub fail_mutation: bool,
 
     /// Test hooks for deterministic backfill race tests: `started` receives a
     /// permit when a header fetch begins, and the fetch waits for a permit on
@@ -61,6 +69,10 @@ impl FakeTransport {
         self.fetch_texts_calls.clear();
         self.fetch_body_calls.clear();
         self.append_calls.clear();
+        self.store_flags_calls.clear();
+        self.move_calls.clear();
+        self.copy_calls.clear();
+        self.delete_calls.clear();
     }
 
     fn current_folder(&self) -> Result<String, TransportError> {
@@ -175,23 +187,41 @@ impl MailTransport for FakeTransport {
         Ok(Vec::new())
     }
 
-    async fn store_flags(&mut self, _uids: &[Uid], _flags: FlagOp) -> Result<(), TransportError> {
+    async fn store_flags(&mut self, uids: &[Uid], flags: FlagOp) -> Result<(), TransportError> {
+        let folder = self.current_folder()?;
+        self.store_flags_calls.push((folder, uids.to_vec(), flags));
+        if self.fail_mutation {
+            return Err(TransportError("mutation failed".to_string()));
+        }
         Ok(())
     }
 
-    async fn move_messages(&mut self, _uids: &[Uid], _dest: &str) -> Result<(), TransportError> {
+    async fn move_messages(&mut self, uids: &[Uid], dest: &str) -> Result<(), TransportError> {
+        let folder = self.current_folder()?;
+        self.move_calls
+            .push((folder, uids.to_vec(), dest.to_string()));
+        if self.fail_mutation {
+            return Err(TransportError("mutation failed".to_string()));
+        }
         Ok(())
     }
 
-    async fn archive(
-        &mut self,
-        _uids: &[Uid],
-        _folder: &RemoteFolder,
-    ) -> Result<(), TransportError> {
+    async fn copy_messages(&mut self, uids: &[Uid], dest: &str) -> Result<(), TransportError> {
+        let folder = self.current_folder()?;
+        self.copy_calls
+            .push((folder, uids.to_vec(), dest.to_string()));
+        if self.fail_mutation {
+            return Err(TransportError("mutation failed".to_string()));
+        }
         Ok(())
     }
 
-    async fn trash(&mut self, _uids: &[Uid], _folder: &RemoteFolder) -> Result<(), TransportError> {
+    async fn delete_messages(&mut self, uids: &[Uid]) -> Result<(), TransportError> {
+        let folder = self.current_folder()?;
+        self.delete_calls.push((folder, uids.to_vec()));
+        if self.fail_mutation {
+            return Err(TransportError("mutation failed".to_string()));
+        }
         Ok(())
     }
 

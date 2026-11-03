@@ -7,7 +7,7 @@ use iced::window;
 use iced::{Subscription, Task};
 use pige_core::account::AccountId;
 use pige_core::api::{self, AccountInput, ModelSnapshot};
-use pige_core::mail::FolderId;
+use pige_core::mail::{FolderId, ThreadId};
 use pige_core::platform::credentials_unavailable;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -109,6 +109,40 @@ impl App {
                 }
             }
             Message::ToggleEarlier => self.reader_expanded = !self.reader_expanded,
+            Message::ConversationBack => return self.reader_back(),
+            Message::ArchiveConversation => {
+                if let Some(thread) = self.open_thread() {
+                    return snapshot_task(async move { api::archive_thread(&thread).await });
+                }
+            }
+            Message::TrashConversation => {
+                if let Some(thread) = self.open_thread() {
+                    return snapshot_task(async move { api::trash_thread(&thread).await });
+                }
+            }
+            Message::MarkUnread => {
+                if let Some(thread) = self.open_thread() {
+                    return snapshot_task(async move { api::set_read(&thread, false).await });
+                }
+            }
+            Message::OpenMovePicker => self.move_picker_open = true,
+            Message::CloseMovePicker => self.move_picker_open = false,
+            Message::MoveConversation(folder) => {
+                self.move_picker_open = false;
+                if let Some(thread) = self.open_thread() {
+                    return snapshot_task(async move { api::move_thread(&thread, &folder).await });
+                }
+            }
+            Message::OpenDeleteConfirm => self.delete_confirm_open = true,
+            Message::CancelDeleteConfirm => self.delete_confirm_open = false,
+            Message::ConfirmDelete => {
+                self.delete_confirm_open = false;
+                if let Some(thread) = self.open_thread() {
+                    return snapshot_task(
+                        async move { api::delete_permanently(&thread, true).await },
+                    );
+                }
+            }
             Message::OpenUrl(url) => {
                 if let Err(error) = api::open_url(&url) {
                     self.error = Some(error);
@@ -465,6 +499,25 @@ impl App {
     fn select_folder(&mut self, folder: FolderId) -> Task<Message> {
         self.drawer_open = false;
         snapshot_task(async move { api::select_folder(&folder).await })
+    }
+
+    /// The thread id of the conversation open in the reader, if any.
+    fn open_thread(&self) -> Option<ThreadId> {
+        self.snapshot
+            .selected_conversation
+            .as_ref()
+            .map(|detail| detail.thread_id.clone())
+    }
+
+    /// Return to the list, re-selecting the current view so the reader clears.
+    fn reader_back(&mut self) -> Task<Message> {
+        if self.snapshot.unified_selected {
+            snapshot_task(api::select_unified())
+        } else if let Some(folder) = self.snapshot.selected_folder.clone() {
+            snapshot_task(async move { api::select_folder(&folder).await })
+        } else {
+            Task::none()
+        }
     }
 
     /// Run the current query on the API's blocking search path. An empty query

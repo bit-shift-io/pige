@@ -33,6 +33,12 @@ impl App {
         if self.error.is_some() {
             root = stack![root, self.error_overlay()].into();
         }
+        if self.move_picker_open {
+            root = stack![root, crate::screens::reader::move_picker_modal(self)].into();
+        }
+        if self.delete_confirm_open {
+            root = stack![root, crate::screens::reader::delete_confirm_modal()].into();
+        }
         if panes.nav && breakpoint != Breakpoint::Expanded {
             root = stack![root, self.drawer()].into();
         }

@@ -314,20 +314,19 @@ impl MailTransport for FakeTransportHandle {
         self.0.lock().await.move_messages(uids, dest).await
     }
 
-    async fn archive(
+    async fn copy_messages(
         &mut self,
         uids: &[crate::mail::Uid],
-        folder: &RemoteFolder,
+        dest: &str,
     ) -> std::result::Result<(), TransportError> {
-        self.0.lock().await.archive(uids, folder).await
+        self.0.lock().await.copy_messages(uids, dest).await
     }
 
-    async fn trash(
+    async fn delete_messages(
         &mut self,
         uids: &[crate::mail::Uid],
-        folder: &RemoteFolder,
     ) -> std::result::Result<(), TransportError> {
-        self.0.lock().await.trash(uids, folder).await
+        self.0.lock().await.delete_messages(uids).await
     }
 
     async fn append(

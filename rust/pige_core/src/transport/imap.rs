@@ -311,18 +311,51 @@ impl MailTransport for ImapTransport {
         Ok(())
     }
 
-    async fn archive(
-        &mut self,
-        uids: &[Uid],
-        _folder: &RemoteFolder,
-    ) -> Result<(), TransportError> {
-        // Generic destination; Task 14 adds the Gmail-specific rules.
-        self.move_messages(uids, "Archive").await
+    async fn copy_messages(&mut self, uids: &[Uid], dest: &str) -> Result<(), TransportError> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        self.session
+            .uid_copy(&uid_set(uids), &encode_modified_utf7(dest))
+            .await
+            .map_err(transport_err)?;
+        Ok(())
     }
 
-    async fn trash(&mut self, uids: &[Uid], _folder: &RemoteFolder) -> Result<(), TransportError> {
-        // Generic destination; Task 14 adds the Gmail-specific rules.
-        self.move_messages(uids, "Trash").await
+    async fn delete_messages(&mut self, uids: &[Uid]) -> Result<(), TransportError> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let set = uid_set(uids);
+        self.ensure_capabilities().await?;
+        {
+            let store = self
+                .session
+                .uid_store(&set, "+FLAGS.SILENT (\\Deleted)")
+                .await
+                .map_err(transport_err)?;
+            futures::pin_mut!(store);
+            while store.try_next().await.map_err(transport_err)?.is_some() {}
+        }
+        // Only a plain EXPUNGE removes every \Deleted message in the mailbox;
+        // with UIDPLUS, scope it to the UIDs we actually deleted.
+        match expunge_set(self.has_capability("UIDPLUS"), uids) {
+            Some(set) => {
+                let expunge = self
+                    .session
+                    .uid_expunge(&set)
+                    .await
+                    .map_err(transport_err)?;
+                futures::pin_mut!(expunge);
+                while expunge.try_next().await.map_err(transport_err)?.is_some() {}
+            }
+            None => {
+                let expunge = self.session.expunge().await.map_err(transport_err)?;
+                futures::pin_mut!(expunge);
+                while expunge.try_next().await.map_err(transport_err)?.is_some() {}
+            }
+        }
+        Ok(())
     }
 
     async fn append(

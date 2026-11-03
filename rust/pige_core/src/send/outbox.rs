@@ -641,15 +641,11 @@ impl MailTransport for UnavailableImap {
         Err(imap_unavailable())
     }
 
-    async fn archive(
-        &mut self,
-        _uids: &[Uid],
-        _folder: &RemoteFolder,
-    ) -> Result<(), TransportError> {
+    async fn copy_messages(&mut self, _uids: &[Uid], _dest: &str) -> Result<(), TransportError> {
         Err(imap_unavailable())
     }
 
-    async fn trash(&mut self, _uids: &[Uid], _folder: &RemoteFolder) -> Result<(), TransportError> {
+    async fn delete_messages(&mut self, _uids: &[Uid]) -> Result<(), TransportError> {
         Err(imap_unavailable())
     }
 

@@ -117,6 +117,7 @@ mod tests {
                 label: "Personal".into(),
                 email: "ada@example.com".into(),
                 unread: 0,
+                capabilities: Default::default(),
                 folders: vec![FolderSummary {
                     id: FolderId("inbox".into()),
                     name: "INBOX".into(),

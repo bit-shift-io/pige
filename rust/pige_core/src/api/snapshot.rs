@@ -6,6 +6,7 @@ use crate::html::MailDocument;
 use crate::mail::{Flags, FolderId, FolderKind, MessageId, ThreadId};
 use crate::search::{SearchHit, SearchScope};
 use crate::send::OutboxEntry;
+use crate::transport::Capabilities;
 
 /// One account row in the navigation rail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,9 @@ pub struct AccountSection {
     pub email: String,
     /// Sum of the section's folder unread counts.
     pub unread: u32,
+    /// Server capabilities observed during the last sync; the UI uses these to
+    /// decide which mutation actions to offer.
+    pub capabilities: Capabilities,
     pub folders: Vec<FolderSummary>,
 }
 
@@ -55,6 +59,9 @@ pub struct ConversationSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationDetail {
     pub thread_id: ThreadId,
+    /// The account the conversation belongs to, so the reader can resolve the
+    /// current account's folders even in the merged inbox.
+    pub account_id: AccountId,
     pub subject: String,
     pub messages: Vec<MessageSummary>,
 }

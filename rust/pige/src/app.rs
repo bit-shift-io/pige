@@ -61,6 +61,10 @@ pub struct App {
     pub(crate) error: Option<String>,
     /// Whether the reader's earlier-message section is expanded.
     pub(crate) reader_expanded: bool,
+    /// Whether the reader's "Move to folder" picker is open.
+    pub(crate) move_picker_open: bool,
+    /// Whether the reader's permanent-delete confirmation is open.
+    pub(crate) delete_confirm_open: bool,
     /// Whether the full-window account screen is showing.
     pub accounts_open: bool,
     /// The account list/form/confirmation state.
@@ -96,6 +100,8 @@ impl App {
                 list_motion: Motion::new(),
                 error: init_error,
                 reader_expanded: false,
+                move_picker_open: false,
+                delete_confirm_open: false,
                 accounts_open: false,
                 accounts: AccountsState::default(),
                 compose: None,
@@ -495,6 +501,7 @@ mod tests {
                     label: "Personal".into(),
                     email: "ada@example.com".into(),
                     unread: 5,
+                    capabilities: Default::default(),
                     folders: vec![
                         folder("p-inbox", "Inbox", CoreFolderKind::Inbox, 3),
                         folder("p-sent", "Sent", CoreFolderKind::Sent, 0),
@@ -505,6 +512,7 @@ mod tests {
                     label: "Work".into(),
                     email: "grace@example.com".into(),
                     unread: 2,
+                    capabilities: Default::default(),
                     folders: vec![folder("w-inbox", "Inbox", CoreFolderKind::Inbox, 2)],
                 },
             ],

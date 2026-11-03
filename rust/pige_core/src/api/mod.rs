@@ -7,9 +7,11 @@
 //! never blocks behind a slow server.
 
 pub mod events;
+pub mod mutations;
 pub mod snapshot;
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -29,9 +31,13 @@ use crate::send::{
 };
 use crate::store::{Body, Store};
 use crate::sync::sync_account as run_sync_account;
-use crate::transport::{RemoteFolder, UidRange};
+use crate::transport::{Capabilities, RemoteFolder, UidRange};
 
 pub use events::{CoreEvent, subscribe};
+pub use mutations::{
+    RECONNECT_ERROR, archive_available, archive_thread, delete_permanently, move_thread, set_read,
+    trash_thread,
+};
 pub use snapshot::{
     AccountSection, AccountSummary, ConversationDetail, ConversationSummary, FolderSummary,
     MessageBody, MessageSummary, ModelSnapshot, SyncStatus,
@@ -183,6 +189,9 @@ struct AppState {
     /// `Some(true/false)` once a server backfill has probed for older mail;
     /// `None` means fall back to comparing the server total with the cache.
     server_more: Option<bool>,
+    /// Server capabilities observed during the last sync, per account. Used by
+    /// the UI to decide which mutation actions to offer.
+    capabilities: HashMap<AccountId, Capabilities>,
     status: SyncStatus,
     events: broadcast::Sender<CoreEvent>,
 }
@@ -290,10 +299,15 @@ impl AppState {
                 unread: section_unread,
             });
             sections.push(AccountSection {
-                account_id: section.account.id,
+                account_id: section.account.id.clone(),
                 label: section.account.label,
                 email: section.account.email,
                 unread: section_unread,
+                capabilities: self
+                    .capabilities
+                    .get(&section.account.id)
+                    .copied()
+                    .unwrap_or_default(),
                 folders: folder_summaries,
             });
         }
@@ -394,6 +408,7 @@ pub fn init(config: Config) -> Result<(), String> {
         selected_conversation: None,
         search: SearchState::default(),
         server_more: None,
+        capabilities: HashMap::new(),
         status: SyncStatus::Idle,
         events: sender.clone(),
     };
@@ -843,9 +858,9 @@ pub async fn sync_all() -> Result<ModelSnapshot, String> {
     };
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
-    let outcome = sync_accounts(&config, &accounts, &sender).await;
+    let (outcome, capabilities) = sync_accounts(&config, &accounts, &sender).await;
 
-    let status = finish_sync(accounts.len(), outcome);
+    let status = finish_sync(accounts.len(), outcome, capabilities);
     let snapshot = snapshot();
     let _ = sender.send(CoreEvent::SnapshotChanged);
     if let SyncStatus::Error(message) = status {
@@ -876,9 +891,9 @@ pub async fn sync_account(id: &AccountId) -> Result<ModelSnapshot, String> {
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
     let accounts = std::slice::from_ref(&account);
-    let outcome = sync_accounts(&config, accounts, &sender).await;
+    let (outcome, capabilities) = sync_accounts(&config, accounts, &sender).await;
 
-    let status = finish_sync(accounts.len(), outcome);
+    let status = finish_sync(accounts.len(), outcome, capabilities);
     let snapshot = snapshot();
     let _ = sender.send(CoreEvent::SnapshotChanged);
     if let SyncStatus::Error(message) = status {
@@ -1123,7 +1138,7 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             fetched.as_deref(),
             too_large,
         );
-        let detail = build_conversation_detail(thread_id, &messages, body);
+        let detail = build_conversation_detail(thread_id, &account.id, &messages, body);
         state.selected_conversation = Some(detail);
         state.build_snapshot()
     };
@@ -1503,6 +1518,7 @@ fn document_from_body(body: &Body) -> Option<MailDocument> {
 /// body to its summary.
 fn build_conversation_detail(
     thread_id: &ThreadId,
+    account_id: &AccountId,
     messages: &[StoredMessage],
     body: Option<MessageBody>,
 ) -> ConversationDetail {
@@ -1527,6 +1543,7 @@ fn build_conversation_detail(
 
     ConversationDetail {
         thread_id: thread_id.clone(),
+        account_id: account_id.clone(),
         subject,
         messages: summaries,
     }
@@ -1690,12 +1707,13 @@ struct SyncOutcome {
 }
 
 /// Run the per-account loop. The helper opens its own connection so the global
-/// state lock is never held across network awaits.
+/// state lock is never held across network awaits. Returns the outcome plus the
+/// capabilities observed for each successfully synced account.
 async fn sync_accounts(
     config: &Config,
     accounts: &[Account],
     sender: &broadcast::Sender<CoreEvent>,
-) -> SyncOutcome {
+) -> (SyncOutcome, Vec<(AccountId, Capabilities)>) {
     let store = match Store::open(database_path(&config.data_dir)) {
         Ok(store) => store,
         Err(error) => {
@@ -1711,11 +1729,14 @@ async fn sync_accounts(
                 });
             }
             let _ = sender.send(CoreEvent::SnapshotChanged);
-            return SyncOutcome {
-                succeeded: 0,
-                failed: accounts.len(),
-                last_error: Some(message),
-            };
+            return (
+                SyncOutcome {
+                    succeeded: 0,
+                    failed: accounts.len(),
+                    last_error: Some(message),
+                },
+                Vec::new(),
+            );
         }
     };
 
@@ -1724,6 +1745,7 @@ async fn sync_accounts(
         failed: 0,
         last_error: None,
     };
+    let mut capabilities = Vec::new();
 
     for account in accounts {
         let _ = sender.send(CoreEvent::SyncStarted {
@@ -1731,7 +1753,10 @@ async fn sync_accounts(
         });
 
         match sync_one(&store, config, account, sender).await {
-            Ok(()) => outcome.succeeded += 1,
+            Ok(caps) => {
+                outcome.succeeded += 1;
+                capabilities.push((account.id.clone(), caps));
+            }
             Err(message) => {
                 outcome.failed += 1;
                 outcome.last_error = Some(message.clone());
@@ -1746,7 +1771,7 @@ async fn sync_accounts(
         let _ = sender.send(CoreEvent::SnapshotChanged);
     }
 
-    outcome
+    (outcome, capabilities)
 }
 
 async fn sync_one(
@@ -1754,12 +1779,22 @@ async fn sync_one(
     config: &Config,
     account: &Account,
     sender: &broadcast::Sender<CoreEvent>,
-) -> Result<(), String> {
+) -> Result<Capabilities, String> {
     let mut transport = config
         .transport
         .imap(account)
         .await
         .map_err(|error| format!("{}: {error}", account.label))?;
+
+    // Capabilities drive the UI's archive/move choices. A failure here must not
+    // abort the whole sync, so fall back to the (generic) default.
+    let capabilities = match transport.capabilities().await {
+        Ok(caps) => caps,
+        Err(error) => {
+            log::warn!("capabilities for {}: {error}", account.label);
+            Capabilities::default()
+        }
+    };
 
     let report = run_sync_account(store, account, transport.as_mut(), SYNC_WINDOW)
         .await
@@ -1795,12 +1830,16 @@ async fn sync_one(
         account: account.id.clone(),
         new_mail: report.new_inbox.len(),
     });
-    Ok(())
+    Ok(capabilities)
 }
 
 /// Update status and re-seed the selection after a sync. Called without any
 /// lock held; the caller emits the final snapshot notification.
-fn finish_sync(attempted: usize, outcome: SyncOutcome) -> SyncStatus {
+fn finish_sync(
+    attempted: usize,
+    outcome: SyncOutcome,
+    capabilities: Vec<(AccountId, Capabilities)>,
+) -> SyncStatus {
     let status = if outcome.failed == 0 || outcome.succeeded > 0 || attempted == 0 {
         SyncStatus::Idle
     } else {
@@ -1815,6 +1854,9 @@ fn finish_sync(attempted: usize, outcome: SyncOutcome) -> SyncStatus {
     if let Some(state) = guard.as_mut() {
         state.status = status.clone();
         state.server_more = None;
+        for (account, caps) in capabilities {
+            state.capabilities.insert(account, caps);
+        }
         state.ensure_selection();
     }
     status
