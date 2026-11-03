@@ -18,7 +18,7 @@ use crate::mail::{Conversation, Folder, FolderId};
 
 use accounts::accounts_on;
 use folders::{folder_total_on, folders_on};
-use messages::{conversations_on, message_count_on};
+use messages::{conversations_on, message_count_on, unified_conversations_on};
 
 /// A consistent read of the cache used to build one UI snapshot.
 #[derive(Debug, Default)]
@@ -101,7 +101,12 @@ impl Store {
     /// Read everything a snapshot needs inside one deferred SQLite transaction,
     /// so a writer on another connection cannot interleave between sections,
     /// folders, and conversations.
-    pub fn view(&self, folder: Option<&FolderId>, limit: u32) -> Result<StoreView, StoreError> {
+    pub fn view(
+        &self,
+        folder: Option<&FolderId>,
+        unified: bool,
+        limit: u32,
+    ) -> Result<StoreView, StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
 
@@ -116,7 +121,12 @@ impl Store {
         let mut has_more_local = false;
         let mut selected_total = 0;
         let mut selected_cached = 0;
-        if let Some(folder) = folder {
+        if unified {
+            let mut rows = unified_conversations_on(&tx, limit.saturating_add(1))?;
+            has_more_local = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            conversations = rows;
+        } else if let Some(folder) = folder {
             let mut rows = conversations_on(&tx, folder, limit.saturating_add(1), None)?;
             has_more_local = rows.len() > limit as usize;
             rows.truncate(limit as usize);

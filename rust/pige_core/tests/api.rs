@@ -169,6 +169,24 @@ fn stored_message(folder: &Folder, uid: u32) -> StoredMessage {
     }
 }
 
+/// Store one message with explicit display data. The local id is folder-scoped
+/// so the same UID can exist in two accounts.
+fn seed_conversation(
+    store: &Store,
+    folder: &Folder,
+    uid: u32,
+    date: i64,
+    subject: &str,
+    thread: &str,
+) {
+    let mut message = stored_message(folder, uid);
+    message.id = MessageId(format!("{}-message-{uid}", folder.id.0));
+    message.header.date = date;
+    message.header.subject = subject.to_string();
+    message.thread_id = ThreadId(thread.to_string());
+    store.upsert_message(&message).unwrap();
+}
+
 #[tokio::test]
 async fn add_account_appears_in_snapshot_with_no_folders() {
     let _guard = TEST_LOCK.lock().await;
@@ -190,6 +208,7 @@ async fn add_account_appears_in_snapshot_with_no_folders() {
     assert_eq!(snapshot.sections[0].unread, 0);
 
     assert_eq!(snapshot.unified_inbox_unread, 0);
+    assert!(snapshot.unified_selected);
     assert_eq!(snapshot.selected_folder, None);
     assert!(snapshot.conversations.is_empty());
     assert_eq!(snapshot.status, SyncStatus::Idle);
@@ -234,7 +253,8 @@ async fn sync_all_updates_snapshot_and_emits_new_mail() {
     assert_eq!(snapshot.sections[0].unread, 2);
     assert_eq!(snapshot.unified_inbox_unread, 2);
     assert_eq!(snapshot.conversations.len(), 2);
-    assert!(snapshot.selected_folder.is_some());
+    assert!(snapshot.unified_selected);
+    assert_eq!(snapshot.selected_folder, None);
     assert_eq!(snapshot.conversations[0].subject, "two");
 
     let mut seen = Vec::new();
@@ -327,6 +347,171 @@ async fn snapshot_keeps_unified_inbox_separate_from_account_sections() {
             .iter()
             .all(|section| !section.folders.is_empty())
     );
+}
+
+#[tokio::test]
+async fn unified_selection_merges_inbox_conversations_across_accounts() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let work = api::add_account(input("Work", "work@example.com"))
+        .await
+        .expect("work account");
+    let work_id = work.accounts[0].id.clone();
+    let personal = api::add_account(input("Personal", "me@example.com"))
+        .await
+        .expect("personal account");
+    let personal_id = personal.accounts[1].id.clone();
+
+    let store = harness.open_store();
+    let work_inbox = folder("work-inbox", &work_id, "INBOX", FolderKind::Inbox, 0);
+    let personal_inbox = folder(
+        "personal-inbox",
+        &personal_id,
+        "INBOX",
+        FolderKind::Inbox,
+        0,
+    );
+    let work_sent = folder("work-sent", &work_id, "Sent", FolderKind::Sent, 0);
+    for item in [&work_inbox, &personal_inbox, &work_sent] {
+        store.upsert_folder(item).unwrap();
+    }
+
+    seed_conversation(&store, &work_inbox, 1, 100, "work 100", "thread-work-100");
+    seed_conversation(&store, &work_inbox, 2, 400, "work 400", "thread-work-400");
+    seed_conversation(&store, &work_inbox, 10, 900, "work tie", "thread-z");
+    seed_conversation(
+        &store,
+        &personal_inbox,
+        1,
+        300,
+        "personal 300",
+        "thread-personal-300",
+    );
+    seed_conversation(
+        &store,
+        &personal_inbox,
+        2,
+        200,
+        "personal 200",
+        "thread-personal-200",
+    );
+    seed_conversation(&store, &personal_inbox, 10, 900, "personal tie", "thread-a");
+    seed_conversation(&store, &work_sent, 3, 1_000, "sent ignored", "thread-sent");
+
+    let snapshot = api::select_unified().await.expect("select unified");
+
+    assert!(snapshot.unified_selected);
+    assert_eq!(snapshot.selected_folder, None);
+    assert_eq!(
+        snapshot
+            .conversations
+            .iter()
+            .map(|conversation| conversation.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "personal tie",
+            "work tie",
+            "work 400",
+            "personal 300",
+            "personal 200",
+            "work 100",
+        ]
+    );
+    assert_eq!(
+        snapshot
+            .conversations
+            .iter()
+            .map(|conversation| conversation.account_id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            personal_id.clone(),
+            work_id.clone(),
+            work_id.clone(),
+            personal_id.clone(),
+            personal_id.clone(),
+            work_id.clone(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn selecting_unified_and_a_folder_switch_the_active_view() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account_id, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    seed_conversation(&store, &inbox, 1, 10, "hello", "thread-hello");
+
+    let unified = api::select_unified().await.expect("select unified");
+    assert!(unified.unified_selected);
+    assert_eq!(unified.selected_folder, None);
+    assert_eq!(unified.conversations.len(), 1);
+
+    let selected = api::select_folder(&inbox.id).await.expect("select folder");
+    assert!(!selected.unified_selected);
+    assert_eq!(selected.selected_folder.as_ref(), Some(&inbox.id));
+
+    let unified_again = api::select_unified().await.expect("select unified again");
+    assert!(unified_again.unified_selected);
+    assert_eq!(unified_again.selected_folder, None);
+}
+
+#[tokio::test]
+async fn unified_selection_pages_the_merged_cached_list() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let first = api::add_account(input("Work", "work@example.com"))
+        .await
+        .expect("first account");
+    let first_id = first.accounts[0].id.clone();
+    let second = api::add_account(input("Personal", "me@example.com"))
+        .await
+        .expect("second account");
+    let second_id = second.accounts[1].id.clone();
+
+    let store = harness.open_store();
+    let first_inbox = folder("a-inbox", &first_id, "INBOX", FolderKind::Inbox, 0);
+    let second_inbox = folder("b-inbox", &second_id, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&first_inbox).unwrap();
+    store.upsert_folder(&second_inbox).unwrap();
+
+    for uid in 1..=160 {
+        seed_conversation(
+            &store,
+            &first_inbox,
+            uid,
+            i64::from(uid),
+            &format!("first {uid}"),
+            &format!("first-thread-{uid}"),
+        );
+        seed_conversation(
+            &store,
+            &second_inbox,
+            uid,
+            i64::from(uid) + 160,
+            &format!("second {uid}"),
+            &format!("second-thread-{uid}"),
+        );
+    }
+
+    let snapshot = api::select_unified().await.expect("select unified");
+    assert_eq!(snapshot.conversations.len(), 300);
+    assert!(snapshot.has_more);
+    assert_eq!(snapshot.conversations.first().unwrap().date, 320);
+    assert_eq!(snapshot.conversations.last().unwrap().date, 21);
+
+    let snapshot = api::load_older_unified().await.expect("load older unified");
+    assert_eq!(snapshot.conversations.len(), 320);
+    assert!(!snapshot.has_more);
+    assert_eq!(snapshot.conversations.last().unwrap().date, 1);
 }
 
 #[tokio::test]
@@ -503,11 +688,18 @@ async fn load_older_backfills_remote_mail_when_cache_is_exhausted() {
 
     let snapshot = api::sync_all().await.expect("initial sync");
     assert_eq!(snapshot.conversations.len(), 300);
-    assert!(snapshot.has_more);
+    // Unified paging is cached-only for now; the server hint lives on the
+    // folder view below.
+    assert!(!snapshot.has_more);
     let inbox = snapshot
-        .selected_folder
-        .clone()
-        .expect("auto-selected inbox");
+        .sections
+        .first()
+        .and_then(|section| section.folders.first())
+        .map(|folder| folder.id.clone())
+        .expect("synced inbox");
+    let snapshot = api::select_folder(&inbox).await.expect("select inbox");
+    assert_eq!(snapshot.conversations.len(), 300);
+    assert!(snapshot.has_more);
 
     let snapshot = api::load_older(&inbox).await.expect("backfill older");
     assert_eq!(snapshot.conversations.len(), 400);
@@ -810,7 +1002,9 @@ fn api_sync_futures_are_send() {
     assert_send(api::sync_account(&id));
     let folder = FolderId("folder".to_string());
     assert_send(api::load_older(&folder));
+    assert_send(api::load_older_unified());
     assert_send(api::select_folder(&folder));
+    assert_send(api::select_unified());
 }
 
 #[test]
@@ -927,9 +1121,13 @@ async fn sync_finish_clears_stale_server_more() {
 
     let snapshot = api::sync_all().await.expect("initial sync");
     let inbox = snapshot
-        .selected_folder
-        .clone()
-        .expect("auto-selected inbox");
+        .sections
+        .first()
+        .and_then(|section| section.folders.first())
+        .map(|folder| folder.id.clone())
+        .expect("synced inbox");
+    let snapshot = api::select_folder(&inbox).await.expect("select inbox");
+    assert_eq!(snapshot.conversations.len(), 300);
     let snapshot = api::load_older(&inbox).await.expect("backfill");
     assert!(snapshot.has_more, "the server still has older mail");
 

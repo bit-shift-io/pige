@@ -80,7 +80,9 @@ pub fn list_pane<'a>(
         pane = pane.push(elastic_scroll::wrap(
             scroller,
             app.list_motion.clone(),
-            Policy::Normal,
+            // Pull-to-refresh owns the top edge; the bounce still handles the
+            // bottom edge.
+            Policy::PullToRefresh,
         ));
     }
 

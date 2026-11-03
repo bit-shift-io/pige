@@ -68,6 +68,7 @@ struct AppState {
     config: Config,
     store: Store,
     selected_folder: Option<FolderId>,
+    unified_selected: bool,
     conversation_limit: u32,
     selected_conversation: Option<ConversationDetail>,
     /// `Some(true/false)` once a server backfill has probed for older mail;
@@ -79,24 +80,19 @@ struct AppState {
 
 impl AppState {
     fn ensure_selection(&mut self) {
-        if self.selected_folder.is_some() {
+        if self.selected_folder.is_some() || self.unified_selected {
             return;
         }
         let Ok(accounts) = self.store.accounts() else {
             return;
         };
-        for account in accounts {
-            let Ok(folders) = self.store.folders(&account.id) else {
-                continue;
-            };
-            if let Some(inbox) = folders
-                .into_iter()
-                .find(|folder| folder.kind == FolderKind::Inbox)
-            {
-                self.selected_folder = Some(inbox.id);
-                return;
-            }
+        if accounts.is_empty() {
+            return;
         }
+
+        // The unified inbox is the default once at least one account exists.
+        // Its conversation list is resolved from every account's Inbox.
+        self.unified_selected = true;
     }
 
     /// Read the current view from the store. The store returns everything in one
@@ -105,16 +101,21 @@ impl AppState {
     /// than failing a UI refresh.
     fn build_snapshot(&self) -> ModelSnapshot {
         let limit = self.conversation_limit.max(1);
-        let view = match self.store.view(self.selected_folder.as_ref(), limit) {
-            Ok(view) => view,
-            Err(error) => {
-                log::warn!("read snapshot view: {error}");
-                return ModelSnapshot {
-                    status: self.status.clone(),
-                    ..ModelSnapshot::default()
-                };
-            }
-        };
+        let view =
+            match self
+                .store
+                .view(self.selected_folder.as_ref(), self.unified_selected, limit)
+            {
+                Ok(view) => view,
+                Err(error) => {
+                    log::warn!("read snapshot view: {error}");
+                    return ModelSnapshot {
+                        status: self.status.clone(),
+                        unified_selected: self.unified_selected,
+                        ..ModelSnapshot::default()
+                    };
+                }
+            };
 
         let mut accounts = Vec::with_capacity(view.sections.len());
         let mut sections = Vec::with_capacity(view.sections.len());
@@ -154,7 +155,9 @@ impl AppState {
         let selected_folder = self.selected_folder.clone();
         let cached_has_older = view.selected_total > view.selected_cached;
         let has_server_more = self.server_more.unwrap_or(cached_has_older);
-        let has_more = view.has_more_local || has_server_more;
+        // Server backfill for a merged inbox is deferred; the cached page still
+        // knows whether another page exists locally.
+        let has_more = view.has_more_local || (!self.unified_selected && has_server_more);
 
         let conversations = view
             .conversations
@@ -176,6 +179,7 @@ impl AppState {
             accounts,
             sections,
             unified_inbox_unread,
+            unified_selected: self.unified_selected,
             selected_folder,
             conversations,
             selected_conversation: self.selected_conversation.clone(),
@@ -233,6 +237,7 @@ pub fn init(config: Config) -> Result<(), String> {
         config,
         store,
         selected_folder: None,
+        unified_selected: false,
         conversation_limit: INITIAL_PAGE,
         selected_conversation: None,
         server_more: None,
@@ -253,6 +258,11 @@ pub fn snapshot() -> ModelSnapshot {
         Some(state) => state.build_snapshot(),
         None => ModelSnapshot::default(),
     }
+}
+
+/// Whether [`init`] has installed the process-wide state.
+pub fn is_initialized() -> bool {
+    lock_state().is_some()
 }
 
 /// Persist an account and its password. The password is written through the
@@ -387,6 +397,26 @@ pub async fn select_folder(id: &FolderId) -> Result<ModelSnapshot, String> {
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
         state.selected_folder = Some(id.clone());
+        state.unified_selected = false;
+        state.conversation_limit = INITIAL_PAGE;
+        state.selected_conversation = None;
+        state.server_more = None;
+        sender = state.events.clone();
+    }
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot())
+}
+
+/// Select the merged inbox across every account and reset the page.
+pub async fn select_unified() -> Result<ModelSnapshot, String> {
+    let sender;
+    {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        state.selected_folder = None;
+        state.unified_selected = true;
         state.conversation_limit = INITIAL_PAGE;
         state.selected_conversation = None;
         state.server_more = None;
@@ -406,6 +436,7 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
 
+        state.unified_selected = false;
         if state.selected_folder.as_ref() != Some(folder) {
             state.selected_folder = Some(folder.clone());
             state.conversation_limit = INITIAL_PAGE;
@@ -482,6 +513,37 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
             Err(error)
         }
     }
+}
+
+/// Extend the merged inbox by one cached page. Cross-account server backfill
+/// is deferred for now, so this only grows the local merged list.
+pub async fn load_older_unified() -> Result<ModelSnapshot, String> {
+    let sender = {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+
+        if !state.unified_selected {
+            None
+        } else {
+            let limit = state.conversation_limit.max(1);
+            let candidate_limit = limit.saturating_add(PAGE_SIZE);
+            let candidate = state
+                .store
+                .unified_conversations(candidate_limit)
+                .map_err(|error| format!("read unified conversations: {error}"))?;
+            if candidate.len() > limit as usize {
+                state.conversation_limit = candidate.len() as u32;
+            }
+            Some(state.events.clone())
+        }
+    };
+
+    if let Some(sender) = sender {
+        let _ = sender.send(CoreEvent::SnapshotChanged);
+    }
+    Ok(snapshot())
 }
 
 struct BackfillRequest {

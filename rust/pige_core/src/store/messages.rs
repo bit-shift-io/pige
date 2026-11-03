@@ -120,6 +120,12 @@ impl Store {
         let conn = self.connection();
         conversations_on(&conn, folder, limit, before_date)
     }
+
+    /// Newest-first page of conversations across every account's Inbox.
+    pub fn unified_conversations(&self, limit: u32) -> Result<Vec<Conversation>, StoreError> {
+        let conn = self.connection();
+        unified_conversations_on(&conn, limit)
+    }
 }
 
 pub(crate) fn messages_on(
@@ -193,6 +199,55 @@ pub(crate) fn conversations_on(
          LIMIT ?3",
     )?;
     let mut rows = stmt.query(params![folder.0, before_date, i64::from(limit)])?;
+
+    let mut conversations = Vec::new();
+    while let Some(row) = rows.next()? {
+        let from_json: String = row.get(3)?;
+        conversations.push(Conversation {
+            thread_id: ThreadId(row.get(0)?),
+            account_id: AccountId(row.get(1)?),
+            subject: row.get(2)?,
+            sender: sender_from_json(&from_json)?,
+            snippet: row.get(4)?,
+            date: row.get(5)?,
+            message_count: row.get(6)?,
+            unread: row.get(7)?,
+            has_attachments: row.get(8)?,
+        });
+    }
+    Ok(conversations)
+}
+
+/// Conversations from every account's Inbox. Threads are aggregated per
+/// account so a shared thread can never consume another account's message
+/// counts; the outer ordering is date DESC with stable thread/account
+/// tie-breakers so paging and tests are deterministic.
+pub(crate) fn unified_conversations_on(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<Conversation>, StoreError> {
+    let mut stmt = conn.prepare(
+        "WITH ranked AS (
+             SELECT
+                 account_id, thread_id, subject, from_json, snippet, date, has_attachments,
+                 COUNT(*) OVER (PARTITION BY account_id, thread_id) AS message_count,
+                 SUM(CASE WHEN (flags & 1) = 0 THEN 1 ELSE 0 END)
+                     OVER (PARTITION BY account_id, thread_id) AS unread,
+                 MAX(has_attachments) OVER (PARTITION BY account_id, thread_id) AS any_attachments,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY account_id, thread_id ORDER BY date DESC, uid DESC
+                 ) AS rank
+             FROM messages
+             WHERE folder_id IN (SELECT id FROM folders WHERE kind = 'inbox')
+         )
+         SELECT thread_id, account_id, subject, from_json, snippet, date,
+                message_count, unread, any_attachments
+         FROM ranked
+         WHERE rank = 1
+         ORDER BY date DESC, thread_id, account_id
+         LIMIT ?1",
+    )?;
+    let mut rows = stmt.query(params![i64::from(limit)])?;
 
     let mut conversations = Vec::new();
     while let Some(row) = rows.next()? {

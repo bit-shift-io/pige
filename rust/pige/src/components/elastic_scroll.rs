@@ -56,9 +56,13 @@ pub(crate) enum Edge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Policy {
     /// Both ends.
+    #[allow(dead_code)]
     Normal,
     /// The launcher grid keeps the top edge for pull-down search.
+    #[allow(dead_code)]
     LauncherTop,
+    /// The message list keeps the top edge for pull-to-refresh.
+    PullToRefresh,
     /// Preview pages and other input-gated scrollers.
     Disabled,
 }
@@ -508,7 +512,9 @@ impl Wrapper<'_> {
             state.touch = Some(touch);
             return;
         }
-        if self.policy == Policy::LauncherTop && touch.edge == Edge::Top {
+        if matches!(self.policy, Policy::LauncherTop | Policy::PullToRefresh)
+            && touch.edge == Edge::Top
+        {
             return;
         }
         // A reorder grip, slider, or other drag owner keeps its gesture: until

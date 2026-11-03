@@ -62,8 +62,9 @@ fn android_main(app: iced_android::AndroidApp) {
     }
 }
 
-/// The Back button, from `MainActivity.onBackPressed`. The shell has a single
-/// window; the Android bridge expands this when the mail screens land. Adapted
+/// The Back button, from `MainActivity.onBackPressed`. Wiring it into the
+/// drawer/reader/list state machine needs a channel from the JNI thread back
+/// into iced; Task 16 owns that bridge, so this stays a no-op for now. Adapted
 /// from qlaunch's `Java_bitshift_qlaunch_MainActivity_onBackPressedEvent`.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]

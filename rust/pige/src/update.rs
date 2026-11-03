@@ -9,25 +9,14 @@ use pige_core::api::{self, ModelSnapshot};
 use pige_core::mail::FolderId;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::app::{App, account_for_folder};
+use crate::app::App;
 use crate::layout::Breakpoint;
 use crate::message::Message;
 
 impl App {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Snapshot(snapshot) => {
-                self.snapshot = snapshot;
-                if let Some(account) = &self.selected_account
-                    && !self
-                        .snapshot
-                        .sections
-                        .iter()
-                        .any(|section| &section.account_id == account)
-                {
-                    self.selected_account = None;
-                }
-            }
+            Message::Snapshot(snapshot) => self.apply_snapshot(snapshot),
             Message::Resized(size) => {
                 self.size = size;
                 if Breakpoint::from_width(size.width) == Breakpoint::Expanded {
@@ -35,24 +24,15 @@ impl App {
                 }
             }
             Message::Tick => {
-                // The event stream is authoritative, but a tick also catches
-                // anything missed while the UI was paused.
-                self.snapshot = api::snapshot();
+                // Keep SQLite work off the UI thread; the executor produces a
+                // snapshot and delivers it as a normal message.
+                return Task::perform(async { api::snapshot() }, Message::Snapshot);
             }
             Message::ToggleDrawer => self.drawer_open = true,
             Message::CloseDrawer => self.drawer_open = false,
             Message::SelectAllInboxes => {
-                let first_inbox = self
-                    .snapshot
-                    .sections
-                    .iter()
-                    .flat_map(|section| section.folders.iter())
-                    .find(|folder| folder.kind == pige_core::mail::FolderKind::Inbox)
-                    .map(|folder| folder.id.clone());
-                if let Some(folder) = first_inbox {
-                    return self.select_folder(folder);
-                }
                 self.drawer_open = false;
+                return snapshot_task(api::select_unified());
             }
             Message::SelectFolder(folder) => return self.select_folder(folder),
             Message::ToggleAccount(account) => {
@@ -61,6 +41,9 @@ impl App {
                 }
             }
             Message::LoadOlder => {
+                if self.snapshot.unified_selected {
+                    return snapshot_task(api::load_older_unified());
+                }
                 if let Some(folder) = self.snapshot.selected_folder.clone() {
                     return snapshot_task(async move { api::load_older(&folder).await });
                 }
@@ -82,7 +65,6 @@ impl App {
 
     fn select_folder(&mut self, folder: FolderId) -> Task<Message> {
         self.drawer_open = false;
-        self.selected_account = account_for_folder(&self.snapshot, &folder);
         snapshot_task(async move { api::select_folder(&folder).await })
     }
 

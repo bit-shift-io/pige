@@ -84,6 +84,8 @@ pub struct ModelSnapshot {
     pub sections: Vec<AccountSection>,
     /// Unread across every account's Inbox folders; rendered above sections.
     pub unified_inbox_unread: u32,
+    /// Whether the unified inbox, rather than one folder, is selected.
+    pub unified_selected: bool,
     pub selected_folder: Option<FolderId>,
     pub conversations: Vec<ConversationSummary>,
     pub selected_conversation: Option<ConversationDetail>,

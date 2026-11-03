@@ -18,6 +18,14 @@ use crate::components::{FolderKind, FolderView, ListRow};
 use crate::message::Message;
 use crate::theme;
 
+/// One folder row in an account group, carrying the id navigation needs to
+/// select it without re-resolving the snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionFolder {
+    pub id: FolderId,
+    pub view: FolderView,
+}
+
 /// One account group in the navigation rail, with its folders already resolved
 /// to plain view data.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,7 +34,7 @@ pub struct SectionView {
     pub label: String,
     pub email: String,
     pub unread: u32,
-    pub folders: Vec<FolderView>,
+    pub folders: Vec<SectionFolder>,
 }
 
 /// Everything the shell remembers between messages.
@@ -58,11 +66,8 @@ impl App {
             size: Size::new(900.0, 700.0),
             ..Default::default()
         });
-        let snapshot = initialize_api();
-        let selected_account = snapshot
-            .selected_folder
-            .as_ref()
-            .and_then(|folder| account_for_folder(&snapshot, folder));
+        let (snapshot, init_error) = initialize_api();
+        let selected_account = selection_account(&snapshot);
 
         (
             App {
@@ -74,15 +79,26 @@ impl App {
                 size: Size::new(900.0, 700.0),
                 dark: true,
                 list_motion: Motion::new(),
-                error: None,
+                error: init_error,
             },
             open.map(|_| Message::Noop),
         )
     }
+
+    /// Install a fresh snapshot and derive the navigation selection in one
+    /// place for both event-driven and tick refreshes.
+    pub(crate) fn apply_snapshot(&mut self, snapshot: ModelSnapshot) {
+        self.selected_account = selection_account(&snapshot);
+        self.snapshot = snapshot;
+    }
 }
 
 /// Open the temporary dev cache and return its first snapshot.
-fn initialize_api() -> ModelSnapshot {
+fn initialize_api() -> (ModelSnapshot, Option<String>) {
+    if api::is_initialized() {
+        return (api::snapshot(), None);
+    }
+
     let root = std::env::temp_dir().join(format!("pige-dev-{}", std::process::id()));
     let config = api::Config {
         data_dir: root.join("data"),
@@ -93,13 +109,26 @@ fn initialize_api() -> ModelSnapshot {
         transport: Arc::new(FakeTransportFactory::new()),
     };
 
-    if let Err(error) = api::init(config) {
-        // `App::new` can run more than once in tests; the first state stays
-        // authoritative and a real initialization failure degrades to an empty
-        // view rather than preventing the shell from starting.
-        log::info!("using existing pige api state: {error}");
+    match api::init(config) {
+        Ok(()) => (api::snapshot(), None),
+        Err(error) => {
+            log::error!("initialize pige api: {error}");
+            (
+                api::snapshot(),
+                Some(format!("Could not open the local mail cache: {error}")),
+            )
+        }
     }
-    api::snapshot()
+}
+
+pub(crate) fn selection_account(snapshot: &ModelSnapshot) -> Option<AccountId> {
+    if snapshot.unified_selected {
+        return None;
+    }
+    snapshot
+        .selected_folder
+        .as_ref()
+        .and_then(|folder| account_for_folder(snapshot, folder))
 }
 
 pub(crate) fn account_for_folder(snapshot: &ModelSnapshot, folder: &FolderId) -> Option<AccountId> {
@@ -245,7 +274,14 @@ pub fn sections(snapshot: &ModelSnapshot, collapsed: &HashSet<AccountId>) -> Vec
             folders: if collapsed.contains(&section.account_id) {
                 Vec::new()
             } else {
-                section.folders.iter().map(folder_view).collect()
+                section
+                    .folders
+                    .iter()
+                    .map(|folder| SectionFolder {
+                        id: folder.id.clone(),
+                        view: folder_view(folder),
+                    })
+                    .collect()
             },
         })
         .collect()
@@ -394,12 +430,27 @@ mod tests {
         assert_eq!(views[0].email, "ada@example.com");
         assert_eq!(views[0].unread, 5);
         assert_eq!(views[0].folders.len(), 2);
-        assert_eq!(views[0].folders[0].name, "Inbox");
-        assert_eq!(views[0].folders[0].unread, 3);
+        assert_eq!(views[0].folders[0].id, FolderId("p-inbox".into()));
+        assert_eq!(views[0].folders[0].view.name, "Inbox");
+        assert_eq!(views[0].folders[0].view.unread, 3);
         assert_eq!(views[1].label, "Work");
         assert_eq!(views[1].email, "grace@example.com");
         assert_eq!(views[1].unread, 2);
         assert_eq!(views[1].folders.len(), 1);
+    }
+
+    #[test]
+    fn unified_selection_clears_the_account_selection() {
+        let mut snapshot = two_accounts();
+        snapshot.unified_selected = true;
+        snapshot.selected_folder = None;
+
+        assert!(snapshot.unified_selected);
+        assert_eq!(selection_account(&snapshot), None);
+
+        snapshot.unified_selected = false;
+        snapshot.selected_folder = Some(FolderId("w-inbox".into()));
+        assert_eq!(selection_account(&snapshot), Some(AccountId("work".into())));
     }
 
     #[test]
