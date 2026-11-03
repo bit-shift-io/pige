@@ -17,11 +17,20 @@ pub enum ParseError {
 
 /// Parse a raw RFC 5322 header block (with no body) into a [`MessageHeader`].
 ///
+/// The input must contain at least one plausible RFC 5322 header line; empty,
+/// whitespace-only, and colon-less blocks return [`ParseError::Malformed`].
 /// A blank line is appended so a block that ends at the last header parses as
-/// a message with an empty body. `size` is the length of the header bytes;
-/// callers that know the real message size (for example from `RFC822.SIZE`)
-/// replace it before caching.
+/// a message with an empty body. [`mail_parser::MessageParser::parse_headers`]
+/// is used because callers supply headers only.
+///
+/// `size` is always `0` (unknown) because a header block does not carry the
+/// message size; callers with `RFC822.SIZE` set [`MessageHeader::size`] before
+/// caching.
 pub fn parse_header_block(bytes: &[u8]) -> Result<MessageHeader, ParseError> {
+    if !has_plausible_header(bytes) {
+        return Err(ParseError::Malformed);
+    }
+
     let mut raw = Vec::with_capacity(bytes.len() + 2);
     raw.extend_from_slice(bytes);
     if !raw.ends_with(b"\n") {
@@ -30,7 +39,7 @@ pub fn parse_header_block(bytes: &[u8]) -> Result<MessageHeader, ParseError> {
     raw.extend_from_slice(b"\r\n");
 
     let message = MessageParser::new()
-        .parse(&raw)
+        .parse_headers(&raw)
         .ok_or(ParseError::Malformed)?;
 
     let message_id = message.message_id().map(message_id_with_brackets);
@@ -51,7 +60,7 @@ pub fn parse_header_block(bytes: &[u8]) -> Result<MessageHeader, ParseError> {
         to: addresses(message.to()),
         cc: addresses(message.cc()),
         date: message.date().map_or(0, |date| date.to_timestamp()),
-        size: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+        size: 0,
     })
 }
 
@@ -125,6 +134,37 @@ fn addresses(list: Option<mail_parser::AddressList<'_>>) -> Vec<Address> {
         .collect()
 }
 
+/// Whether the block has at least one line shaped like `field-name: value`.
+///
+/// This rejects empty, whitespace-only, and colon-less input before handing it
+/// to `mail-parser`, whose success otherwise means only "some bytes were
+/// present". Folded continuation lines are skipped, and a blank line ends the
+/// header block.
+fn has_plausible_header(bytes: &[u8]) -> bool {
+    for line in bytes.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            continue;
+        }
+        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+            continue;
+        };
+        let name = &line[..colon];
+        if !name.is_empty() && name.iter().all(|&byte| is_field_name_byte(byte)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// RFC 5322 `ftext`: printable US-ASCII other than `:`.
+fn is_field_name_byte(byte: u8) -> bool {
+    matches!(byte, 33..=57 | 59..=126)
+}
+
 /// Mail headers store identifiers with their angle brackets; `mail-parser`
 /// returns the bare id, so put them back for consistent threading lookups.
 fn message_id_with_brackets(id: &str) -> String {
@@ -142,11 +182,24 @@ fn strip_prefix_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
         .map(|_| &text[prefix.len()..])
 }
 
-/// Strip one leading `[tag]` list marker, if present.
+/// Strip one leading lowercase list marker such as `[list]` or `[pige-dev]`.
+///
+/// Mixed-case or uppercase tags such as `[PATCH]`, `[ANN]`, and `[URGENT]`
+/// are deliberately preserved: treating every bracketed prefix as a list tag
+/// would collapse distinct announcement or urgent threads.
 fn strip_list_tag(text: &str) -> Option<&str> {
     let rest = text.strip_prefix('[')?;
     let close = rest.find(']')?;
-    Some(&rest[close + 1..])
+    let tag = &rest[..close];
+    let recognizable = !tag.is_empty()
+        && tag.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'-'
+                || byte == b'_'
+                || byte == b'.'
+        });
+    recognizable.then(|| &rest[close + 1..])
 }
 
 #[cfg(test)]
@@ -188,7 +241,56 @@ mod tests {
         assert_eq!(header.from[0].email, "noreply@example.com");
         assert_eq!(header.from[0].name, None);
         assert_eq!(header.date, 1_700_000_000);
-        assert_eq!(header.size, MISSING_MESSAGE_ID.len() as u32);
+        assert_eq!(header.size, 0);
+    }
+
+    #[test]
+    fn parse_header_rejects_empty_whitespace_and_colonless_garbage() {
+        assert_eq!(parse_header_block(b""), Err(ParseError::Malformed));
+        assert_eq!(
+            parse_header_block(b" \r\n\t\r\n"),
+            Err(ParseError::Malformed)
+        );
+        assert_eq!(
+            parse_header_block(b"this is not a header\r\nnor is this\r\n"),
+            Err(ParseError::Malformed)
+        );
+    }
+
+    #[test]
+    fn parse_header_uses_zero_for_missing_or_invalid_dates() {
+        let missing = parse_header_block(b"Subject: No date\r\n\r\n").expect("header");
+        assert_eq!(missing.date, 0);
+
+        let invalid =
+            parse_header_block(b"Subject: Bad date\r\nDate: not a date\r\n\r\n").expect("header");
+        assert_eq!(invalid.date, 0);
+    }
+
+    #[test]
+    fn parse_header_replaces_invalid_utf8_and_keeps_bad_encoded_words() {
+        let invalid_utf8 = parse_header_block(b"Subject: caf\xe9\r\n\r\n").expect("header");
+        assert_eq!(invalid_utf8.subject, "caf\u{fffd}");
+
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?B?not-base64?="),
+            "=?UTF-8?B?not-base64?="
+        );
+    }
+
+    #[test]
+    fn parse_header_decodes_mixed_plain_and_encoded_subject() {
+        let header =
+            parse_header_block(b"Subject: Hello =?UTF-8?B?R3LDvMOfZQ==?=\r\n\r\n").expect("header");
+
+        assert_eq!(header.subject, "Hello Grüße");
+    }
+
+    #[test]
+    fn parse_header_takes_the_last_of_multiple_in_reply_to_ids() {
+        let header = parse_header_block(b"In-Reply-To: <one@x> <two@x>\r\n\r\n").expect("header");
+
+        assert_eq!(header.in_reply_to.as_deref(), Some("<two@x>"));
     }
 
     #[test]
@@ -227,15 +329,28 @@ mod tests {
         assert!(flags.draft);
         assert_eq!(parse_flags(&[]), Flags::default());
         assert_eq!(parse_flags(&["\\Unknown"]), Flags::default());
+        assert_eq!(
+            parse_flags(&["Seen", "DRAFT", "flagged", "answered", "deleted"]),
+            Flags {
+                seen: true,
+                answered: true,
+                flagged: true,
+                deleted: true,
+                draft: true,
+            }
+        );
     }
 
     #[test]
-    fn normalized_subject_strips_prefixes_and_collapses_space() {
+    fn normalized_subject_strips_only_recognizable_list_tags() {
         assert_eq!(normalized_subject("Re: [list] Hello  World"), "hello world");
+        assert_eq!(normalized_subject("[pige-dev] Release 1.0"), "release 1.0");
         assert_eq!(
             normalized_subject("Fwd: Re: [PATCH] Café  Release"),
-            "café release"
+            "[patch] café release"
         );
+        assert_eq!(normalized_subject("[URGENT] Outage"), "[urgent] outage");
+        assert_eq!(normalized_subject("[ANN] New release"), "[ann] new release");
         assert_eq!(normalized_subject("   "), "");
     }
 }
