@@ -1,0 +1,12 @@
+# Adapted from qlaunch (bitshift, MIT). The Gradle wrapper (gradlew,
+# gradlew.bat, gradle/wrapper/*) is committed on purpose for reproducibility.
+/.gradle
+/.kotlin
+/captures/
+/local.properties
+.cxx/
+
+# Never publicly share a signing key.
+key.properties
+**/*.keystore
+**/*.jks

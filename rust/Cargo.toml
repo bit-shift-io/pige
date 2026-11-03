@@ -1,0 +1,12 @@
+# Workspace layout adapted from qlaunch (bitshift, MIT): same resolver, the
+# `android-activity` patch and release `strip` so the Android shell builds
+# identically to the launcher it was derived from.
+[workspace]
+resolver = "2"
+members = ["pige_core", "pige"]
+
+[patch.crates-io]
+android-activity = { git = "https://github.com/Santuzius/android-activity", tag = "iced_android-v0.1.1" }
+
+[profile.release]
+strip = "debuginfo"

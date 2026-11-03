@@ -1,0 +1,26 @@
+[package]
+name = "pige"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "pige"
+path = "src/main.rs"
+
+[dependencies]
+pige_core = { path = "../pige_core" }
+# Iced is pinned exactly as qlaunch does (bitshift, MIT), including the
+# `iced_android` fork that drives the Android surface. Android inherits
+# premultiplied surface alpha, so keep iced's default web-colors blend space.
+iced = { git = "https://github.com/Santuzius/iced", tag = "iced_android-v0.1.1", default-features = false, features = ["wgpu", "tokio", "image", "wayland", "advanced", "web-colors"] }
+iced_android = { git = "https://github.com/Santuzius/iced_android", tag = "v0.1.1" }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
+futures = { version = "0.3", features = ["executor"] }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+jni = "0.21"
