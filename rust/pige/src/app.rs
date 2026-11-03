@@ -52,6 +52,8 @@ pub struct App {
     pub(crate) dark: bool,
     pub(crate) list_motion: Motion,
     pub(crate) error: Option<String>,
+    /// Whether the reader's earlier-message section is expanded.
+    pub(crate) reader_expanded: bool,
 }
 
 impl App {
@@ -80,6 +82,7 @@ impl App {
                 dark: true,
                 list_motion: Motion::new(),
                 error: init_error,
+                reader_expanded: false,
             },
             open.map(|_| Message::Noop),
         )

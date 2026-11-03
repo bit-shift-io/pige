@@ -6,6 +6,7 @@
 
 pub mod account;
 pub mod api;
+pub mod html;
 pub mod mail;
 pub mod platform;
 pub mod store;
@@ -17,7 +18,7 @@ pub use mail::{
     Address, Conversation, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId,
     StoredMessage, ThreadId, Uid,
 };
-pub use store::{Store, StoreError};
+pub use store::{Body, Store, StoreError};
 
 /// Bumped whenever the persisted schema changes; later tasks version the store
 /// against this so a mismatched database can be migrated or rebuilt.

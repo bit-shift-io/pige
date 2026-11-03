@@ -1,6 +1,6 @@
 //! Composes the navigation, list and reader panes for one frame.
 
-use iced::widget::{MouseArea, column, container, row, space, stack};
+use iced::widget::{MouseArea, container, row, space, stack};
 use iced::window;
 use iced::{Alignment, Element, Fill};
 
@@ -55,22 +55,7 @@ impl App {
     }
 
     fn reader_pane(&self) -> Element<'_, Message> {
-        let actions = vec![components::icon_button(
-            icons::MORE_VERT,
-            "More",
-            Message::Noop,
-        )];
-        container(column![
-            components::app_bar("Conversation", None, actions),
-            components::empty_state(
-                "No conversation selected",
-                "Choose a message from the list to read it here."
-            ),
-        ])
-        .width(Fill)
-        .height(Fill)
-        .style(components::pane_style(PaneTone::Surface))
-        .into()
+        crate::screens::reader::reader_pane(self)
     }
 
     fn drawer(&self) -> Element<'_, Message> {

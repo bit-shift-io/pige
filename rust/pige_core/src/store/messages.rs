@@ -85,6 +85,27 @@ impl Store {
         message_on(&conn, id)
     }
 
+    /// Every message in one conversation, newest first.
+    pub fn messages_for_thread(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        let conn = self.connection();
+        let sql = format!(
+            "SELECT {COLUMNS} FROM messages
+             WHERE thread_id = ?1
+             ORDER BY date DESC, uid DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([&thread_id.0])?;
+
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(message_from_row(row)?);
+        }
+        Ok(messages)
+    }
+
     pub fn set_flags(&self, id: &MessageId, flags: &Flags) -> Result<(), StoreError> {
         let conn = self.connection();
         conn.execute(

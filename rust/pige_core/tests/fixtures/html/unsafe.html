@@ -1,0 +1,12 @@
+<html>
+  <body>
+    <p onclick="alert('xss')">safe text</p>
+    <script>alert('script')</script>
+    <iframe src="https://evil.example"></iframe>
+    <form><input type="text" name="q"></form>
+    <img src="https://tracker.example/pixel.gif" alt="beacon">
+    <a href="javascript:alert('link')">dangerous link</a>
+    <style>body { display: none; }</style>
+    <p style="color: red" id="styled">styled paragraph</p>
+  </body>
+</html>

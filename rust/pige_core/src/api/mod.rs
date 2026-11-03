@@ -17,9 +17,12 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 
 use crate::account::{Account, AccountId, AuthKind, ServerConfig};
-use crate::mail::{Folder, FolderId, FolderKind, MessageId, StoredMessage, Uid};
+use crate::html::{MailDocument, parse_html, plain_text_document};
+use crate::mail::{
+    Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadId, Uid, sender_display,
+};
 use crate::platform::{CredentialStore, Notifier, Opener, TransportFactory};
-use crate::store::Store;
+use crate::store::{Body, Store};
 use crate::sync::engine::temporary_thread_id;
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{RemoteFolder, UidRange};
@@ -544,6 +547,230 @@ pub async fn load_older_unified() -> Result<ModelSnapshot, String> {
         let _ = sender.send(CoreEvent::SnapshotChanged);
     }
     Ok(snapshot())
+}
+
+/// Open a conversation for the reader: load its messages, resolve the newest
+/// message's body (from cache or through the account's transport), and install
+/// the resulting [`ConversationDetail`] as the selected conversation.
+///
+/// A missing or unreachable body degrades to `body: None` rather than failing
+/// the whole reader, so the reader always renders its chrome even offline.
+pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
+    // Phase 1: read the conversation and decide whether the body is cached.
+    let (messages, config, account, folder, cached, events) = {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let messages = state
+            .store
+            .messages_for_thread(thread_id)
+            .map_err(|error| format!("read conversation: {error}"))?;
+        if messages.is_empty() {
+            return Err(format!("unknown conversation {thread_id}"));
+        }
+        let account = state
+            .store
+            .accounts()
+            .map_err(|error| format!("read accounts: {error}"))?
+            .into_iter()
+            .find(|account| account.id == messages[0].account_id)
+            .ok_or_else(|| "conversation account missing".to_string())?;
+        let folder = state
+            .store
+            .folders(&account.id)
+            .map_err(|error| format!("read folders: {error}"))?
+            .into_iter()
+            .find(|folder| folder.id == messages[0].folder_id)
+            .ok_or_else(|| "conversation folder missing".to_string())?;
+        let cached = state
+            .store
+            .body(&messages[0].id)
+            .map_err(|error| format!("read cached body: {error}"))?;
+        (
+            messages,
+            state.config.clone(),
+            account,
+            folder,
+            cached,
+            state.events.clone(),
+        )
+    };
+
+    // Phase 2: resolve the newest message's body outside the lock.
+    let resolved = match cached {
+        Some(cached) => Some(cached),
+        None => match fetch_and_cache_body(&config, &account, &folder, &messages[0]).await {
+            Ok(body) => Some(body),
+            Err(error) => {
+                log::warn!("open conversation {thread_id}: {error}");
+                None
+            }
+        },
+    };
+    let body_doc = resolved.as_ref().and_then(document_from_body);
+    let body_html = resolved.as_ref().and_then(|body| body.html.clone());
+    let detail = build_conversation_detail(thread_id, &messages, body_doc, body_html);
+
+    // Phase 3: install the detail and emit a snapshot.
+    let snapshot = {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        state.selected_conversation = Some(detail);
+        state.build_snapshot()
+    };
+    let _ = events.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot)
+}
+
+/// Mark every message in a conversation as read. Fired by the reader after the
+/// message has been visible for a moment.
+pub async fn mark_read(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
+    let events = {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let messages = state
+            .store
+            .messages_for_thread(thread_id)
+            .map_err(|error| format!("read conversation: {error}"))?;
+        for message in messages {
+            if !message.flags.seen {
+                let mut flags = message.flags;
+                flags.seen = true;
+                state
+                    .store
+                    .set_flags(&message.id, &flags)
+                    .map_err(|error| format!("mark read: {error}"))?;
+                if let Some(detail) = state.selected_conversation.as_mut()
+                    && let Some(summary) = detail
+                        .messages
+                        .iter_mut()
+                        .find(|summary| summary.id == message.id)
+                {
+                    summary.flags = flags;
+                }
+            }
+        }
+        state.events.clone()
+    };
+    let _ = events.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot())
+}
+
+/// Open a URL with the platform's default handler. Synchronous because the
+/// opener resolves immediately.
+pub fn open_url(url: &str) -> Result<(), String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state.config.opener.open_url(url)
+}
+
+/// Fetch the raw body of a message and cache its extracted text.
+async fn fetch_and_cache_body(
+    config: &Config,
+    account: &Account,
+    folder: &Folder,
+    message: &StoredMessage,
+) -> Result<Body, String> {
+    let mut transport = config
+        .transport
+        .imap(account)
+        .await
+        .map_err(|error| format!("{}: {error}", account.label))?;
+    let remote = RemoteFolder {
+        name: folder.name.clone(),
+        delimiter: folder.delimiter.clone(),
+        kind: folder.kind,
+    };
+    transport
+        .select(&remote)
+        .await
+        .map_err(|error| format!("select {}: {error}", folder.name))?;
+    let raw = transport
+        .fetch_body(message.uid)
+        .await
+        .map_err(|error| format!("fetch body {}: {error}", message.uid))?;
+
+    let (html, plain_text) = extract_body_parts(&raw);
+
+    let store = Store::open(database_path(&config.data_dir))
+        .map_err(|error| format!("open body store: {error}"))?;
+    let body = Body {
+        plain_text,
+        html,
+        fetched_at: now_unix(),
+    };
+    store
+        .upsert_body(&message.id, &body)
+        .map_err(|error| format!("cache body: {error}"))?;
+    Ok(body)
+}
+
+/// Extract the HTML and plain-text bodies from a raw RFC 5322 message.
+fn extract_body_parts(raw: &[u8]) -> (Option<String>, Option<String>) {
+    let Some(parsed) = mail_parser::MessageParser::new().parse(raw) else {
+        return (None, None);
+    };
+    let html = parsed.html_bodies().next().map(|body| body.into_owned());
+    let plain_text = parsed.text_bodies().next().map(|body| body.into_owned());
+    (html, plain_text)
+}
+
+/// Build a [`MailDocument`] from a cached body, preferring HTML.
+fn document_from_body(body: &Body) -> Option<MailDocument> {
+    if let Some(html) = &body.html {
+        Some(parse_html(html, false))
+    } else {
+        body.plain_text.as_deref().map(plain_text_document)
+    }
+}
+
+/// Assemble the reader view for a conversation, attaching the newest message's
+/// body to its summary.
+fn build_conversation_detail(
+    thread_id: &ThreadId,
+    messages: &[StoredMessage],
+    body_doc: Option<MailDocument>,
+    body_html: Option<String>,
+) -> ConversationDetail {
+    let subject = messages
+        .first()
+        .map(|message| message.header.subject.clone())
+        .unwrap_or_default();
+    let summaries = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| MessageSummary {
+            id: message.id.clone(),
+            sender: sender_display(&message.header.from),
+            to: sender_display(&message.header.to),
+            date: message.header.date,
+            snippet: message.snippet.clone(),
+            flags: message.flags,
+            has_attachments: message.has_attachments,
+            body: if index == 0 { body_doc.clone() } else { None },
+        })
+        .collect();
+
+    ConversationDetail {
+        thread_id: thread_id.clone(),
+        subject,
+        messages: summaries,
+        body_html,
+    }
+}
+
+/// Unix seconds, UTC, for the body cache's `fetched_at`.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
 struct BackfillRequest {

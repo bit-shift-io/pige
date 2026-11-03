@@ -6,6 +6,7 @@
 pub mod app;
 pub mod components;
 pub mod fonts;
+pub mod html_view;
 pub mod icons;
 pub mod layout;
 pub mod message;

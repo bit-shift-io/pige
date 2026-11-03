@@ -2,6 +2,7 @@
 //! folder, and cached message; platform code decides where it lives.
 
 mod accounts;
+mod bodies;
 mod folders;
 mod messages;
 mod migrations;
@@ -19,6 +20,8 @@ use crate::mail::{Conversation, Folder, FolderId};
 use accounts::accounts_on;
 use folders::{folder_total_on, folders_on};
 use messages::{conversations_on, message_count_on, unified_conversations_on};
+
+pub use bodies::Body;
 
 /// A consistent read of the cache used to build one UI snapshot.
 #[derive(Debug, Default)]

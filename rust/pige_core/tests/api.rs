@@ -12,6 +12,7 @@ use pige_core::{
     AccountId, Address, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId, Security,
     ServerConfig, Store, StoredMessage, ThreadId, Uid,
     api::{self, AccountInput, Config, CoreEvent, DB_FILE_NAME, SyncStatus},
+    html::{Block, Inline, MailDocument},
     platform::{
         CredentialStore,
         fake::{FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory},
@@ -989,6 +990,136 @@ async fn snapshot_reads_are_consistent_during_writes() {
         );
     }
     writer.join().unwrap();
+}
+
+#[tokio::test]
+async fn open_conversation_fetches_and_caches_the_latest_body() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account_id, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    let mut message = stored_message(&inbox, 1);
+    message.thread_id = ThreadId("thread-body".to_string());
+    store.upsert_message(&message).unwrap();
+
+    let raw = b"From: sender@example.com\r\nTo: me@example.com\r\nSubject: Hello\r\n\
+Content-Type: text/html; charset=utf-8\r\n\r\n\
+<html><body><p>Hello <b>world</b></p></body></html>\r\n"
+        .to_vec();
+    let transport = FakeTransport {
+        folders: vec![RemoteFolder {
+            name: "INBOX".to_string(),
+            delimiter: Some("/".to_string()),
+            kind: FolderKind::Inbox,
+        }],
+        states: HashMap::from([(
+            "INBOX".to_string(),
+            FolderState {
+                uidvalidity: 1,
+                uidnext: 2,
+                exists: 1,
+            },
+        )]),
+        bodies: HashMap::from([("INBOX".to_string(), HashMap::from([(Uid(1), raw)]))]),
+        ..FakeTransport::default()
+    };
+    harness.factory.add_transport(account_id.clone(), transport);
+
+    let snapshot = api::open_conversation(&ThreadId("thread-body".to_string()))
+        .await
+        .expect("open conversation");
+    let detail = snapshot
+        .selected_conversation
+        .as_ref()
+        .expect("selected conversation");
+    assert_eq!(detail.messages.len(), 1);
+    let body = detail.messages[0].body.as_ref().expect("body present");
+    assert!(!body.is_empty());
+    assert!(mail_doc_text(body).contains("Hello"));
+    assert!(
+        detail
+            .body_html
+            .as_deref()
+            .is_some_and(|html| html.contains("Hello"))
+    );
+
+    // The body was fetched exactly once and then cached.
+    let first = harness
+        .factory
+        .transport(&account_id)
+        .await
+        .expect("shared transport");
+    assert_eq!(first.fetch_body_calls.len(), 1);
+
+    // Reopening uses the cache and never hits the network again.
+    let reopened = api::open_conversation(&ThreadId("thread-body".to_string()))
+        .await
+        .expect("reopen conversation");
+    assert!(
+        reopened.selected_conversation.unwrap().messages[0]
+            .body
+            .is_some()
+    );
+    let second = harness
+        .factory
+        .transport(&account_id)
+        .await
+        .expect("shared transport");
+    assert_eq!(
+        second.fetch_body_calls.len(),
+        1,
+        "second open must read the cached body"
+    );
+}
+
+/// Flatten a document to its visible text, for body assertions in API tests.
+fn mail_doc_text(doc: &MailDocument) -> String {
+    fn render_blocks(blocks: &[Block], out: &mut String) {
+        for block in blocks {
+            match block {
+                Block::Paragraph(inlines)
+                | Block::Heading {
+                    content: inlines, ..
+                } => {
+                    render_inlines(inlines, out);
+                }
+                Block::List { items, .. } => {
+                    for item in items {
+                        render_blocks(item, out);
+                    }
+                }
+                Block::Quote(inner) => render_blocks(inner, out),
+                Block::Pre(text) => out.push_str(text),
+                Block::Table(rows) => {
+                    for row in rows {
+                        for cell in row {
+                            render_inlines(cell, out);
+                        }
+                    }
+                }
+                Block::Rule | Block::Image { .. } => {}
+            }
+        }
+    }
+    fn render_inlines(inlines: &[Inline], out: &mut String) {
+        for inline in inlines {
+            match inline {
+                Inline::Text { text, .. } => out.push_str(text),
+                Inline::Link { content, .. } => render_inlines(content, out),
+                Inline::Image { .. } => {}
+            }
+        }
+    }
+    let mut out = String::new();
+    render_blocks(&doc.blocks, &mut out);
+    out
 }
 
 fn assert_send<T: Send>(_: T) {}

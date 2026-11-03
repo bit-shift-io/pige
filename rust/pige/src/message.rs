@@ -29,6 +29,13 @@ pub enum Message {
     Search(String),
     /// A conversation was chosen; the reader lands in a later task.
     OpenConversation(ThreadId),
+    /// The reader's "Load images" bar was pressed: re-parse the body with
+    /// remote images allowed.
+    LoadImages,
+    /// The reader's earlier-message section was toggled.
+    ToggleEarlier,
+    /// Open a link from a message body.
+    OpenUrl(String),
     Compose,
     AddAccount,
     Settings,

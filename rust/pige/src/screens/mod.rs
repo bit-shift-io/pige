@@ -2,3 +2,4 @@
 
 pub mod message_list;
 pub mod navigation;
+pub mod reader;

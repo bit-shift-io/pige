@@ -25,6 +25,8 @@ pub struct FakeTransport {
     pub states: HashMap<String, FolderState>,
     /// Folder name -> UID -> snippet text returned by `fetch_texts`.
     pub texts: HashMap<String, HashMap<Uid, String>>,
+    /// Folder name -> UID -> raw body bytes returned by `fetch_body`.
+    pub bodies: HashMap<String, HashMap<Uid, Vec<u8>>>,
     pub capabilities: Capabilities,
     /// Folder names whose `select` returns an error.
     pub fail_select: HashSet<String>,
@@ -142,8 +144,13 @@ impl MailTransport for FakeTransport {
 
     async fn fetch_body(&mut self, uid: Uid) -> Result<Vec<u8>, TransportError> {
         let folder = self.current_folder()?;
-        self.fetch_body_calls.push((folder, uid));
-        Ok(Vec::new())
+        self.fetch_body_calls.push((folder.clone(), uid));
+        Ok(self
+            .bodies
+            .get(&folder)
+            .and_then(|map| map.get(&uid))
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn fetch_flags(&mut self, uids: &[Uid]) -> Result<Vec<(Uid, Flags)>, TransportError> {

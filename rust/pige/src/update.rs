@@ -52,8 +52,39 @@ impl App {
                 return snapshot_task(api::sync_all());
             }
             Message::Search(query) => self.search = query,
-            Message::OpenConversation(_) => {
-                // The reader and its message selection arrive in Task 9.
+            Message::OpenConversation(thread_id) => {
+                self.drawer_open = false;
+                let open_thread = thread_id.clone();
+                let open = Task::perform(
+                    async move { api::open_conversation(&open_thread).await },
+                    |result| match result {
+                        Ok(snapshot) => Message::Snapshot(snapshot),
+                        Err(error) => Message::Error(error),
+                    },
+                );
+                let mark_thread = thread_id.clone();
+                let mark_read = Task::perform(
+                    async move {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        match api::mark_read(&mark_thread).await {
+                            Ok(snapshot) => Message::Snapshot(snapshot),
+                            Err(_) => Message::Noop,
+                        }
+                    },
+                    |message| message,
+                );
+                return Task::batch([open, mark_read]);
+            }
+            Message::LoadImages => {
+                if let Some(detail) = self.snapshot.selected_conversation.as_mut() {
+                    crate::screens::reader::load_images(detail);
+                }
+            }
+            Message::ToggleEarlier => self.reader_expanded = !self.reader_expanded,
+            Message::OpenUrl(url) => {
+                if let Err(error) = api::open_url(&url) {
+                    self.error = Some(error);
+                }
             }
             Message::Error(error) => self.error = Some(error),
             Message::DismissError => self.error = None,
