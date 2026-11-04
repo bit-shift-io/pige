@@ -114,4 +114,55 @@ mod tests {
         );
         assert_eq!(node.size().width, 600.0);
     }
+
+    /// Focused, repeatable measurement of the CPU work iced does for one frame
+    /// of the real shell: build the view element, build its widget tree, and lay
+    /// it out. GPU rasterization is not included (`Headless` cannot draw the
+    /// widget tree), so this is a lower bound on frame time, not a GPU frame
+    /// time. Marked ignored; run explicitly with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "performance measurement; run explicitly with --ignored --nocapture"]
+    fn shell_view_build_and_layout_time() {
+        use std::time::Instant;
+
+        use iced::advanced::renderer::Headless;
+        use iced::advanced::{layout, widget::Tree};
+
+        let renderer = futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            16.0.into(),
+            None,
+        ))
+        .expect("headless wgpu adapter");
+
+        const RUNS: usize = 50;
+        for (label, width) in [("compact", 600.0_f32), ("medium", 900.0), ("expanded", 1300.0)] {
+            let (mut app, _) = App::new();
+            app.size = iced::Size::new(width, 800.0);
+            let limits =
+                layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0));
+
+            // Warm up caches before timing.
+            for _ in 0..5 {
+                let mut element = app.view(window::Id::unique());
+                let mut tree = Tree::new(&element);
+                let _ = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            }
+
+            let mut samples = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let started = Instant::now();
+                let mut element = app.view(window::Id::unique());
+                let mut tree = Tree::new(&element);
+                let _ = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                samples.push(started.elapsed());
+            }
+            samples.sort_unstable();
+            let median = samples[samples.len() / 2];
+            let min = samples[0];
+            println!(
+                "shell {label} ({width}pt): view+layout median={median:?} min={min:?} over {RUNS} runs"
+            );
+        }
+    }
 }
