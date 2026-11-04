@@ -610,6 +610,12 @@ impl App {
         let Some(compose) = self.compose.as_ref() else {
             return Task::none();
         };
+        // A send or save is already in flight; the Cancel action closes the
+        // surface without starting a second one.
+        if compose.busy {
+            self.compose = None;
+            return Task::none();
+        }
         if compose.is_empty() {
             self.compose = None;
             return Task::none();
@@ -729,10 +735,11 @@ impl App {
                 // Desktop Escape and the Android Back gesture both close the
                 // innermost surface.
                 iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(
-                        iced::keyboard::key::Named::Escape
-                        | iced::keyboard::key::Named::BrowserBack,
-                    ),
+                    key:
+                        iced::keyboard::Key::Named(
+                            iced::keyboard::key::Named::Escape
+                            | iced::keyboard::key::Named::BrowserBack,
+                        ),
                     ..
                 } => Some(Message::Back),
                 _ => None,
