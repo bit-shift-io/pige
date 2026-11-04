@@ -1,5 +1,5 @@
-//! Linux platform adapters: Secret Service credentials, `xdg-open`, and the
-//! real IMAP transport. Notifications stay a no-op until Task 17 adds D-Bus.
+//! Linux platform adapters: Secret Service credentials, `xdg-open`, D-Bus
+//! notifications, and the real IMAP transport.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -10,10 +10,7 @@ use futures::future::BoxFuture;
 use keyring::Entry;
 
 use crate::account::{Account, AccountId};
-use crate::platform::{
-    CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, TransportFactory,
-};
-use crate::sync::NewMailSummary;
+use crate::platform::{CredentialStore, CredentialsUnavailable, Opener, Result, TransportFactory};
 use crate::transport::{MailTransport, SmtpSender, imap, smtp};
 
 /// The Secret Service service name every pige secret is filed under.
@@ -225,20 +222,11 @@ impl Opener for LinuxOpener {
     }
 }
 
-/// Desktop notifications are deliberately inert until Task 17 wires
-/// `notify-rust`; mail still arrives and syncs without them.
-#[derive(Debug, Default)]
-pub struct LinuxNotifier;
-
-impl LinuxNotifier {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Notifier for LinuxNotifier {
-    fn notify(&self, _mail: &NewMailSummary) {}
-}
+/// Desktop notifications live in [`linux_notify`], which owns the `notify-rust`
+/// dependency; re-exported here so the platform wiring keeps one Linux module.
+///
+/// [`linux_notify`]: crate::platform::linux_notify
+pub use crate::platform::linux_notify::LinuxNotifier;
 
 /// Builds real TLS IMAP connections with passwords from the credential store.
 /// SMTP sending is completed by Task 13.

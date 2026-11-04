@@ -9,6 +9,7 @@ use pige_core::account::AccountId;
 use pige_core::api::{self, AccountInput, ModelSnapshot};
 use pige_core::mail::{FolderId, ThreadId};
 use pige_core::platform::credentials_unavailable;
+use pige_core::settings::{Settings, ThemeMode};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::app::App;
@@ -27,6 +28,7 @@ impl App {
                     self.drawer_open = false;
                 }
             }
+            Message::Insets(insets) => self.insets = insets,
             Message::Tick => {
                 // Keep SQLite work off the UI thread; the executor produces a
                 // snapshot and delivers it as a normal message.
@@ -121,6 +123,8 @@ impl App {
                     self.accounts_open = false;
                     self.accounts.close_form();
                     self.accounts.confirm_remove = None;
+                } else if self.settings_open {
+                    self.settings_open = false;
                 } else if self.drawer_open {
                     self.drawer_open = false;
                 } else if self.snapshot.selected_conversation.is_some() {
@@ -176,11 +180,13 @@ impl App {
             }
             Message::OpenAccounts => {
                 self.drawer_open = false;
+                self.settings_open = false;
                 self.accounts_open = true;
                 self.accounts.open(&self.snapshot);
             }
             Message::AddAccount => {
                 self.drawer_open = false;
+                self.settings_open = false;
                 self.accounts_open = true;
                 self.accounts.open(&self.snapshot);
                 // First run goes straight to the form; afterwards the screen
@@ -302,7 +308,17 @@ impl App {
                     self.error = Some(error);
                 }
             },
-            Message::AccountRemove(id) => self.accounts.confirm_remove = Some(id),
+            Message::AccountRemove(id) => {
+                // The remove confirmation lives on the account screen, so a
+                // remove started from settings hands off to it rather than
+                // duplicating the dialog.
+                if self.settings_open {
+                    self.settings_open = false;
+                    self.accounts_open = true;
+                    self.accounts.open(&self.snapshot);
+                }
+                self.accounts.confirm_remove = Some(id);
+            }
             Message::AccountRemoveConfirmed(id) => {
                 self.accounts.confirm_remove = None;
                 return Task::perform(
@@ -492,7 +508,56 @@ impl App {
                 Ok(snapshot) => self.apply_snapshot(snapshot),
                 Err(error) => self.error = Some(error),
             },
-            Message::Settings | Message::Noop => {}
+            Message::Settings => {
+                self.drawer_open = false;
+                self.accounts_open = false;
+                self.settings_open = true;
+                self.settings = api::settings();
+                self.settings_sync = self.settings.sync_minutes.to_string();
+                // The settings list edits labels through the shared account
+                // actions, so seed their drafts from the authoritative snapshot.
+                self.accounts.open(&self.snapshot);
+                if self.settings.theme == ThemeMode::System {
+                    return iced::system::theme().map(Message::SystemTheme);
+                }
+            }
+            Message::CloseSettings => self.settings_open = false,
+            Message::SettingsSyncChanged(value) => self.settings_sync = value,
+            Message::SettingsNotificationsToggled(on) => self.settings.notifications = on,
+            Message::SettingsThemeChanged(mode) => {
+                self.settings.theme = mode;
+                match mode {
+                    ThemeMode::Light => self.dark = false,
+                    ThemeMode::Dark => self.dark = true,
+                    ThemeMode::System => {
+                        return iced::system::theme().map(Message::SystemTheme);
+                    }
+                }
+            }
+            Message::SettingsSave => {
+                let minutes = self
+                    .settings_sync
+                    .trim()
+                    .parse()
+                    .unwrap_or(self.settings.sync_minutes);
+                self.settings.sync_minutes = Settings::clamp_minutes(minutes);
+                self.settings_sync = self.settings.sync_minutes.to_string();
+                match api::save_settings(&self.settings) {
+                    Ok(()) => {
+                        self.error = Some("Settings saved.".to_string());
+                        crate::platform::schedule_sync(self.settings.sync_minutes);
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+            Message::SystemTheme(mode) => {
+                if self.settings.theme == ThemeMode::System
+                    && let Some(dark) = system_theme_dark(mode)
+                {
+                    self.dark = dark;
+                }
+            }
+            Message::Noop => {}
         }
 
         Task::none()
@@ -573,8 +638,21 @@ impl App {
     }
 
     pub(crate) fn subscription(&self) -> Subscription<Message> {
+        // Only follow the OS palette while the user chose "System"; an explicit
+        // Light/Dark choice must not be overridden by a desktop theme change.
+        let system_theme = if self.settings.theme == ThemeMode::System {
+            iced::system::theme_changes().map(Message::SystemTheme)
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
             window::resize_events().map(|(_, size)| Message::Resized(size)),
+            system_theme,
+            // Edge-to-edge is mandatory on Android 15+. The window covers the
+            // whole screen, so the root view pads by these insets to stay clear
+            // of the status bar, navigation bar, cutout, and soft keyboard.
+            // Other platforms return an empty subscription.
+            iced_android::insets().map(Message::Insets),
             Subscription::run(core_events),
             iced::time::every(Duration::from_secs(30)).map(|_| Message::Tick),
             // Android 13+ stops calling `onBackPressed` once
@@ -637,6 +715,16 @@ async fn save_account(
     Ok(AccountSaveResult { snapshot, warning })
 }
 
+/// Map the OS theme preference to the shell's dark flag. `None` (the platform
+/// did not report a preference) leaves the current choice alone.
+fn system_theme_dark(mode: iced::theme::Mode) -> Option<bool> {
+    match mode {
+        iced::theme::Mode::Light => Some(false),
+        iced::theme::Mode::Dark => Some(true),
+        iced::theme::Mode::None => None,
+    }
+}
+
 fn session_only_warning() -> String {
     "Secret Service is unavailable. The account password is kept for this session only and will not be saved after pige exits.".to_string()
 }
@@ -684,4 +772,17 @@ fn core_events() -> impl iced::futures::Stream<Item = Message> {
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_theme_maps_to_dark_light_and_ignores_none() {
+        assert_eq!(system_theme_dark(iced::theme::Mode::Dark), Some(true));
+        assert_eq!(system_theme_dark(iced::theme::Mode::Light), Some(false));
+        // A platform that reports no preference must not override the user's.
+        assert_eq!(system_theme_dark(iced::theme::Mode::None), None);
+    }
 }

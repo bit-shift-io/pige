@@ -131,6 +131,25 @@ fn call_void(method: &str, args: &[&str]) -> Result<()> {
     })
 }
 
+/// Call a static bridge method that takes one `int` and returns `void`.
+fn call_void_int(method: &str, value: i32) -> Result<()> {
+    with_env(|env| {
+        env.call_static_method(class()?, method, "(I)V", &[JValue::Int(value)])
+            .map(|_| ())
+            .map_err(|error| jni_error(env, error))
+    })
+}
+
+/// Replace the periodic background sync with one that runs every `minutes`.
+///
+/// WorkManager enforces its own 15-minute minimum, and the settings layer
+/// clamps before calling, so the value is passed through unchanged. Kept small
+/// and separate from the sync worker so changing a setting never rebuilds the
+/// background architecture.
+pub fn schedule_sync(minutes: u16) -> Result<()> {
+    call_void_int("scheduleSync", i32::from(minutes))
+}
+
 /// App-private storage locations read from `PigeBridge` at startup. Android
 /// does not expose a portable XDG equivalent, so these are never guessed.
 #[derive(Debug, Clone, PartialEq, Eq)]

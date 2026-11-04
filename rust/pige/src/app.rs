@@ -11,6 +11,7 @@ use pige_core::api::{
 };
 use pige_core::mail::{FolderId, FolderKind as CoreFolderKind};
 use pige_core::search::{SearchHit, SearchScope};
+use pige_core::settings::{Settings, ThemeMode};
 
 use crate::components::elastic_scroll::Motion;
 use crate::components::{FolderKind, FolderView, ListRow};
@@ -55,6 +56,8 @@ pub struct App {
     /// The latest background search results.
     pub(crate) search_results: Vec<SearchHit>,
     pub(crate) size: Size,
+    /// Android safe-area insets; zero on desktop.
+    pub(crate) insets: iced_android::Insets,
     pub(crate) dark: bool,
     pub(crate) list_motion: Motion,
     pub(crate) error: Option<String>,
@@ -68,6 +71,12 @@ pub struct App {
     pub accounts_open: bool,
     /// The account list/form/confirmation state.
     pub accounts: AccountsState,
+    /// Whether the full-window settings screen is showing.
+    pub settings_open: bool,
+    /// The settings being edited. Persisted to the store on `SettingsSave`.
+    pub(crate) settings: Settings,
+    /// The raw sync-interval text while it is being edited.
+    pub(crate) settings_sync: String,
     /// The open compose surface, if any.
     pub compose: Option<ComposeState>,
 }
@@ -84,6 +93,23 @@ impl App {
         });
         let (snapshot, init_error) = initialize_api();
         let selected_account = selection_account(&snapshot);
+        let settings = api::settings();
+
+        // A `System` theme keeps the dark default until the OS reports its
+        // preference; `Light` and `Dark` are applied immediately.
+        let dark = match settings.theme {
+            ThemeMode::Light => false,
+            ThemeMode::Dark | ThemeMode::System => true,
+        };
+        let settings_sync = settings.sync_minutes.to_string();
+
+        // Light system-bar icons against the dark shell. No-op off Android.
+        iced_android::set_system_bars_dark(true);
+
+        let mut startup = Task::batch([open.map(|_| Message::Noop)]);
+        if settings.theme == ThemeMode::System {
+            startup = Task::batch([startup, iced::system::theme().map(Message::SystemTheme)]);
+        }
 
         (
             App {
@@ -95,7 +121,8 @@ impl App {
                 search_scope: SearchScope::AllAccounts,
                 search_results: Vec::new(),
                 size: Size::new(900.0, 700.0),
-                dark: true,
+                insets: iced_android::Insets::default(),
+                dark,
                 list_motion: Motion::new(),
                 error: init_error,
                 reader_expanded: false,
@@ -103,9 +130,12 @@ impl App {
                 delete_confirm_open: false,
                 accounts_open: false,
                 accounts: AccountsState::default(),
+                settings_open: false,
+                settings,
+                settings_sync,
                 compose: None,
             },
-            open.map(|_| Message::Noop),
+            startup,
         )
     }
 

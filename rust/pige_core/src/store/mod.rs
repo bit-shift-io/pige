@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::account::Account;
 use crate::mail::{Conversation, Folder, FolderId};
@@ -149,6 +149,28 @@ impl Store {
             selected_total,
             selected_cached,
         })
+    }
+
+    /// Read one `meta` value by key. Settings and schema bookkeeping live here;
+    /// the SQLite connection itself is never exposed.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let value = self
+            .connection()
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Insert or replace one `meta` value.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
     }
 }
 

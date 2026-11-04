@@ -1,0 +1,106 @@
+//! User settings, persisted as one JSON document in the store's `meta` table.
+//!
+//! The core owns the schema so every shell (desktop, Android) reads and writes
+//! the same values. Nothing here touches the network or the UI; a settings
+//! screen only edits this struct and hands it back through [`save_settings`].
+
+use serde::{Deserialize, Serialize};
+
+use crate::store::{Store, StoreError};
+
+/// `meta` key the settings JSON is stored under.
+const SETTINGS_KEY: &str = "settings";
+
+/// Interval used when the user has not chosen one, or enters `0`.
+pub const DEFAULT_SYNC_MINUTES: u16 = 15;
+/// Largest allowed background sync interval, in minutes.
+pub const MAX_SYNC_MINUTES: u16 = 60;
+
+/// How the shell picks a palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    /// Follow the operating system's light/dark preference.
+    System,
+    /// Always use the light scheme.
+    Light,
+    /// Always use the dark scheme.
+    Dark,
+}
+
+/// Everything the user can change about pige's behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Minutes between background syncs. `0` is never stored: it is resolved to
+    /// [`DEFAULT_SYNC_MINUTES`] on save.
+    pub sync_minutes: u16,
+    /// Whether new mail posts a desktop/Android notification.
+    pub notifications: bool,
+    /// The preferred colour scheme.
+    pub theme: ThemeMode,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            sync_minutes: DEFAULT_SYNC_MINUTES,
+            notifications: true,
+            theme: ThemeMode::System,
+        }
+    }
+}
+
+impl Settings {
+    /// Normalise a user-entered interval: `0` means the default, `1..=59` is
+    /// kept, and anything at or above [`MAX_SYNC_MINUTES`] is pinned to it.
+    pub fn clamp_minutes(minutes: u16) -> u16 {
+        match minutes {
+            0 => DEFAULT_SYNC_MINUTES,
+            1..=59 => minutes,
+            _ => MAX_SYNC_MINUTES,
+        }
+    }
+}
+
+/// Load the persisted settings. Missing or corrupt data degrades to the
+/// defaults rather than failing the UI; the raw JSON is never surfaced.
+pub fn load_settings(store: &Store) -> Settings {
+    let Ok(Some(raw)) = store.get_meta(SETTINGS_KEY) else {
+        return Settings::default();
+    };
+    let mut settings: Settings = serde_json::from_str(&raw).unwrap_or_default();
+    settings.sync_minutes = Settings::clamp_minutes(settings.sync_minutes);
+    settings
+}
+
+/// Persist `settings`, normalising the sync interval first so an out-of-range
+/// value can never be stored and read back later.
+pub fn save_settings(store: &Store, settings: &Settings) -> Result<(), StoreError> {
+    let mut settings = settings.clone();
+    settings.sync_minutes = Settings::clamp_minutes(settings.sync_minutes);
+    let raw = serde_json::to_string(&settings)?;
+    store.set_meta(SETTINGS_KEY, &raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_clamping_resolves_zero_to_the_default() {
+        assert_eq!(Settings::clamp_minutes(0), DEFAULT_SYNC_MINUTES);
+        assert_eq!(Settings::clamp_minutes(1), 1);
+        assert_eq!(Settings::clamp_minutes(59), 59);
+        assert_eq!(Settings::clamp_minutes(60), MAX_SYNC_MINUTES);
+        assert_eq!(Settings::clamp_minutes(u16::MAX), MAX_SYNC_MINUTES);
+    }
+
+    #[test]
+    fn defaults_are_fifteen_on_and_system() {
+        let settings = Settings::default();
+        assert_eq!(settings.sync_minutes, 15);
+        assert!(settings.notifications);
+        assert_eq!(settings.theme, ThemeMode::System);
+    }
+}

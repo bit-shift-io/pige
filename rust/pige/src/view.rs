@@ -19,6 +19,8 @@ impl App {
         let panes = panes(breakpoint, self.drawer_open);
         let base = if self.accounts_open {
             crate::screens::accounts::screen(self)
+        } else if self.settings_open {
+            crate::screens::settings::screen(self)
         } else {
             self.content(breakpoint, panes)
         };
@@ -42,7 +44,15 @@ impl App {
         if panes.nav && breakpoint != Breakpoint::Expanded {
             root = stack![root, self.drawer()].into();
         }
-        root
+
+        // Android draws the app edge-to-edge, so inset the whole shell
+        // (including drawers and overlays) by the system-bar and keyboard
+        // insets. On desktop these insets are zero.
+        container(root)
+            .width(Fill)
+            .height(Fill)
+            .padding(self.insets)
+            .into()
     }
 
     fn content(&self, breakpoint: Breakpoint, panes: Panes) -> Element<'_, Message> {

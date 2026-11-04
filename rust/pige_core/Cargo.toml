@@ -27,6 +27,9 @@ webpki-roots = "0.26"
 [target.'cfg(not(target_os = "android"))'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = "4"
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 

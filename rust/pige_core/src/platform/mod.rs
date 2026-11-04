@@ -7,6 +7,8 @@ pub mod android;
 pub mod fake;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "linux")]
+pub mod linux_notify;
 pub mod opener;
 
 use std::path::Path;

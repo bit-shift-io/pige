@@ -10,6 +10,7 @@ use pige_core::api::ModelSnapshot;
 use pige_core::mail::{FolderId, MessageId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
+use pige_core::settings::ThemeMode;
 
 use crate::screens::accounts::AccountField;
 use crate::screens::compose::{ComposeField, ComposeSeed};
@@ -52,6 +53,10 @@ pub enum Message {
     /// A fresh view of the cache.
     Snapshot(ModelSnapshot),
     Resized(Size),
+    /// Android status/navigation bar and soft-keyboard insets. Desktop never
+    /// emits this; the app pads its root by them so content stays inside the
+    /// system bars.
+    Insets(iced_android::Insets),
     /// The periodic UI tick that keeps relative dates fresh.
     Tick,
     ToggleDrawer,
@@ -127,7 +132,21 @@ pub enum Message {
     ComposeDiscarded(Result<ModelSnapshot, String>),
     ComposeClose,
     AddAccount,
+    /// The full-window settings screen was requested.
     Settings,
+    /// Close the settings screen and return to mail.
+    CloseSettings,
+    /// The sync-interval field changed. Kept as text until save so partial
+    /// input is not clamped mid-keystroke.
+    SettingsSyncChanged(String),
+    /// The notifications toggle changed.
+    SettingsNotificationsToggled(bool),
+    /// The theme choice changed.
+    SettingsThemeChanged(ThemeMode),
+    /// Persist the edited settings and reschedule background sync.
+    SettingsSave,
+    /// The operating system reported its light/dark preference.
+    SystemTheme(iced::theme::Mode),
     /// The account screen is open.
     OpenAccounts,
     CloseAccounts,

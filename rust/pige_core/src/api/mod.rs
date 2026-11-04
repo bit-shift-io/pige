@@ -34,6 +34,7 @@ use crate::store::{Body, Store};
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{Capabilities, RemoteFolder, UidRange};
 
+pub use crate::settings::{Settings, ThemeMode};
 pub use events::{CoreEvent, back_pressed, subscribe};
 pub use mutations::{
     RECONNECT_ERROR, archive_available, archive_thread, delete_permanently, move_thread, set_read,
@@ -432,6 +433,25 @@ pub fn snapshot() -> ModelSnapshot {
 /// Whether [`init`] has installed the process-wide state.
 pub fn is_initialized() -> bool {
     lock_state().is_some()
+}
+
+/// Load the persisted user settings, or the defaults before [`init`].
+pub fn settings() -> Settings {
+    let guard = lock_state();
+    match guard.as_ref() {
+        Some(state) => crate::settings::load_settings(&state.store),
+        None => Settings::default(),
+    }
+}
+
+/// Persist user settings. Requires [`init`] so there is a store to write to.
+pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    crate::settings::save_settings(&state.store, settings)
+        .map_err(|error| format!("save settings: {error}"))
 }
 
 /// Search cached mail for the search screen. The SQLite scan runs on a
@@ -1962,8 +1982,13 @@ async fn sync_one(
         }
     }
 
+    // The in-app event always fires so the list refreshes; only the OS
+    // notification is suppressed when the user has turned notifications off.
+    let notify_new_mail = crate::settings::load_settings(store).notifications;
     for mail in &report.new_inbox {
-        config.notifier.notify(mail);
+        if notify_new_mail {
+            config.notifier.notify(mail);
+        }
         let _ = sender.send(CoreEvent::NewMail(mail.clone()));
     }
     for error in report.errors.iter().chain(outbox_errors.iter()) {
