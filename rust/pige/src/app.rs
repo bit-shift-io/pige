@@ -11,7 +11,7 @@ use pige_core::api::{
 };
 use pige_core::mail::{FolderId, FolderKind as CoreFolderKind};
 use pige_core::search::{SearchHit, SearchScope};
-use pige_core::settings::{Settings, ThemeMode};
+use pige_core::settings::Settings;
 
 use crate::components::elastic_scroll::Motion;
 use crate::components::{FolderKind, FolderView, ListRow};
@@ -93,23 +93,22 @@ impl App {
         });
         let (snapshot, init_error) = initialize_api();
         let selected_account = selection_account(&snapshot);
-        let settings = api::settings();
 
-        // A `System` theme keeps the dark default until the OS reports its
-        // preference; `Light` and `Dark` are applied immediately.
-        let dark = match settings.theme {
-            ThemeMode::Light => false,
-            ThemeMode::Dark | ThemeMode::System => true,
-        };
+        // Start from the defaults and let the persisted settings arrive through
+        // `SettingsLoaded`; `App::new` must not block the runtime on SQLite.
+        let settings = Settings::default();
         let settings_sync = settings.sync_minutes.to_string();
+        // A `System` theme keeps the dark default until the OS reports its
+        // preference; a persisted `Light`/`Dark` mode is applied on load.
+        let dark = true;
 
         // Light system-bar icons against the dark shell. No-op off Android.
         iced_android::set_system_bars_dark(true);
 
-        let mut startup = Task::batch([open.map(|_| Message::Noop)]);
-        if settings.theme == ThemeMode::System {
-            startup = Task::batch([startup, iced::system::theme().map(Message::SystemTheme)]);
-        }
+        let startup = Task::batch([
+            open.map(|_| Message::Noop),
+            Task::perform(async { api::settings() }, Message::SettingsLoaded),
+        ]);
 
         (
             App {

@@ -512,13 +512,22 @@ impl App {
                 self.drawer_open = false;
                 self.accounts_open = false;
                 self.settings_open = true;
-                self.settings = api::settings();
-                self.settings_sync = self.settings.sync_minutes.to_string();
                 // The settings list edits labels through the shared account
                 // actions, so seed their drafts from the authoritative snapshot.
                 self.accounts.open(&self.snapshot);
-                if self.settings.theme == ThemeMode::System {
-                    return iced::system::theme().map(Message::SystemTheme);
+                // Read the stored settings off the UI thread; `SettingsLoaded`
+                // fills in the screen once the query finishes.
+                return Task::perform(async { api::settings() }, Message::SettingsLoaded);
+            }
+            Message::SettingsLoaded(settings) => {
+                self.settings = settings;
+                self.settings_sync = self.settings.sync_minutes.to_string();
+                match self.settings.theme {
+                    ThemeMode::Light => self.dark = false,
+                    ThemeMode::Dark => self.dark = true,
+                    ThemeMode::System => {
+                        return iced::system::theme().map(Message::SystemTheme);
+                    }
                 }
             }
             Message::CloseSettings => self.settings_open = false,
@@ -542,14 +551,21 @@ impl App {
                     .unwrap_or(self.settings.sync_minutes);
                 self.settings.sync_minutes = Settings::clamp_minutes(minutes);
                 self.settings_sync = self.settings.sync_minutes.to_string();
-                match api::save_settings(&self.settings) {
-                    Ok(()) => {
-                        self.error = Some("Settings saved.".to_string());
-                        crate::platform::schedule_sync(self.settings.sync_minutes);
-                    }
-                    Err(error) => self.error = Some(error),
-                }
+                // Write the settings off the UI thread; `SettingsSaved` reports
+                // the result and reschedules background sync.
+                let settings = self.settings.clone();
+                return Task::perform(
+                    async move { api::save_settings(&settings) },
+                    Message::SettingsSaved,
+                );
             }
+            Message::SettingsSaved(result) => match result {
+                Ok(()) => {
+                    self.error = Some("Settings saved.".to_string());
+                    crate::platform::schedule_sync(self.settings.sync_minutes);
+                }
+                Err(error) => self.error = Some(error),
+            },
             Message::SystemTheme(mode) => {
                 if self.settings.theme == ThemeMode::System
                     && let Some(dark) = system_theme_dark(mode)

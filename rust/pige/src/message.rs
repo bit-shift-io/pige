@@ -10,7 +10,7 @@ use pige_core::api::ModelSnapshot;
 use pige_core::mail::{FolderId, MessageId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
-use pige_core::settings::ThemeMode;
+use pige_core::settings::{Settings, ThemeMode};
 
 use crate::screens::accounts::AccountField;
 use crate::screens::compose::{ComposeField, ComposeSeed};
@@ -136,6 +136,8 @@ pub enum Message {
     Settings,
     /// Close the settings screen and return to mail.
     CloseSettings,
+    /// Persisted settings arrived from the store (startup and screen open).
+    SettingsLoaded(Settings),
     /// The sync-interval field changed. Kept as text until save so partial
     /// input is not clamped mid-keystroke.
     SettingsSyncChanged(String),
@@ -145,6 +147,8 @@ pub enum Message {
     SettingsThemeChanged(ThemeMode),
     /// Persist the edited settings and reschedule background sync.
     SettingsSave,
+    /// The save finished, off the UI thread.
+    SettingsSaved(Result<(), String>),
     /// The operating system reported its light/dark preference.
     SystemTheme(iced::theme::Mode),
     /// The account screen is open.
