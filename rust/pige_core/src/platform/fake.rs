@@ -20,7 +20,7 @@ use crate::transport::{
 use super::{CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, TransportFactory};
 
 /// In-memory password store.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct FakeCredentials {
     secrets: Mutex<HashMap<AccountId, String>>,
     session: Mutex<HashMap<AccountId, String>>,
@@ -29,6 +29,18 @@ pub struct FakeCredentials {
     fail_next_set: AtomicBool,
     fail_delete: AtomicBool,
     unavailable: AtomicBool,
+}
+
+/// Redacting `Debug`: the store holds plaintext secrets, so only account counts
+/// are printable.
+impl std::fmt::Debug for FakeCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FakeCredentials")
+            .field("secrets", &self.secrets.lock().unwrap().len())
+            .field("session", &self.session.lock().unwrap().len())
+            .finish()
+    }
 }
 
 impl FakeCredentials {

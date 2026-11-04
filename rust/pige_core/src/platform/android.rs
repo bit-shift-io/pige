@@ -150,6 +150,11 @@ pub fn schedule_sync(minutes: u16) -> Result<()> {
     call_void_int("scheduleSync", i32::from(minutes))
 }
 
+/// Cancel the periodic background sync, for when the user turns it off.
+pub fn cancel_sync() -> Result<()> {
+    call_void("cancelSync", &[])
+}
+
 /// App-private storage locations read from `PigeBridge` at startup. Android
 /// does not expose a portable XDG equivalent, so these are never guessed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +184,7 @@ impl AndroidPaths {
 /// touches the filesystem. A failed Keystore reports
 /// [`CredentialsUnavailable`] so the UI can offer session-only passwords, and
 /// this adapter keeps those in process memory only.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AndroidCredentials {
     session: Mutex<HashMap<AccountId, String>>,
     /// Accounts this process has successfully read or written through the
@@ -187,6 +192,19 @@ pub struct AndroidCredentials {
     persistent: Mutex<HashSet<AccountId>>,
     /// Accounts whose only credential is the in-memory session password.
     session_only: Mutex<HashSet<AccountId>>,
+}
+
+/// Redacting `Debug`: the struct holds plaintext session passwords, so only
+/// account counts are printable.
+impl std::fmt::Debug for AndroidCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AndroidCredentials")
+            .field("session_accounts", &self.session().len())
+            .field("persistent_accounts", &self.persistent().len())
+            .field("session_only_accounts", &self.session_only().len())
+            .finish()
+    }
 }
 
 impl AndroidCredentials {

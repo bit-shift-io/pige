@@ -87,11 +87,15 @@ impl App {
                         Err(error) => Message::Error(error),
                     },
                 );
+                // Mark read through the server-backed, current-folder-scoped
+                // path. The automatic open path stays silent when offline: a
+                // failed STORE must not raise a snackbar the user did not ask
+                // for, and the next sync reconciles flags from the server.
                 let mark_thread = thread_id.clone();
                 let mark_read = Task::perform(
                     async move {
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        match api::mark_read(&mark_thread).await {
+                        match api::set_read(&mark_thread, true).await {
                             Ok(snapshot) => Message::Snapshot(snapshot),
                             Err(_) => Message::Noop,
                         }
@@ -99,16 +103,6 @@ impl App {
                     |message| message,
                 );
                 return Task::batch([open, mark_read]);
-            }
-            Message::LoadImages => {
-                let thread_id = self
-                    .snapshot
-                    .selected_conversation
-                    .as_ref()
-                    .map(|detail| detail.thread_id.clone());
-                if let Some(thread_id) = thread_id {
-                    return snapshot_task(async move { api::load_images(&thread_id) });
-                }
             }
             Message::ToggleEarlier => self.reader_expanded = !self.reader_expanded,
             Message::ConversationBack => return self.reader_back(),
@@ -118,7 +112,7 @@ impl App {
                 } else if self.move_picker_open {
                     self.move_picker_open = false;
                 } else if self.compose.is_some() {
-                    self.compose = None;
+                    return self.close_compose();
                 } else if self.accounts_open {
                     self.accounts_open = false;
                     self.accounts.close_form();
@@ -409,7 +403,7 @@ impl App {
                     compose.body.perform(action);
                 }
             }
-            Message::ComposeClose => self.compose = None,
+            Message::ComposeClose => return self.close_compose(),
             Message::ComposeSend => {
                 let Some(compose) = self.compose.as_mut() else {
                     return Task::none();
@@ -523,8 +517,8 @@ impl App {
                 self.settings = settings;
                 self.settings_sync = self.settings.sync_minutes.to_string();
                 match self.settings.theme {
-                    ThemeMode::Light => self.dark = false,
-                    ThemeMode::Dark => self.dark = true,
+                    ThemeMode::Light => self.set_dark(false),
+                    ThemeMode::Dark => self.set_dark(true),
                     ThemeMode::System => {
                         return iced::system::theme().map(Message::SystemTheme);
                     }
@@ -533,11 +527,12 @@ impl App {
             Message::CloseSettings => self.settings_open = false,
             Message::SettingsSyncChanged(value) => self.settings_sync = value,
             Message::SettingsNotificationsToggled(on) => self.settings.notifications = on,
+            Message::SettingsBackgroundSyncToggled(on) => self.settings.background_sync = on,
             Message::SettingsThemeChanged(mode) => {
                 self.settings.theme = mode;
                 match mode {
-                    ThemeMode::Light => self.dark = false,
-                    ThemeMode::Dark => self.dark = true,
+                    ThemeMode::Light => self.set_dark(false),
+                    ThemeMode::Dark => self.set_dark(true),
                     ThemeMode::System => {
                         return iced::system::theme().map(Message::SystemTheme);
                     }
@@ -562,7 +557,10 @@ impl App {
             Message::SettingsSaved(result) => match result {
                 Ok(()) => {
                     self.error = Some("Settings saved.".to_string());
-                    crate::platform::schedule_sync(self.settings.sync_minutes);
+                    crate::platform::apply_background_sync(
+                        self.settings.background_sync,
+                        self.settings.sync_minutes,
+                    );
                 }
                 Err(error) => self.error = Some(error),
             },
@@ -570,7 +568,7 @@ impl App {
                 if self.settings.theme == ThemeMode::System
                     && let Some(dark) = system_theme_dark(mode)
                 {
-                    self.dark = dark;
+                    self.set_dark(dark);
                 }
             }
             Message::Noop => {}
@@ -601,6 +599,55 @@ impl App {
                 Message::ComposeLoaded(result.map(|message| ComposeSeed { id: None, message }))
             },
         )
+    }
+
+    /// Close the compose surface. A non-empty form is saved as a draft through
+    /// the normal save path so typed text is not silently discarded; the
+    /// surface stays open until the save result arrives. An empty form closes
+    /// immediately, and a form whose recipients do not parse is dropped rather
+    /// than reported on close.
+    fn close_compose(&mut self) -> Task<Message> {
+        let Some(compose) = self.compose.as_ref() else {
+            return Task::none();
+        };
+        if compose.is_empty() {
+            self.compose = None;
+            return Task::none();
+        }
+        let outgoing = compose.outgoing();
+        let id = compose.id.clone();
+        match outgoing {
+            Ok(message) => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.busy = true;
+                    compose.notice = None;
+                }
+                match id {
+                    Some(id) => Task::perform(
+                        async move {
+                            api::update_draft(&id, message)?;
+                            Ok(id)
+                        },
+                        Message::ComposeSaved,
+                    ),
+                    None => Task::perform(
+                        async move { api::save_draft(message) },
+                        Message::ComposeSaved,
+                    ),
+                }
+            }
+            Err(_) => {
+                self.compose = None;
+                Task::none()
+            }
+        }
+    }
+
+    /// Apply a light/dark change to the shell and, on Android, the system-bar
+    /// icon polarity. A no-op off Android.
+    pub(crate) fn set_dark(&mut self, dark: bool) {
+        self.dark = dark;
+        iced_android::set_system_bars_dark(dark);
     }
 
     fn select_folder(&mut self, folder: FolderId) -> Task<Message> {
@@ -679,8 +726,13 @@ impl App {
             // the gesture closes the innermost surface. Desktop never emits
             // `BrowserBack`.
             iced::keyboard::listen().filter_map(|event| match event {
+                // Desktop Escape and the Android Back gesture both close the
+                // innermost surface.
                 iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::BrowserBack),
+                    key: iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::Escape
+                        | iced::keyboard::key::Named::BrowserBack,
+                    ),
                     ..
                 } => Some(Message::Back),
                 _ => None,

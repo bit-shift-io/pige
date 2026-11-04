@@ -66,10 +66,12 @@ spec's "well under a second".
 
 ### Desktop frame time
 
-**Not measured.** iced exposes no in-app frame-timing hook here, the app is
-event-driven (there is no continuous frame loop to sample at idle), and neither
-the test harness nor the KWin/Wayland compositor offers a frame-timing CLI. What
-*was* done honestly:
+**Not measured — instrumentation was out of verification scope.** iced does
+expose `window::frames()`, so a frame-time sampler is possible; wiring it into
+the shell, attributing frames to interactions, and validating the numbers on
+this host was beyond the task-18 scope. Rather than publish an
+instrumentation-free estimate, no desktop frame time is claimed. What *was* done
+honestly:
 
 1. The release desktop binary was built (`cargo build --release -p pige --bin
    pige`) and run against the live Wayland session (`WAYLAND_DISPLAY=wayland-0`).
@@ -94,7 +96,7 @@ cd rust && cargo test --workspace
 cd rust && cargo clippy --workspace --all-targets
 ```
 
-`cargo test --workspace`: **251 passed, 0 failed, 16 ignored** (the ignored tests
+`cargo test --workspace`: **260 passed, 0 failed, 17 ignored** (the ignored tests
 are the live-network tests, the headless layout/timing tests, and the perf test).
 `cargo clippy --workspace --all-targets`: clean, no warnings.
 
@@ -191,6 +193,11 @@ mailbox, so the two are not directly comparable.
   live only in un-downloaded bodies are not found until those bodies are fetched.
 - **Replayable mutation queue** — offline mutation replay is not in v1; only
   sending is queued.
+- **Remote image fetching** — the spec lists a "Load images" action, but v1
+  fetches no remote bytes (there is deliberately no HTTP client). Blocked images
+  stay as "[image blocked]" placeholders and the misleading "Load images" bar
+  and message path were removed in the final fix wave (2026-11-04). This is a
+  deliberate, recorded deviation from the spec.
 
 ### Deferred minors (from `.superpowers/sdd/2026-11-03-pige-v1/progress.md`)
 

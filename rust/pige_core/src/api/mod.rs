@@ -389,6 +389,13 @@ pub fn init(config: Config) -> Result<(), String> {
         return Err("pige api is already initialized".to_string());
     }
 
+    // Android's `AndroidPaths::load` returns empty paths when app storage is
+    // unavailable; refuse them rather than writing `pige.db` to the process
+    // working directory.
+    if config.data_dir.as_os_str().is_empty() || config.cache_dir.as_os_str().is_empty() {
+        return Err("data and cache directories must not be empty".to_string());
+    }
+
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create data dir: {error}"))?;
     std::fs::create_dir_all(&config.cache_dir)
@@ -882,6 +889,13 @@ pub async fn sync_all() -> Result<ModelSnapshot, String> {
     let (outcome, capabilities) = sync_accounts(&config, &accounts, &sender).await;
 
     let status = finish_sync(accounts.len(), outcome, capabilities);
+    // The account sync never visits non-special folders; if one is open,
+    // refresh it too so manual refresh and pull-to-refresh update the view.
+    if let Some(folder) = selected_other_folder()
+        && let Err(error) = sync_folder_inner(&folder).await
+    {
+        log::warn!("refresh open folder {}: {error}", folder);
+    }
     let snapshot = snapshot();
     let _ = sender.send(CoreEvent::SnapshotChanged);
     if let SyncStatus::Error(message) = status {
@@ -923,10 +937,77 @@ pub async fn sync_account(id: &AccountId) -> Result<ModelSnapshot, String> {
     Ok(snapshot)
 }
 
-/// Select a folder and reset the conversation page.
+/// Sync one folder on demand. Used to open a non-special folder (a Gmail user
+/// label or any "Other" IMAP folder, which the account sync deliberately
+/// skips), and to refresh a destination folder after a move. Serialized with
+/// account syncs through [`SYNC_LOCK`] so it cannot race SQLite writes.
+pub async fn sync_folder(id: &FolderId) -> Result<ModelSnapshot, String> {
+    let _sync = SYNC_LOCK.lock().await;
+    sync_folder_inner(id).await
+}
+
+/// One-folder sync that assumes `SYNC_LOCK` is already held. Locates the
+/// account and folder, connects, and runs the engine's one-folder sync with a
+/// thread index seeded from the account's cached messages.
+async fn sync_folder_inner(id: &FolderId) -> Result<ModelSnapshot, String> {
+    let (config, account, folder, sender) = {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let (account, folder) = locate_folder(&state.store, id)?;
+        (state.config.clone(), account, folder, state.events.clone())
+    };
+
+    let store = Store::open(database_path(&config.data_dir))
+        .map_err(|error| format!("open folder store: {error}"))?;
+    let mut transport = config
+        .transport
+        .imap(&account)
+        .await
+        .map_err(|error| format!("{}: {error}", account.label))?;
+    let remote = RemoteFolder {
+        name: folder.name.clone(),
+        delimiter: folder.delimiter.clone(),
+        kind: folder.kind,
+    };
+    let mut threads = ThreadAssigner::from_messages(
+        &store
+            .messages_for_account(&account.id)
+            .map_err(|error| format!("read thread index: {error}"))?,
+    );
+    crate::sync::engine::sync_folder(
+        &store,
+        &account,
+        transport.as_mut(),
+        &remote,
+        &folder,
+        SYNC_WINDOW,
+        &mut threads,
+    )
+    .await?;
+
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot())
+}
+
+/// The currently selected folder when it is one the account sync never visits,
+/// so a manual refresh can sync it too.
+fn selected_other_folder() -> Option<FolderId> {
+    let guard = lock_state();
+    let state = guard.as_ref()?;
+    let folder = state.selected_folder.as_ref()?;
+    let (_, row) = locate_folder(&state.store, folder).ok()?;
+    (row.kind == FolderKind::Other).then(|| folder.clone())
+}
+
+/// Select a folder and reset the conversation page. Non-special folders are
+/// synced on first open ("other folders sync when opened"); a network failure
+/// is logged and the cached snapshot is returned rather than failing the
+/// selection.
 pub async fn select_folder(id: &FolderId) -> Result<ModelSnapshot, String> {
     let sender;
-    {
+    let needs_sync = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
@@ -936,9 +1017,23 @@ pub async fn select_folder(id: &FolderId) -> Result<ModelSnapshot, String> {
         state.conversation_limit = INITIAL_PAGE;
         state.selected_conversation = None;
         state.server_more = None;
+        let needs_sync = locate_folder(&state.store, id).is_ok_and(|(_, folder)| {
+            folder.kind == FolderKind::Other
+                && (folder.uidnext.is_none()
+                    || state
+                        .store
+                        .messages(id, 1, None)
+                        .map(|messages| messages.is_empty())
+                        .unwrap_or(true))
+        });
         sender = state.events.clone();
-    }
+        needs_sync
+    };
     let _ = sender.send(CoreEvent::SnapshotChanged);
+
+    if needs_sync && let Err(error) = sync_folder(id).await {
+        log::warn!("sync newly opened folder {}: {error}", id);
+    }
     Ok(snapshot())
 }
 
@@ -1166,46 +1261,38 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
                 Vec::new()
             }
         };
-        let detail =
-            build_conversation_detail(thread_id, &account.id, &messages, body, attachments);
+        // Earlier messages carry their cached bodies so "Earlier messages" can
+        // show real content instead of names only. Reading cached SQLite rows is
+        // cheap; a missing body degrades to `None` and the reader shows the
+        // snippet plus a "Not downloaded" label.
+        let earlier_bodies: HashMap<MessageId, MessageBody> = messages
+            .iter()
+            .skip(1)
+            .filter_map(|message| {
+                if message.header.size > MAX_BODY_BYTES {
+                    return Some((message.id.clone(), MessageBody::TooLarge));
+                }
+                state
+                    .store
+                    .body(&message.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|cached| {
+                        document_from_body(&cached)
+                            .map(|document| (message.id.clone(), MessageBody::Document(document)))
+                    })
+            })
+            .collect();
+        let detail = build_conversation_detail(
+            thread_id,
+            &account.id,
+            &messages,
+            body,
+            &earlier_bodies,
+            attachments,
+        );
         state.selected_conversation = Some(detail);
         state.build_snapshot()
-    };
-    let _ = events.send(CoreEvent::SnapshotChanged);
-    Ok(snapshot)
-}
-
-/// Re-parse the newest message's cached HTML with remote images allowed. Remote
-/// images have no bytes to fetch, so they are dropped, clearing the "Load
-/// images" prompt.
-pub fn load_images(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
-    let (events, snapshot) = {
-        let mut guard = lock_state();
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| "pige api is not initialized".to_string())?;
-        let messages = state
-            .store
-            .messages_for_thread(thread_id)
-            .map_err(|error| format!("read conversation: {error}"))?;
-        let Some(newest) = messages.first() else {
-            return Err(format!("unknown conversation {thread_id}"));
-        };
-        if let Some(body) = state
-            .store
-            .body(&newest.id)
-            .map_err(|error| format!("read cached body: {error}"))?
-            && let Some(html) = body.html
-        {
-            let document = parse_html(&html, true);
-            if let Some(detail) = state.selected_conversation.as_mut()
-                && let Some(summary) = detail.messages.first_mut()
-            {
-                summary.body = Some(MessageBody::Document(document));
-            }
-        }
-        let snapshot = state.build_snapshot();
-        (state.events.clone(), snapshot)
     };
     let _ = events.send(CoreEvent::SnapshotChanged);
     Ok(snapshot)
@@ -1417,42 +1504,6 @@ pub fn draft(id: &OutboxId) -> Result<Option<OutboxEntry>, String> {
         .store
         .outbox_entry(id)
         .map_err(|error| format!("read draft: {error}"))
-}
-
-/// Mark every message in a conversation as read. Fired by the reader after the
-/// message has been visible for a moment.
-pub async fn mark_read(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
-    let events = {
-        let mut guard = lock_state();
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| "pige api is not initialized".to_string())?;
-        let messages = state
-            .store
-            .messages_for_thread(thread_id)
-            .map_err(|error| format!("read conversation: {error}"))?;
-        for message in messages {
-            if !message.flags.seen {
-                let mut flags = message.flags;
-                flags.seen = true;
-                state
-                    .store
-                    .set_flags(&message.id, &flags)
-                    .map_err(|error| format!("mark read: {error}"))?;
-                if let Some(detail) = state.selected_conversation.as_mut()
-                    && let Some(summary) = detail
-                        .messages
-                        .iter_mut()
-                        .find(|summary| summary.id == message.id)
-                {
-                    summary.flags = flags;
-                }
-            }
-        }
-        state.events.clone()
-    };
-    let _ = events.send(CoreEvent::SnapshotChanged);
-    Ok(snapshot())
 }
 
 /// Open a URL with the platform's default handler. Synchronous because the
@@ -1673,12 +1724,13 @@ fn document_from_body(body: &Body) -> Option<MailDocument> {
 }
 
 /// Assemble the reader view for a conversation, attaching the newest message's
-/// body to its summary.
+/// resolved body and any cached bodies for earlier messages.
 fn build_conversation_detail(
     thread_id: &ThreadId,
     account_id: &AccountId,
     messages: &[StoredMessage],
     body: Option<MessageBody>,
+    earlier_bodies: &HashMap<MessageId, MessageBody>,
     attachments: Vec<AttachmentPart>,
 ) -> ConversationDetail {
     let subject = messages
@@ -1701,7 +1753,11 @@ fn build_conversation_detail(
             } else {
                 Vec::new()
             },
-            body: if index == 0 { body.clone() } else { None },
+            body: if index == 0 {
+                body.clone()
+            } else {
+                earlier_bodies.get(&message.id).cloned()
+            },
         })
         .collect();
 
@@ -1754,7 +1810,6 @@ async fn backfill_older(
     folder: &Folder,
     oldest: Option<Uid>,
 ) -> Result<(usize, bool), String> {
-    let oldest = oldest.ok_or_else(|| "no cached mail to page from".to_string())?;
     let mut transport = config
         .transport
         .imap(account)
@@ -1782,9 +1837,19 @@ async fn backfill_older(
 
     // Fetch one extra message so `server_more` is known without another round
     // trip. The range walk handles sparse UIDs, not just dense UID sequences.
+    //
+    // With no cached mail (a folder opened before its first sync), start at the
+    // server's UIDNEXT high-water mark so paging can bootstrap an empty folder
+    // instead of failing forever; the top UID is included in that case.
+    let (ceiling, mut cursor, include_ceiling) = match oldest {
+        Some(uid) => (uid.0, uid.0.saturating_sub(1), false),
+        None => {
+            let top = state.uidnext.saturating_sub(1);
+            (top, top, true)
+        }
+    };
     let want = PAGE_SIZE as usize;
     let mut found = Vec::new();
-    let mut cursor = oldest.0.saturating_sub(1);
     while found.len() <= want && cursor >= 1 {
         let remaining = (want + 1 - found.len()) as u32;
         let from = cursor.saturating_sub(remaining.saturating_sub(1)).max(1);
@@ -1795,7 +1860,13 @@ async fn backfill_older(
             })
             .await
             .map_err(|error| format!("fetch older in {}: {error}", folder.name))?;
-        found.extend(batch.into_iter().filter(|message| message.uid < oldest));
+        found.extend(batch.into_iter().filter(|message| {
+            if include_ceiling {
+                message.uid.0 <= ceiling
+            } else {
+                message.uid.0 < ceiling
+            }
+        }));
         if from == 1 {
             break;
         }
@@ -1857,6 +1928,9 @@ async fn backfill_older(
     updated.unread = unread;
     updated.total = state.exists;
     updated.uidvalidity = Some(uidvalidity);
+    // Record the high-water mark so a later paging call (and the open-sync
+    // guard) treats this folder as synced.
+    updated.uidnext = Some(state.uidnext);
     store
         .upsert_folder(&updated)
         .map_err(|error| format!("store folder {}: {error}", folder.name))?;

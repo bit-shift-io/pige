@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use pige_core::{
     Account, AccountId, Address, AuthKind, Flags, FolderKind, MessageHeader, Security,
     ServerConfig, Store, Uid,
+    search::{SearchScope, search},
     sync::sync_account,
     transport::{FakeTransport, FolderState, RemoteFolder, RemoteMessage, UidRange},
 };
@@ -275,6 +276,58 @@ async fn flag_changes_are_reconciled_without_refetching_headers() {
     assert_eq!(
         fake.fetch_flags_calls,
         vec![("INBOX".to_string(), vec![Uid(1), Uid(2)])]
+    );
+}
+
+#[tokio::test]
+async fn expunged_uids_are_removed_from_the_cache_and_search() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    store.upsert_account(&account).unwrap();
+
+    let mut fake = FakeTransport {
+        folders: vec![folder("INBOX", FolderKind::Inbox)],
+        messages: HashMap::from([(
+            "INBOX".to_string(),
+            vec![
+                msg(1, "keepme", "a@example.com"),
+                msg(2, "expungeme", "b@example.com"),
+            ],
+        )]),
+        states: HashMap::from([("INBOX".to_string(), state(1, 3))]),
+        ..FakeTransport::default()
+    };
+
+    sync_account(&store, &account, &mut fake, 10).await.unwrap();
+    let folder_id = store.folders(&account.id).unwrap()[0].id.clone();
+    assert_eq!(store.messages(&folder_id, 10, None).unwrap().len(), 2);
+    assert_eq!(
+        search(&store, "expungeme", &SearchScope::AllAccounts, 10)
+            .unwrap()
+            .len(),
+        1,
+        "the message must be indexed before it is expunged"
+    );
+
+    // The server expunges UID 2; the next FETCH response no longer lists it.
+    fake.messages
+        .get_mut("INBOX")
+        .unwrap()
+        .retain(|message| message.uid != Uid(2));
+    fake.states.insert("INBOX".to_string(), state(1, 3));
+
+    let report = sync_account(&store, &account, &mut fake, 10).await.unwrap();
+    assert!(report.errors.is_empty());
+
+    let remaining = store.messages(&folder_id, 10, None).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].uid, Uid(1));
+    assert!(
+        search(&store, "expungeme", &SearchScope::AllAccounts, 10)
+            .unwrap()
+            .is_empty(),
+        "the expunged message's search hit must be gone too"
     );
 }
 

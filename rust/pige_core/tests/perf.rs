@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use pige_core::{
     Account, AccountId, Address, AuthKind, Body, Flags, Folder, FolderId, FolderKind,
-    MessageHeader, MessageId, Security, ServerConfig, Store, StoredMessage, ThreadId, Uid,
-    SearchScope,
+    MessageHeader, MessageId, SearchScope, Security, ServerConfig, Store, StoredMessage, ThreadId,
+    Uid,
 };
 use tempfile::TempDir;
 
@@ -71,7 +71,11 @@ fn seed(store: &Store) {
     store.upsert_folder(&inbox).unwrap();
 
     for index in 0..CONVERSATIONS {
-        let keyword = if index % 10 == 0 { "quantum" } else { "ordinary" };
+        let keyword = if index % 10 == 0 {
+            "quantum"
+        } else {
+            "ordinary"
+        };
         let subject = format!("Conversation {index:04} about {keyword} matters");
         let message = StoredMessage {
             id: MessageId(format!("message-{index}")),
@@ -84,7 +88,10 @@ fn seed(store: &Store) {
                 in_reply_to: None,
                 references: Vec::new(),
                 subject: subject.clone(),
-                from: vec![Address::new(Some(format!("Sender {index}")), "ada@example.com")],
+                from: vec![Address::new(
+                    Some(format!("Sender {index}")),
+                    "ada@example.com",
+                )],
                 to: vec![Address::new(None, "inbox@example.com")],
                 cc: Vec::new(),
                 date: 1_700_000_000 + i64::from(index),

@@ -7,7 +7,7 @@ use iced::{Alignment, Element, Fill};
 use crate::app::App;
 use crate::components::{self, PaneTone};
 use crate::icons;
-use crate::layout::{Breakpoint, Panes, panes};
+use crate::layout::{Breakpoint, Panes, panes_for};
 use crate::message::Message;
 use crate::theme;
 
@@ -16,7 +16,8 @@ impl App {
         theme::set_active(theme::palette(self.dark));
 
         let breakpoint = Breakpoint::from_width(self.size.width);
-        let panes = panes(breakpoint, self.drawer_open);
+        let reading = self.snapshot.selected_conversation.is_some();
+        let panes = panes_for(breakpoint, self.drawer_open, reading);
         let base = if self.accounts_open {
             crate::screens::accounts::screen(self)
         } else if self.settings_open {
@@ -70,15 +71,37 @@ impl App {
             ));
         }
         if panes.reader {
-            layout = layout.push(components::divider());
+            // A divider only separates panes that are shown together; on compact
+            // the reader replaces the list and sits on its own.
+            if panes.list {
+                layout = layout.push(components::divider());
+            }
             layout = layout.push(self.reader_pane());
         }
 
-        container(layout)
+        let base: Element<'_, Message> = container(layout)
             .width(Fill)
             .height(Fill)
             .style(components::pane_style(PaneTone::Page))
-            .into()
+            .into();
+
+        // The spec asks for a floating compose button on compact layouts; wide
+        // layouts keep the toolbar compose button instead.
+        if breakpoint == Breakpoint::Compact && panes.list {
+            let palette = theme::active();
+            let fab = container(components::floating_action_button(
+                icons::EDIT,
+                "Compose",
+                Message::Compose,
+            ))
+            .width(Fill)
+            .height(Fill)
+            .padding(palette.space.lg)
+            .align_x(Alignment::End)
+            .align_y(Alignment::End);
+            return stack![base, fab].into();
+        }
+        base
     }
 
     fn reader_pane(&self) -> Element<'_, Message> {

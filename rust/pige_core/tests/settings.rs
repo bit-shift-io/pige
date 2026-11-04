@@ -19,8 +19,26 @@ fn settings_default_to_15_minutes_notifications_on_and_system_theme() {
 
     assert_eq!(settings.sync_minutes, 15);
     assert!(settings.notifications);
+    assert!(settings.background_sync);
     assert_eq!(settings.theme, ThemeMode::System);
     assert_eq!(settings, Settings::default());
+}
+
+#[test]
+fn background_sync_round_trips_when_off() {
+    let (store, _dir) = migrated_store();
+
+    let settings = Settings {
+        sync_minutes: 30,
+        notifications: true,
+        background_sync: false,
+        theme: ThemeMode::System,
+    };
+    save_settings(&store, &settings).expect("save settings");
+
+    let loaded = load_settings(&store);
+    assert!(!loaded.background_sync);
+    assert_eq!(loaded, settings);
 }
 
 #[test]
@@ -30,6 +48,7 @@ fn settings_round_trip_and_clamp_invalid_interval() {
     let mut settings = Settings {
         sync_minutes: 30,
         notifications: false,
+        background_sync: true,
         theme: ThemeMode::Dark,
     };
     save_settings(&store, &settings).expect("save settings");

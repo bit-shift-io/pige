@@ -37,6 +37,9 @@ pub struct Settings {
     pub sync_minutes: u16,
     /// Whether new mail posts a desktop/Android notification.
     pub notifications: bool,
+    /// Whether the shell runs periodic background sync. Android schedules (or
+    /// cancels) WorkManager from this flag; desktop only persists it.
+    pub background_sync: bool,
     /// The preferred colour scheme.
     pub theme: ThemeMode,
 }
@@ -46,6 +49,7 @@ impl Default for Settings {
         Self {
             sync_minutes: DEFAULT_SYNC_MINUTES,
             notifications: true,
+            background_sync: true,
             theme: ThemeMode::System,
         }
     }
@@ -101,6 +105,7 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.sync_minutes, 15);
         assert!(settings.notifications);
+        assert!(settings.background_sync);
         assert_eq!(settings.theme, ThemeMode::System);
     }
 }

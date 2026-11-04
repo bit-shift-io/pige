@@ -4,7 +4,6 @@ package bitshift.pige
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.util.Log
 import androidx.core.content.FileProvider
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
@@ -22,34 +21,23 @@ object PigeBridge {
     /// WorkManager's minimum periodic interval. Changing the sync interval in
     /// settings calls [scheduleSync] to replace this work.
     private const val MIN_SYNC_MINUTES = 15
-    const val DEFAULT_SYNC_MINUTES = MIN_SYNC_MINUTES
     private const val WORK_NAME = "pige-sync"
 
     private var appContext: Context? = null
 
+    /// Install the application context. Background sync is scheduled by Rust
+    /// from the persisted settings after the core initializes (see
+    /// `nativeInit`), not from a hardcoded default here.
     @JvmStatic
     fun install(context: Context) {
-        install(context, schedule = true)
+        appContext = context.applicationContext
     }
 
     /// Worker entry point: installs the context without re-enqueueing the
     /// periodic work from inside its own run.
     @JvmStatic
     fun installForWorker(context: Context) {
-        install(context, schedule = false)
-    }
-
-    private fun install(context: Context, schedule: Boolean) {
-        appContext = context.applicationContext
-        if (schedule) {
-            try {
-                scheduleSync(DEFAULT_SYNC_MINUTES)
-            } catch (error: Throwable) {
-                // WorkManager being unavailable must not prevent the app from
-                // opening; the next successful launch will try again.
-                Log.w("pige", "schedule background sync failed", error)
-            }
-        }
+        install(context)
     }
 
     @JvmStatic
@@ -128,5 +116,12 @@ object PigeBridge {
             ExistingPeriodicWorkPolicy.UPDATE,
             request,
         )
+    }
+
+    /// Cancel the unique periodic sync, for when the user turns background sync
+    /// off. Safe to call when no work is enqueued.
+    @JvmStatic
+    fun cancelSync() {
+        WorkManager.getInstance(getAppContext()).cancelUniqueWork(WORK_NAME)
     }
 }

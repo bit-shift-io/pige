@@ -97,7 +97,12 @@ pub extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _reserved: *mut c_v
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_bitshift_pige_MainActivity_nativeInit(_env: JNIEnv, _this: JObject) {
     init_logging();
-    initialize_api("nativeInit");
+    if initialize_api("nativeInit") {
+        // Rust owns the persisted background-sync choice; apply it now that the
+        // store is open instead of scheduling a hardcoded default.
+        let settings = api::settings();
+        crate::platform::apply_background_sync(settings.background_sync, settings.sync_minutes);
+    }
 }
 
 /// Called by `SyncWorker` on a background thread. If WorkManager started this

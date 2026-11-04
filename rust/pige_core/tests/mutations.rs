@@ -12,7 +12,7 @@ use pige_core::{
     ServerConfig, Store, StoredMessage, ThreadId, Uid,
     api::{self, AccountInput, Config, DB_FILE_NAME},
     platform::fake::{FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory},
-    transport::{Capabilities, FakeTransport, FlagOp, FolderState},
+    transport::{Capabilities, FakeTransport, FlagOp, FolderState, RemoteMessage},
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -528,9 +528,10 @@ async fn archive_is_hidden_without_gmail_or_an_archive_folder() {
         move_ext: false,
     };
     assert!(api::archive_available(&gmail, FolderKind::Inbox, false));
-    // Never archive from Trash or Spam.
+    // Never archive from Trash, Spam, or Archive (Gmail All Mail included).
     assert!(!api::archive_available(&gmail, FolderKind::Trash, false));
     assert!(!api::archive_available(&gmail, FolderKind::Junk, false));
+    assert!(!api::archive_available(&gmail, FolderKind::Archive, true));
 }
 
 #[tokio::test]
@@ -574,6 +575,195 @@ async fn mutations_scope_to_the_current_folder_and_never_touch_sent() {
     assert!(inbox_messages.is_empty(), "Inbox copy must be gone");
     let sent_messages = store.messages(&sent.id, 10, None).unwrap();
     assert_eq!(sent_messages.len(), 1, "Sent copy must remain untouched");
+}
+
+/// A scripted server message, used to reflect a STORE or a server-side move
+/// back into the fake mailbox across a sync.
+fn remote(uid: u32, subject: &str, seen: bool) -> RemoteMessage {
+    RemoteMessage {
+        uid: Uid(uid),
+        header: MessageHeader {
+            message_id: Some(format!("<{uid}@example.com>")),
+            in_reply_to: None,
+            references: Vec::new(),
+            subject: subject.to_string(),
+            from: vec![Address::new(None, "sender@example.com")],
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: i64::from(uid),
+            size: 64,
+        },
+        flags: Flags {
+            seen,
+            ..Flags::default()
+        },
+        size: 64,
+    }
+}
+
+#[tokio::test]
+async fn reader_open_read_survives_a_sync() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let account = account_and_transport(
+        &harness,
+        Capabilities {
+            gmail: false,
+            move_ext: true,
+        },
+    )
+    .await;
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account, "INBOX", FolderKind::Inbox);
+    store.upsert_folder(&inbox).unwrap();
+    seed_message(&store, &inbox, 1, "thread");
+
+    api::select_folder(&inbox.id).await.expect("select inbox");
+    // The reader-open path marks read through the server-backed, current-folder
+    // scoped API.
+    api::set_read(&ThreadId("thread".into()), true)
+        .await
+        .expect("mark read");
+
+    // The server accepted the STORE; reflect it in the scripted mailbox.
+    let mut transport = harness.factory.transport(&account).await.unwrap();
+    transport.messages = HashMap::from([("INBOX".to_string(), vec![remote(1, "Subject 1", true)])]);
+    transport.states = HashMap::from([(
+        "INBOX".to_string(),
+        FolderState {
+            uidvalidity: 1,
+            uidnext: 2,
+            exists: 1,
+        },
+    )]);
+    harness.factory.add_transport(account.clone(), transport);
+
+    api::sync_all().await.expect("sync");
+
+    let seen = harness.open_store().messages(&inbox.id, 10, None).unwrap()[0]
+        .flags
+        .seen;
+    assert!(seen, "read state must survive a sync");
+}
+
+#[tokio::test]
+async fn move_into_an_other_folder_syncs_the_destination() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let account = account_and_transport(
+        &harness,
+        Capabilities {
+            gmail: false,
+            move_ext: true,
+        },
+    )
+    .await;
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account, "INBOX", FolderKind::Inbox);
+    let mut work = folder("work", &account, "Work", FolderKind::Other);
+    work.uidvalidity = None;
+    work.uidnext = None;
+    store.upsert_folder(&inbox).unwrap();
+    store.upsert_folder(&work).unwrap();
+    seed_message(&store, &inbox, 1, "thread");
+
+    // The destination already holds the moved message, as it would after MOVE.
+    let transport = FakeTransport {
+        capabilities: Capabilities {
+            gmail: false,
+            move_ext: true,
+        },
+        messages: HashMap::from([("Work".to_string(), vec![remote(1, "moved mail", false)])]),
+        states: HashMap::from([(
+            "Work".to_string(),
+            FolderState {
+                uidvalidity: 1,
+                uidnext: 2,
+                exists: 1,
+            },
+        )]),
+        ..FakeTransport::default()
+    };
+    harness.factory.add_transport(account.clone(), transport);
+
+    api::select_folder(&inbox.id).await.expect("select inbox");
+    api::move_thread(&ThreadId("thread".into()), &work.id)
+        .await
+        .expect("move");
+
+    let visible = harness.open_store().messages(&work.id, 10, None).unwrap();
+    assert_eq!(
+        visible.len(),
+        1,
+        "moved conversation must appear in the destination label"
+    );
+}
+
+#[tokio::test]
+async fn archive_from_all_mail_is_refused() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let account = account_and_transport(
+        &harness,
+        Capabilities {
+            gmail: true,
+            move_ext: false,
+        },
+    )
+    .await;
+    let store = harness.open_store();
+    let all = folder("all", &account, "[Gmail]/All Mail", FolderKind::Archive);
+    store.upsert_folder(&all).unwrap();
+    seed_message(&store, &all, 1, "thread");
+
+    api::select_folder(&all.id).await.expect("select all mail");
+    let error = api::archive_thread(&ThreadId("thread".into()))
+        .await
+        .expect_err("archive from All Mail must be refused");
+    assert!(error.contains("archive"), "got {error}");
+}
+
+#[tokio::test]
+async fn gmail_move_from_all_mail_copies_without_deleting() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let account = account_and_transport(
+        &harness,
+        Capabilities {
+            gmail: true,
+            move_ext: false,
+        },
+    )
+    .await;
+    let store = harness.open_store();
+    let all = folder("all", &account, "[Gmail]/All Mail", FolderKind::Archive);
+    let work = folder("work", &account, "Work", FolderKind::Other);
+    store.upsert_folder(&all).unwrap();
+    store.upsert_folder(&work).unwrap();
+    seed_message(&store, &all, 1, "thread");
+
+    api::select_folder(&all.id).await.expect("select all mail");
+    api::move_thread(&ThreadId("thread".into()), &work.id)
+        .await
+        .expect("move");
+
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert_eq!(
+        transport.copy_calls,
+        vec![(
+            "[Gmail]/All Mail".to_string(),
+            vec![Uid(1)],
+            "Work".to_string()
+        )]
+    );
+    assert!(
+        transport.delete_calls.is_empty(),
+        "All Mail membership must not be deleted"
+    );
 }
 
 #[tokio::test]

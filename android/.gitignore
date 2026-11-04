@@ -6,7 +6,11 @@
 /local.properties
 .cxx/
 
-# Never publicly share a signing key.
+# Never publicly share a signing key, except the shared test-phone key below.
 key.properties
 **/*.keystore
 **/*.jks
+# The shared test-phone key is committed on purpose so every PC signs
+# identically (see android/keystore.properties).
+!keystore/pige-release.jks
+!keystore.properties

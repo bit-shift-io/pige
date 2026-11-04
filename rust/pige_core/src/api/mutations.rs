@@ -42,7 +42,12 @@ pub fn archive_available(
     current: FolderKind,
     has_archive: bool,
 ) -> bool {
-    if matches!(current, FolderKind::Trash | FolderKind::Junk) {
+    // Archiving from Archive (Gmail All Mail) or its generic equivalent is
+    // meaningless and, on Gmail, removing All Mail membership would expunge.
+    if matches!(
+        current,
+        FolderKind::Trash | FolderKind::Junk | FolderKind::Archive
+    ) {
         return false;
     }
     capabilities.gmail || has_archive
@@ -143,17 +148,26 @@ pub async fn move_thread(thread: &ThreadId, dest: &FolderId) -> Result<ModelSnap
     remove_optimistically(&target, &sender)?;
 
     let dest_name = dest_folder.name.clone();
+    let source_from_all_mail = caps.gmail && target.folder.kind == FolderKind::Archive;
     let outcome = async {
         select_target(transport.as_mut(), &target).await?;
         if caps.gmail {
+            // Gmail "move" removes the source label. From All Mail that label
+            // is implicit membership, so deleting the source copy would expunge
+            // the message from every label; copy to the destination and keep
+            // All Mail. Trash keeps its own copy-then-delete semantics.
             transport
                 .copy_messages(&target.uids, &dest_name)
                 .await
                 .map_err(transport_msg)?;
-            transport
-                .delete_messages(&target.uids)
-                .await
-                .map_err(transport_msg)
+            if source_from_all_mail {
+                Ok(())
+            } else {
+                transport
+                    .delete_messages(&target.uids)
+                    .await
+                    .map_err(transport_msg)
+            }
         } else if caps.move_ext {
             transport
                 .move_messages(&target.uids, &dest_name)
@@ -172,7 +186,13 @@ pub async fn move_thread(thread: &ThreadId, dest: &FolderId) -> Result<ModelSnap
     }
     .await;
 
-    conclude(&target, &sender, outcome)
+    conclude(&target, &sender, outcome)?;
+    // The server move already succeeded; make the destination visible locally.
+    // A failed follow-up sync must not turn a successful move into an error.
+    if let Err(error) = super::sync_folder(dest).await {
+        log::warn!("sync destination folder after move: {error}");
+    }
+    Ok(snapshot())
 }
 
 /// Archive the conversation. Gmail archive removes the source label; generic
@@ -182,8 +202,12 @@ pub async fn archive_thread(thread: &ThreadId) -> Result<ModelSnapshot, String> 
         let guard = lock_state();
         let state = guard.as_ref().ok_or_else(not_initialized)?;
         let target = resolve_target(state, thread)?;
-        // Never archive from Trash or Spam.
-        if matches!(target.folder.kind, FolderKind::Trash | FolderKind::Junk) {
+        // Never archive from Trash, Spam, or Archive itself. On Gmail, All Mail
+        // is implicit membership: removing it would delete the message.
+        if matches!(
+            target.folder.kind,
+            FolderKind::Trash | FolderKind::Junk | FolderKind::Archive
+        ) {
             return Err(format!("cannot archive from {}", target.folder.name));
         }
         let archive_folder = state

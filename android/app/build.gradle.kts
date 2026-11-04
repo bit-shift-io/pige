@@ -1,8 +1,18 @@
 // Adapted from qlaunch (bitshift, MIT).
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// The shared test-phone key is committed at android/keystore/ so every PC signs
+// identically; `android/keystore.properties` supplies it.
+val keystoreProperties = Properties().apply {
+    val file = rootProject.file("keystore.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+val hasSharedKey = keystoreProperties.getProperty("storeFile") != null
 
 android {
     namespace = "bitshift.pige"
@@ -28,10 +38,36 @@ android {
         ndk { abiFilters += "arm64-v8a" }
     }
 
+    signingConfigs {
+        if (hasSharedKey) {
+            create("shared") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
+        // Sign development builds with the shared key too, so installs from
+        // different machines replace one another instead of failing with a
+        // signature mismatch. The first install after switching keys needs an
+        // uninstall because the old APK used the local debug key.
+        debug {
+            signingConfig = if (hasSharedKey) {
+                signingConfigs.getByName("shared")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+        }
         release {
-            // No release key yet; sign with the debug key so assembleRelease works.
-            signingConfig = signingConfigs.getByName("debug")
+            // A missing keystore.properties falls back to the local debug key.
+            signingConfig = if (hasSharedKey) {
+                signingConfigs.getByName("shared")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }

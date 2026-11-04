@@ -80,18 +80,23 @@ pub(crate) fn config() -> api::Config {
     }
 }
 
-/// Ask the host to reschedule periodic background sync. Android forwards the
-/// interval to WorkManager; the desktop has no background worker, so this is a
-/// deliberate no-op there.
+/// Apply the persisted background-sync choice. Android schedules the periodic
+/// WorkManager job when enabled and cancels it when disabled; the desktop has no
+/// background worker, so this is a deliberate no-op there.
 #[cfg(target_os = "android")]
-pub(crate) fn schedule_sync(minutes: u16) {
-    if let Err(error) = pige_core::platform::android::schedule_sync(minutes) {
-        log::warn!("schedule Android background sync: {error}");
+pub(crate) fn apply_background_sync(enabled: bool, minutes: u16) {
+    let result = if enabled {
+        pige_core::platform::android::schedule_sync(minutes)
+    } else {
+        pige_core::platform::android::cancel_sync()
+    };
+    if let Err(error) = result {
+        log::warn!("update Android background sync: {error}");
     }
 }
 
 #[cfg(not(target_os = "android"))]
-pub(crate) fn schedule_sync(_minutes: u16) {}
+pub(crate) fn apply_background_sync(_enabled: bool, _minutes: u16) {}
 
 /// Resolve `$XDG_*_HOME/pige`, falling back to the XDG default under `$HOME`.
 /// A process-scoped temp directory keeps the shell usable if `HOME` is unset.

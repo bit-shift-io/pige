@@ -93,6 +93,7 @@ impl App {
         });
         let (snapshot, init_error) = initialize_api();
         let selected_account = selection_account(&snapshot);
+        let has_accounts = !snapshot.accounts.is_empty();
 
         // Start from the defaults and let the persisted settings arrive through
         // `SettingsLoaded`; `App::new` must not block the runtime on SQLite.
@@ -105,10 +106,20 @@ impl App {
         // Light system-bar icons against the dark shell. No-op off Android.
         iced_android::set_system_bars_dark(true);
 
-        let startup = Task::batch([
+        let mut startup = vec![
             open.map(|_| Message::Noop),
             Task::perform(async { api::settings() }, Message::SettingsLoaded),
-        ]);
+        ];
+        // Sync-on-open: kick a background sync through the normal message path
+        // (so SyncStarted/Finished and errors behave as usual) once an account
+        // exists. Window creation is never blocked on the network.
+        if has_accounts {
+            startup.push(Task::perform(api::sync_all(), |result| match result {
+                Ok(snapshot) => Message::Snapshot(snapshot),
+                Err(error) => Message::Error(error),
+            }));
+        }
+        let startup = Task::batch(startup);
 
         (
             App {

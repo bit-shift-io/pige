@@ -198,6 +198,63 @@ pub fn icon_button<'a>(glyph: char, tooltip: &str, on_press: Message) -> Element
         .into()
 }
 
+/// A circular floating action button for compact layouts: filled primary
+/// colours, a touch-plus target, and a top tooltip. Placed bottom-end over the
+/// message list by `view`.
+pub fn floating_action_button<'a>(
+    glyph: char,
+    tooltip: &str,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let palette = theme::active();
+    let size = palette.metrics.touch_target + palette.space.sm;
+    let glyph = glyph.to_string();
+    let tooltip = tooltip.to_string();
+
+    let content = iced::widget::text(glyph)
+        .font(icons::FONT)
+        .size(palette.metrics.icon_size)
+        .color(palette.on_primary);
+
+    let button = widget_button(container(content).center(Fill))
+        .width(size)
+        .height(size)
+        .padding(0)
+        .style(move |_, status| {
+            let background = match status {
+                widget_button::Status::Hovered | widget_button::Status::Pressed => {
+                    palette.primary_container
+                }
+                widget_button::Status::Disabled => palette.disabled(palette.on_surface),
+                _ => palette.primary,
+            };
+            widget_button::Style {
+                background: Some(background.into()),
+                text_color: palette.on_primary,
+                border: iced::border::rounded(size / 2.0),
+                ..Default::default()
+            }
+        })
+        .on_press(on_press);
+
+    let tip = container(styled_text(
+        tooltip,
+        palette.role(TextRole::LabelSmall),
+        palette.on_inverse_surface,
+    ))
+    .padding([palette.space.xs, palette.space.sm])
+    .style(move |_| container::Style {
+        background: Some(palette.inverse_surface.into()),
+        text_color: Some(palette.on_inverse_surface),
+        border: iced::border::rounded(palette.radius.xs),
+        ..Default::default()
+    });
+
+    iced::widget::tooltip(button, tip, tooltip::Position::Top)
+        .gap(palette.space.xs)
+        .into()
+}
+
 /// The height of a standard action button.
 pub fn height() -> f32 {
     theme::active().metrics.action_height

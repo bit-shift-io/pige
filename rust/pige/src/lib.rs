@@ -136,17 +136,22 @@ mod tests {
         .expect("headless wgpu adapter");
 
         const RUNS: usize = 50;
-        for (label, width) in [("compact", 600.0_f32), ("medium", 900.0), ("expanded", 1300.0)] {
+        for (label, width) in [
+            ("compact", 600.0_f32),
+            ("medium", 900.0),
+            ("expanded", 1300.0),
+        ] {
             let (mut app, _) = App::new();
             app.size = iced::Size::new(width, 800.0);
-            let limits =
-                layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0));
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0));
 
             // Warm up caches before timing.
             for _ in 0..5 {
                 let mut element = app.view(window::Id::unique());
                 let mut tree = Tree::new(&element);
-                let _ = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let _ = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
             }
 
             let mut samples = Vec::with_capacity(RUNS);
@@ -154,7 +159,9 @@ mod tests {
                 let started = Instant::now();
                 let mut element = app.view(window::Id::unique());
                 let mut tree = Tree::new(&element);
-                let _ = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let _ = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
                 samples.push(started.elapsed());
             }
             samples.sort_unstable();

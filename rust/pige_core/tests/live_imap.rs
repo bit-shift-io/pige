@@ -27,9 +27,7 @@ use pige_core::{
     Account, AccountId, Address, AuthKind, Security, ServerConfig, Uid,
     send::{OutgoingMessage, deliver},
     transport::{
-        MailTransport, UidRange,
-        imap::connect as imap_connect,
-        smtp::connect as smtp_connect,
+        MailTransport, UidRange, imap::connect as imap_connect, smtp::connect as smtp_connect,
     },
 };
 
@@ -39,7 +37,11 @@ fn require(names: &[&str]) -> Vec<String> {
     let missing: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| env::var(name).map(|value| value.trim().is_empty()).unwrap_or(true))
+        .filter(|name| {
+            env::var(name)
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+        })
         .collect();
     assert!(
         missing.is_empty(),
@@ -119,10 +121,7 @@ async fn live_imap_and_smtp_smoke() {
             from: Uid(newest.saturating_sub(9).max(1)),
             to: Uid(newest),
         };
-        let headers = transport
-            .fetch_headers(range)
-            .await
-            .expect("fetch headers");
+        let headers = transport.fetch_headers(range).await.expect("fetch headers");
         assert!(
             !headers.is_empty(),
             "folder {} reports {} messages but returned no headers for UIDs {}:{}",

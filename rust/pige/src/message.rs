@@ -83,9 +83,6 @@ pub enum Message {
     },
     /// A conversation was chosen; the reader lands in a later task.
     OpenConversation(ThreadId),
-    /// The reader's "Load images" bar was pressed: re-parse the body with
-    /// remote images allowed.
-    LoadImages,
     /// The reader's earlier-message section was toggled.
     ToggleEarlier,
     /// The reader toolbar: return to the list (deselect the conversation).
@@ -143,6 +140,8 @@ pub enum Message {
     SettingsSyncChanged(String),
     /// The notifications toggle changed.
     SettingsNotificationsToggled(bool),
+    /// The background-sync toggle changed.
+    SettingsBackgroundSyncToggled(bool),
     /// The theme choice changed.
     SettingsThemeChanged(ThemeMode),
     /// Persist the edited settings and reschedule background sync.

@@ -1,5 +1,7 @@
 //! Incremental read-path sync for one account.
 
+use std::collections::HashSet;
+
 use crate::account::{Account, AccountId};
 use crate::mail::{
     Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner, ThreadId, Uid,
@@ -133,7 +135,12 @@ fn sync_order(kind: FolderKind) -> Option<usize> {
 }
 
 /// Sync one folder and return any newly-arrived inbox summaries it produced.
-async fn sync_folder(
+///
+/// Exposed to the API so a non-special folder (a Gmail user label, or any
+/// "Other" IMAP folder) can be synced on demand, and so a destination folder
+/// can be refreshed after a move. The account sync calls it once per special
+/// folder.
+pub(crate) async fn sync_folder(
     store: &Store,
     account: &Account,
     transport: &mut dyn MailTransport,
@@ -262,18 +269,33 @@ async fn sync_folder(
         }
     }
 
-    // Reconcile flags for messages we already had cached (not the new ones).
+    // Reconcile flags for messages we already had cached (not the new ones),
+    // and detect expunges. A cached UID absent from the FETCH response no
+    // longer exists on the server; delete its row so FTS and thread aggregates
+    // are updated instead of leaking forever. This also covers "every cached
+    // UID was expunged" (an empty response).
     if !cached_uids.is_empty() {
         let flags = transport
             .fetch_flags(&cached_uids)
             .await
             .map_err(|e| format!("flags {}: {e}", remote.name))?;
-        for (uid, flag) in flags {
-            if let Some(stored) = cached.iter().find(|m| m.uid == uid) {
+        let returned: HashSet<Uid> = flags.iter().map(|(uid, _)| *uid).collect();
+        for (uid, flag) in &flags {
+            if let Some(stored) = cached.iter().find(|m| m.uid == *uid) {
                 store
-                    .set_flags(&stored.id, &flag)
+                    .set_flags(&stored.id, flag)
                     .map_err(|e| format!("flags {}: {e}", remote.name))?;
             }
+        }
+        let expunged: Vec<MessageId> = cached
+            .iter()
+            .filter(|message| !returned.contains(&message.uid))
+            .map(|message| message.id.clone())
+            .collect();
+        if !expunged.is_empty() {
+            store
+                .delete_messages(&expunged)
+                .map_err(|e| format!("expunge {}: {e}", remote.name))?;
         }
     }
 

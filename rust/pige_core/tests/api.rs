@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use pige_core::{
-    AccountId, Address, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId, Security,
-    ServerConfig, Store, StoredMessage, ThreadId, Uid,
+    AccountId, Address, Body, Flags, Folder, FolderId, FolderKind, MessageHeader, MessageId,
+    Security, ServerConfig, Store, StoredMessage, ThreadId, Uid,
     api::{self, AccountInput, Config, CoreEvent, DB_FILE_NAME, MessageBody, SyncStatus},
     html::{Block, Inline, MailDocument},
     platform::{
@@ -1388,4 +1388,143 @@ async fn sync_finish_clears_stale_server_more() {
     assert_eq!(snapshot.selected_folder.as_ref(), Some(&inbox));
     assert_eq!(snapshot.conversations.len(), 400);
     assert!(!snapshot.has_more, "finish_sync must clear server_more");
+}
+
+#[tokio::test]
+async fn opening_an_other_folder_syncs_it_when_no_cache_exists() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let transport = FakeTransport {
+        folders: vec![
+            RemoteFolder {
+                name: "INBOX".to_string(),
+                delimiter: Some("/".to_string()),
+                kind: FolderKind::Inbox,
+            },
+            RemoteFolder {
+                name: "Work".to_string(),
+                delimiter: Some("/".to_string()),
+                kind: FolderKind::Other,
+            },
+        ],
+        messages: HashMap::from([
+            (
+                "INBOX".to_string(),
+                vec![remote_message(1, "Inbox mail", "a@example.com")],
+            ),
+            (
+                "Work".to_string(),
+                vec![remote_message(1, "Label mail", "b@example.com")],
+            ),
+        ]),
+        states: HashMap::from([
+            (
+                "INBOX".to_string(),
+                FolderState {
+                    uidvalidity: 1,
+                    uidnext: 2,
+                    exists: 1,
+                },
+            ),
+            (
+                "Work".to_string(),
+                FolderState {
+                    uidvalidity: 1,
+                    uidnext: 2,
+                    exists: 1,
+                },
+            ),
+        ]),
+        ..FakeTransport::default()
+    };
+    harness.factory.add_transport(account_id, transport);
+
+    api::sync_all().await.expect("initial sync");
+    let work = api::snapshot()
+        .sections
+        .first()
+        .and_then(|section| {
+            section
+                .folders
+                .iter()
+                .find(|folder| folder.kind == FolderKind::Other)
+        })
+        .map(|folder| folder.id.clone())
+        .expect("the label folder must be listed");
+
+    // The account sync skips Other folders, so nothing is cached before open.
+    assert!(
+        harness
+            .open_store()
+            .messages(&work, 10, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    let snapshot = api::select_folder(&work).await.expect("open label");
+    assert_eq!(snapshot.selected_folder.as_ref(), Some(&work));
+    assert_eq!(snapshot.conversations.len(), 1);
+    assert_eq!(snapshot.conversations[0].subject, "Label mail");
+}
+
+#[tokio::test]
+async fn earlier_messages_carry_their_cached_bodies() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account_id, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    let mut older = stored_message(&inbox, 1);
+    older.thread_id = ThreadId("thread-two".to_string());
+    older.header.date = 1;
+    store.upsert_message(&older).unwrap();
+    let mut newer = stored_message(&inbox, 2);
+    newer.thread_id = ThreadId("thread-two".to_string());
+    newer.header.date = 2;
+    store.upsert_message(&newer).unwrap();
+    store
+        .upsert_body(
+            &older.id,
+            &Body {
+                plain_text: Some("the earlier body".to_string()),
+                html: None,
+                fetched_at: 1,
+            },
+        )
+        .unwrap();
+    store
+        .upsert_body(
+            &newer.id,
+            &Body {
+                plain_text: Some("the newest body".to_string()),
+                html: None,
+                fetched_at: 2,
+            },
+        )
+        .unwrap();
+
+    let snapshot = api::open_conversation(&ThreadId("thread-two".to_string()))
+        .await
+        .expect("open conversation");
+    let detail = snapshot.selected_conversation.expect("detail");
+    assert_eq!(detail.messages.len(), 2);
+
+    // Newest first; both carry a body so "Earlier messages" is not names only.
+    assert!(detail.messages[0].body.is_some());
+    assert!(
+        detail.messages[1].body.is_some(),
+        "the earlier message must expose its cached body"
+    );
 }

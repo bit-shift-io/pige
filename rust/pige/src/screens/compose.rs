@@ -93,6 +93,17 @@ impl ComposeState {
         self.notice = None;
     }
 
+    /// Whether the form holds no user content worth keeping. Used when closing
+    /// the surface: an empty form closes immediately, a non-empty one is saved
+    /// as a draft first.
+    pub fn is_empty(&self) -> bool {
+        self.to.trim().is_empty()
+            && self.cc.trim().is_empty()
+            && self.bcc.trim().is_empty()
+            && self.subject.trim().is_empty()
+            && self.body.text().trim().is_empty()
+    }
+
     /// Validate the recipient fields and turn the form into the core's message.
     /// Empty Cc/Bcc are fine; send-time MIME generation enforces at least one
     /// recipient because drafts may legitimately have none.
@@ -389,6 +400,19 @@ mod tests {
         assert_eq!(outgoing.body, message.body);
         assert_eq!(outgoing.in_reply_to, message.in_reply_to);
         assert_eq!(outgoing.references, message.references);
+    }
+
+    #[test]
+    fn closing_a_compose_form_keeps_non_empty_text_to_save() {
+        let mut compose = ComposeState::new(AccountId("a".into()));
+        assert!(compose.is_empty(), "a fresh form closes immediately");
+
+        compose.body = text_editor::Content::with_text("hello");
+        assert!(!compose.is_empty(), "typed text must be saved, not dropped");
+
+        compose.body = text_editor::Content::new();
+        compose.subject = "   ".into();
+        assert!(compose.is_empty(), "whitespace alone is still empty");
     }
 
     #[test]

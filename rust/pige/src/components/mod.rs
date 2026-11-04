@@ -35,7 +35,7 @@ pub mod rows;
 pub mod scroll_fade;
 
 pub use avatar::avatar;
-pub use buttons::{ButtonVariant, button, icon_button};
+pub use buttons::{ButtonVariant, button, floating_action_button, icon_button};
 pub use chips::{attachment_chip, chip, format_size};
 pub use chrome::{app_bar, empty_state, snackbar};
 pub use dialog::{dialog, dialog_sized};

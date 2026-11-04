@@ -31,6 +31,7 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
 
     let body = column![
         sync_section(app),
+        background_sync_section(app),
         notifications_section(app),
         theme_section(app),
         accounts_section(app),
@@ -69,6 +70,27 @@ fn sync_section<'a>(app: &'a App) -> Element<'a, Message> {
     .spacing(palette.space.xs)
     .width(Fill);
     section("Sync", body.into())
+}
+
+fn background_sync_section<'a>(app: &'a App) -> Element<'a, Message> {
+    let palette = theme::active();
+    let on = app.settings.background_sync;
+    let body = column![
+        row![
+            components::chip("On", on, Message::SettingsBackgroundSyncToggled(true)),
+            components::chip("Off", !on, Message::SettingsBackgroundSyncToggled(false)),
+        ]
+        .spacing(palette.space.sm)
+        .align_y(Alignment::Center),
+        styled(
+            "Android schedules the interval above while this is on; desktop has no background scheduler.".to_string(),
+            TextRole::LabelMedium,
+            palette.on_surface_variant,
+        ),
+    ]
+    .spacing(palette.space.xs)
+    .width(Fill);
+    section("Background sync", body.into())
 }
 
 fn notifications_section<'a>(app: &'a App) -> Element<'a, Message> {

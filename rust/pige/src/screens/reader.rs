@@ -1,7 +1,6 @@
-//! The reader pane: subject, sender summary, message body, and a "Load images"
-//! bar when remote content is blocked. Earlier messages collapse behind a
-//! header; the current data model has one message per conversation, so that
-//! section is empty until real threading lands.
+//! The reader pane: subject, sender summary, message body, and an expandable
+//! "Earlier messages" section. Remote images stay as blocked placeholders; v1
+//! never fetches remote bytes, so there is no "Load images" action.
 
 use iced::widget::{column, container, row, scrollable, space};
 use iced::{Alignment, Element, Fill};
@@ -242,12 +241,10 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
             .into();
     };
 
-    // Body, or a clear state when it is unavailable.
+    // Body, or a clear state when it is unavailable. Remote images remain
+    // "[image blocked]" placeholders: v1 fetches no remote bytes.
     match &latest.body {
         Some(MessageBody::Document(document)) => {
-            if document.has_remote_images() {
-                content = content.push(load_images_bar());
-            }
             let rendered = html_view::render_document(document, Message::OpenUrl);
             let mut body = column![].spacing(palette.space.xs).width(Fill);
             for element in rendered {
@@ -359,32 +356,6 @@ fn header<'a>(detail: &'a ConversationDetail) -> Element<'a, Message> {
         .into()
 }
 
-/// The bar shown when a message has blocked remote images.
-fn load_images_bar<'a>() -> Element<'a, Message> {
-    let palette = theme::active();
-    let content = row![
-        components::styled_text(
-            "This message has blocked remote images.".to_string(),
-            palette.role(TextRole::BodySmall),
-            palette.on_surface_variant,
-        ),
-        space().width(Fill),
-        components::button("Load images", ButtonVariant::Text, Message::LoadImages),
-    ]
-    .spacing(palette.space.sm)
-    .align_y(Alignment::Center);
-
-    container(content)
-        .width(Fill)
-        .padding([palette.space.xs, palette.space.lg])
-        .style(move |_| container::Style {
-            background: Some(palette.secondary_container.into()),
-            border: iced::border::rounded(palette.radius.sm),
-            ..Default::default()
-        })
-        .into()
-}
-
 /// One attachment chip per MIME part. Tapping asks the core to download (if
 /// needed), cache, and open the file through the platform opener.
 fn attachment_chips<'a>(message: &'a MessageSummary) -> Element<'a, Message> {
@@ -417,20 +388,7 @@ fn earlier_messages<'a>(detail: &'a ConversationDetail, app: &'a App) -> Element
 
     if app.reader_expanded {
         for earlier in detail.messages.iter().skip(1) {
-            let name = if earlier.sender.trim().is_empty() {
-                "Unknown sender".to_string()
-            } else {
-                earlier.sender.clone()
-            };
-            section = section.push(
-                container(components::styled_text(
-                    name,
-                    palette.role(TextRole::BodyMedium),
-                    palette.on_surface_variant,
-                ))
-                .width(Fill)
-                .padding(palette.space.xs),
-            );
+            section = section.push(earlier_message(earlier));
         }
     }
 
@@ -440,43 +398,80 @@ fn earlier_messages<'a>(detail: &'a ConversationDetail, app: &'a App) -> Element
         .into()
 }
 
-/// Whether the "Load images" bar should show for a body.
-pub fn has_blocked_images(body: &Option<MessageBody>) -> bool {
-    matches!(body, Some(MessageBody::Document(document)) if document.has_remote_images())
-}
+/// One earlier message inside the expanded section: sender, date, and its
+/// cached body. A body that was never downloaded shows the snippet plus a short
+/// "Not downloaded" label rather than a blank or dead control.
+fn earlier_message<'a>(message: &'a MessageSummary) -> Element<'a, Message> {
+    let palette = theme::active();
+    let sender = if message.sender.trim().is_empty() {
+        "Unknown sender".to_string()
+    } else {
+        message.sender.clone()
+    };
+    let date = crate::format_list_date(now_unix(), message.date);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pige_core::html::parse_html;
-    use pige_core::mail::{Flags, MessageId};
+    let mut meta = row![].spacing(palette.space.sm).align_y(Alignment::Center);
+    meta = meta.push(components::styled_text(
+        sender,
+        palette.role(TextRole::TitleSmall),
+        palette.on_surface,
+    ));
+    if !date.is_empty() {
+        meta = meta.push(components::styled_text(
+            date,
+            palette.role(TextRole::BodySmall),
+            palette.on_surface_variant,
+        ));
+    }
 
-    fn summary_with_remote_image() -> MessageSummary {
-        MessageSummary {
-            id: MessageId("m1".into()),
-            sender: "Ada".into(),
-            to: String::new(),
-            date: 0,
-            snippet: String::new(),
-            flags: Flags::default(),
-            has_attachments: false,
-            attachments: Vec::new(),
-            body: Some(MessageBody::Document(parse_html(
-                "<img src='https://tracker.example/p.gif'>",
-                false,
-            ))),
+    let mut card = column![].spacing(palette.space.xs).width(Fill);
+    card = card.push(meta);
+    match &message.body {
+        Some(MessageBody::Document(document)) => {
+            let rendered = html_view::render_document(document, Message::OpenUrl);
+            let mut body = column![].spacing(palette.space.xs).width(Fill);
+            for element in rendered {
+                body = body.push(element);
+            }
+            card = card.push(body);
+        }
+        Some(MessageBody::TooLarge) => {
+            card = card.push(components::styled_text(
+                "This message is too large to display.",
+                palette.role(TextRole::BodySmall),
+                palette.on_surface_variant,
+            ));
+        }
+        None => {
+            if !message.snippet.trim().is_empty() {
+                card = card.push(components::styled_text(
+                    message.snippet.clone(),
+                    palette.role(TextRole::BodySmall),
+                    palette.on_surface_variant,
+                ));
+            }
+            card = card.push(components::styled_text(
+                "Not downloaded",
+                palette.role(TextRole::LabelSmall),
+                palette.on_surface_variant,
+            ));
         }
     }
 
-    #[test]
-    fn blocked_images_are_detected_only_on_documents() {
-        assert!(has_blocked_images(&summary_with_remote_image().body));
+    container(card)
+        .width(Fill)
+        .padding(palette.space.sm)
+        .style(move |_| container::Style {
+            background: Some(palette.surface_container.into()),
+            border: iced::border::rounded(palette.radius.sm),
+            ..Default::default()
+        })
+        .into()
+}
 
-        let mut plain = summary_with_remote_image();
-        plain.body = Some(MessageBody::Document(parse_html("<p>no images</p>", false)));
-        assert!(!has_blocked_images(&plain.body));
-
-        assert!(!has_blocked_images(&Some(MessageBody::TooLarge)));
-        assert!(!has_blocked_images(&None));
-    }
+/// Unix seconds, UTC, for the earlier-message date labels.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }

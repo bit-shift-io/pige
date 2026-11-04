@@ -47,13 +47,22 @@ pub struct Panes {
 
 /// Resolve the visible panes for a breakpoint. On compact and medium the
 /// navigation pane is only present while its drawer is open, and it overlays
-/// the content rather than taking a column.
+/// the content rather than taking a column. This is the "not reading" case; a
+/// compact layout with an open conversation uses [`panes_for`] so the reader
+/// replaces the list instead of being hidden beside it.
 pub fn panes(bp: Breakpoint, drawer_open: bool) -> Panes {
+    panes_for(bp, drawer_open, false)
+}
+
+/// Resolve the visible panes, including whether a conversation is open. On
+/// compact a reader replaces the list (full pane); medium and expanded always
+/// show both list and reader side by side.
+pub fn panes_for(bp: Breakpoint, drawer_open: bool, reading: bool) -> Panes {
     match bp {
         Breakpoint::Compact => Panes {
             nav: drawer_open,
-            list: true,
-            reader: false,
+            list: !reading,
+            reader: reading,
         },
         Breakpoint::Medium => Panes {
             nav: drawer_open,
@@ -113,6 +122,40 @@ mod tests {
                 list: true,
                 reader: true
             }
+        );
+    }
+
+    #[test]
+    fn compact_shows_the_reader_instead_of_the_list_when_reading() {
+        assert_eq!(
+            panes_for(Breakpoint::Compact, false, false),
+            Panes {
+                nav: false,
+                list: true,
+                reader: false
+            }
+        );
+        assert_eq!(
+            panes_for(Breakpoint::Compact, false, true),
+            Panes {
+                nav: false,
+                list: false,
+                reader: true
+            }
+        );
+        // The drawer still overlays the reader while open.
+        assert_eq!(
+            panes_for(Breakpoint::Compact, true, true),
+            Panes {
+                nav: true,
+                list: false,
+                reader: true
+            }
+        );
+        // Medium keeps both panes regardless of selection.
+        assert_eq!(
+            panes_for(Breakpoint::Medium, false, true),
+            panes(Breakpoint::Medium, false)
         );
     }
 
