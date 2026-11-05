@@ -633,8 +633,13 @@ impl App {
                 self.confirm_reset = false;
                 match result {
                     Ok(outcome) => {
+                        let mut message = "The app was reset.".to_string();
+                        for warning in &outcome.warnings {
+                            message.push(' ');
+                            message.push_str(warning);
+                        }
                         self.apply_config_outcome(outcome);
-                        return self.show_toast("The app was reset.".to_string());
+                        return self.show_toast(message);
                     }
                     Err(error) => return self.show_toast(error),
                 }
@@ -1003,6 +1008,7 @@ mod tests {
                 notifications: false,
                 ..Settings::default()
             },
+            warnings: Vec::new(),
         };
         let _ = app.update(Message::RestoreDone("a.json".to_string(), Ok(outcome)));
 
