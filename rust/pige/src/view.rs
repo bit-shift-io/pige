@@ -47,6 +47,9 @@ impl App {
         if let Some(names) = &self.restore_picker {
             root = stack![root, crate::screens::advanced::restore_picker_modal(names)].into();
         }
+        if let Some(name) = &self.restore_confirm {
+            root = stack![root, crate::screens::advanced::restore_confirm_modal(name)].into();
+        }
         if self.confirm_reset {
             root = stack![root, crate::screens::advanced::reset_confirm_modal()].into();
         }

@@ -291,7 +291,7 @@ the UI and checked both on screen and on disk (`run-as bitshift.pige`):
 | Settings → Advanced | three action cards (Backup / Restore / Factory Reset) render with icons |
 | Backup config | wrote `pige-backup-2026-11-05-202915.json` to shared Downloads; small dark bottom toast "Backup saved to Downloads/…"; the screen behind stayed visible |
 | Restore, no All-files access | opened the system "All files access" page for pige |
-| Restore, access granted | picker listed the backup; choosing it restored settings, wrote `pige.json.pre-restore`, and toasted the password note |
+| Restore, access granted | picker listed the backup; choosing it opened a confirmation ("This replaces your current accounts and settings with …"), and confirming restored settings, wrote `pige.json.pre-restore`, and toasted the password note |
 | Change setting + Save | `pige.json` updated (`notifications: false`) |
 | Factory Reset | destructive confirmation, then `pige.json` back to defaults and the cache directory emptied; toast "The app was reset." |
 

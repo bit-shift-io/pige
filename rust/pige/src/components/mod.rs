@@ -128,6 +128,40 @@ pub fn action_card<'a>(
         .into()
 }
 
+/// A confirmation modal: a title, an explanatory line, and Cancel/confirm
+/// actions. Shared by the restore and factory-reset confirmations so they match.
+pub fn confirm<'a>(
+    title: &str,
+    body: &str,
+    confirm_label: &str,
+    destructive: bool,
+    on_confirm: Message,
+    on_cancel: Message,
+) -> iced::Element<'a, Message> {
+    let palette = theme::active();
+    let body_style = palette.role(TextRole::BodyMedium);
+    let body_widget = text(body.to_string())
+        .size(body_style.size)
+        .line_height(body_style.line_height())
+        .font(body_style.font)
+        .color(palette.on_surface_variant);
+    let variant = if destructive {
+        ButtonVariant::Danger
+    } else {
+        ButtonVariant::Filled
+    };
+
+    dialog::dialog_sized(
+        title,
+        body_widget.into(),
+        vec![
+            button("Cancel", ButtonVariant::Text, on_cancel),
+            button(confirm_label, variant, on_confirm),
+        ],
+        palette.metrics.dialog_width,
+    )
+}
+
 /// A text widget that already carries the palette's type style and colour.
 pub(crate) fn styled_text<'a>(
     value: impl Into<String>,

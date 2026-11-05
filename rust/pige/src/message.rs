@@ -148,9 +148,11 @@ pub enum Message {
     RestoreAccessChecked(bool),
     /// The system "All files access" screen was opened.
     RestoreAccessRequested(Result<(), String>),
-    /// A backup was chosen from the restore picker.
+    /// A backup was chosen from the restore picker; ask to confirm.
     RestoreChosen(String),
-    /// The restore picker was dismissed.
+    /// The restore was confirmed and should run.
+    RestoreConfirmed,
+    /// The restore picker or its confirmation was dismissed.
     RestoreCancelled,
     /// A restore finished, with the file name it used.
     RestoreDone(String, Result<ConfigOutcome, String>),

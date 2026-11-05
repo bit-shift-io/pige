@@ -100,6 +100,8 @@ pub struct App {
     pub(crate) delete_confirm_open: bool,
     /// Candidate backup names shown in the Advanced restore picker.
     pub(crate) restore_picker: Option<Vec<String>>,
+    /// The backup name awaiting a restore confirmation.
+    pub(crate) restore_confirm: Option<String>,
     /// Whether the Advanced factory-reset confirmation is open.
     pub(crate) confirm_reset: bool,
     /// Whether the full-window account screen is showing.
@@ -181,6 +183,7 @@ impl App {
                 move_picker_open: false,
                 delete_confirm_open: false,
                 restore_picker: None,
+                restore_confirm: None,
                 confirm_reset: false,
                 accounts_open: false,
                 accounts: AccountsState::default(),
@@ -216,6 +219,7 @@ impl App {
             move_picker_open: false,
             delete_confirm_open: false,
             restore_picker: None,
+            restore_confirm: None,
             confirm_reset: false,
             accounts_open: false,
             accounts: AccountsState::default(),

@@ -12,7 +12,7 @@ use crate::app::App;
 use crate::components::{self, ButtonVariant};
 use crate::icons;
 use crate::message::Message;
-use crate::theme::{self, TextRole};
+use crate::theme;
 
 /// One action the Advanced screen offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,25 +137,28 @@ pub(crate) fn restore_picker_modal(names: &[String]) -> Element<'_, Message> {
     )
 }
 
+/// The restore confirmation: choosing a backup asks first, as qlaunch does.
+pub(crate) fn restore_confirm_modal(name: &str) -> Element<'static, Message> {
+    let body = format!("This replaces your current accounts and settings with {name}.");
+    components::confirm(
+        "Restore config",
+        &body,
+        "Restore",
+        false,
+        Message::RestoreConfirmed,
+        Message::RestoreCancelled,
+    )
+}
+
 /// The factory-reset confirmation.
 pub(crate) fn reset_confirm_modal() -> Element<'static, Message> {
-    let palette = theme::active();
-    let body_style = palette.role(TextRole::BodyMedium);
-    let body = iced::widget::text(
-        "This wipes every account, setting and cached message. It cannot be undone.",
-    )
-    .size(body_style.size)
-    .line_height(body_style.line_height())
-    .font(body_style.font)
-    .color(palette.on_surface_variant);
-
-    components::dialog(
+    components::confirm(
         "Factory Reset",
-        body.into(),
-        vec![
-            components::button("Cancel", ButtonVariant::Text, Message::ResetCancelled),
-            components::button("Reset", ButtonVariant::Danger, Message::ResetConfirmed),
-        ],
+        "This wipes every account, setting and cached message. It cannot be undone.",
+        "Reset",
+        true,
+        Message::ResetConfirmed,
+        Message::ResetCancelled,
     )
 }
 

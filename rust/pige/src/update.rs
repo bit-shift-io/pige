@@ -608,17 +608,29 @@ impl App {
                 return self.show_toast(message);
             }
             Message::RestoreChosen(name) => {
+                // The picker closes and the confirmation opens; nothing is
+                // replaced until Restore is confirmed.
                 self.restore_picker = None;
+                self.restore_confirm = Some(name);
+            }
+            Message::RestoreConfirmed => {
+                let Some(name) = self.restore_confirm.take() else {
+                    return Task::none();
+                };
                 let restore_name = name.clone();
                 return Task::perform(
                     async move { api::restore_config(restore_name).await },
                     move |result| Message::RestoreDone(name.clone(), result),
                 );
             }
-            Message::RestoreCancelled => self.restore_picker = None,
+            Message::RestoreCancelled => {
+                self.restore_picker = None;
+                self.restore_confirm = None;
+            }
             Message::RestoreDone(name, result) => {
                 let message = crate::screens::advanced::restore_message(&result, &name);
                 self.restore_picker = None;
+                self.restore_confirm = None;
                 if let Ok(outcome) = result {
                     self.apply_config_outcome(outcome);
                 }
@@ -973,6 +985,28 @@ mod tests {
         assert_eq!(system_theme_dark(iced::theme::Mode::Light), Some(false));
         // A platform that reports no preference must not override the user's.
         assert_eq!(system_theme_dark(iced::theme::Mode::None), None);
+    }
+
+    #[test]
+    fn restore_asks_for_confirmation_before_replacing() {
+        let mut app = App::for_test();
+        app.restore_picker = Some(vec!["a.json".to_string()]);
+        let _ = app.update(Message::RestoreChosen("a.json".to_string()));
+
+        assert!(app.restore_picker.is_none(), "the picker closes");
+        assert_eq!(
+            app.restore_confirm.as_deref(),
+            Some("a.json"),
+            "the restore must wait for confirmation"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_restore_confirmation_leaves_that_pending_name_off() {
+        let mut app = App::for_test();
+        app.restore_confirm = Some("a.json".to_string());
+        let _ = app.update(Message::RestoreCancelled);
+        assert!(app.restore_confirm.is_none());
     }
 
     #[test]
