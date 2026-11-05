@@ -78,6 +78,9 @@ pub struct SendOutcome {
 pub struct ConfigOutcome {
     pub snapshot: ModelSnapshot,
     pub settings: Settings,
+    /// Non-fatal problems, such as a password that could not be cleared after
+    /// a restore or reset. The shell appends these to its result message.
+    pub warnings: Vec<String>,
 }
 
 /// Everything the core needs from the host process. Built once per process by
@@ -201,6 +204,12 @@ struct AppState {
     config_doc: ConfigDocument,
     /// `<config_dir>/pige.json`.
     config_path: PathBuf,
+    /// A one-time message for the shell (for example a quarantined document),
+    /// taken with [`take_startup_warning`].
+    startup_warning: Option<String>,
+    /// Set when the document exists but could not be read. Saves are refused so
+    /// an unreadable configuration is never overwritten.
+    config_writes_blocked: bool,
     selected_folder: Option<FolderId>,
     unified_selected: bool,
     conversation_limit: u32,
@@ -258,6 +267,7 @@ impl AppState {
     /// exactly as it was, so the UI cannot show an account the disk does not
     /// have. Callers own any credential rollback.
     fn replace_accounts(&mut self, accounts: Vec<Account>) -> Result<(), String> {
+        self.ensure_writable()?;
         let previous = self.config_doc.accounts.clone();
         self.config_doc.accounts = accounts;
         if let Err(error) = config::save(&self.config_path, &self.config_doc) {
@@ -270,6 +280,17 @@ impl AppState {
             self.config_doc.accounts = previous;
             let _ = config::save(&self.config_path, &self.config_doc);
             return Err(format!("update account cache: {error}"));
+        }
+        Ok(())
+    }
+
+    /// Refuse configuration writes when `pige.json` exists but could not be
+    /// read, so the unreadable file is never overwritten.
+    fn ensure_writable(&self) -> Result<(), String> {
+        if self.config_writes_blocked {
+            return Err(
+                "the configuration file could not be read and will not be overwritten".to_string(),
+            );
         }
         Ok(())
     }
@@ -452,7 +473,8 @@ pub fn init(config: Config) -> Result<(), String> {
         .map_err(|error| format!("migrate store: {error}"))?;
 
     let config_path = config::document_path(&config.config_dir);
-    let (config_doc, warning) = load_or_migrate_document(&store, &config_path);
+    let (config_doc, startup_warning, writes_blocked) =
+        load_or_migrate_document(&store, &config_path);
 
     let sender = events::sender().clone();
     let mut state = AppState {
@@ -460,6 +482,8 @@ pub fn init(config: Config) -> Result<(), String> {
         store,
         config_doc,
         config_path,
+        startup_warning,
+        config_writes_blocked: writes_blocked,
         selected_folder: None,
         unified_selected: false,
         conversation_limit: INITIAL_PAGE,
@@ -472,25 +496,26 @@ pub fn init(config: Config) -> Result<(), String> {
     };
     state.ensure_selection();
 
+    // Install the state first, then clear any subscriber backlog. The warning
+    // waits in `startup_warning` for the shell to take it: sending it on the
+    // event channel here would drop it, because the shell subscribes after
+    // `init` returns.
     *lock_state() = Some(state);
-    if let Some(warning) = warning {
-        let _ = sender.send(CoreEvent::Error(warning));
-    }
     let _ = sender.send(CoreEvent::SnapshotChanged);
     Ok(())
 }
 
 /// Read the configuration document, or create it: from the SQLite cache on a
-/// fresh install, and after quarantining an unreadable file. Returns a warning
-/// to surface when something could not be read or written; never overwrites a
-/// document that exists but could not be read.
-fn load_or_migrate_document(store: &Store, path: &Path) -> (ConfigDocument, Option<String>) {
+/// fresh install, and after quarantining an unreadable file. Returns the
+/// document, a warning for the shell, and whether writes must be blocked
+/// because a file exists that could not be read (so it is never overwritten).
+fn load_or_migrate_document(store: &Store, path: &Path) -> (ConfigDocument, Option<String>, bool) {
     match config::load(path) {
         Ok(Some(doc)) => {
             if let Err(error) = store.sync_accounts(&doc.accounts) {
                 log::warn!("sync account mirror from configuration: {error}");
             }
-            (doc, None)
+            (doc, None, false)
         }
         Ok(None) => {
             let doc = document_from_store(store);
@@ -498,7 +523,7 @@ fn load_or_migrate_document(store: &Store, path: &Path) -> (ConfigDocument, Opti
                 Ok(()) => {
                     // The document now owns settings; drop the legacy row.
                     let _ = crate::settings::clear_settings(store);
-                    (doc, None)
+                    (doc, None, false)
                 }
                 Err(error) => {
                     log::warn!("write configuration document: {error}");
@@ -507,26 +532,44 @@ fn load_or_migrate_document(store: &Store, path: &Path) -> (ConfigDocument, Opti
                         Some(format!(
                             "Could not write the configuration file ({error}); changes will not be saved."
                         )),
+                        true,
                     )
                 }
             }
         }
         Err(config::ConfigError::Json(error)) => {
-            log::warn!("unreadable configuration quarantined: {error}");
-            let _ = config::quarantine(path);
+            log::warn!("unreadable configuration: {error}");
             let doc = document_from_store(store);
-            let _ = config::save(path, &doc);
-            let _ = crate::settings::clear_settings(store);
-            (
-                doc,
-                Some(
-                    "The saved configuration could not be read and was set aside; pige started from its cache."
-                        .to_string(),
-                ),
-            )
+            match config::quarantine(path) {
+                Ok(_) => {
+                    let _ = config::save(path, &doc);
+                    let _ = crate::settings::clear_settings(store);
+                    (
+                        doc,
+                        Some(
+                            "The saved configuration could not be read and was set aside; pige started from its cache."
+                                .to_string(),
+                        ),
+                        false,
+                    )
+                }
+                Err(quarantine_error) => {
+                    // Could not move the bad file aside; leave it and refuse
+                    // to overwrite it.
+                    log::warn!("quarantine configuration: {quarantine_error}");
+                    (
+                        doc,
+                        Some(format!(
+                            "The saved configuration could not be read ({error}) and could not be set aside ({quarantine_error}); changes will not be saved."
+                        )),
+                        true,
+                    )
+                }
+            }
         }
         Err(config::ConfigError::Io(error)) => {
-            // The file exists but could not be read. Leave it untouched.
+            // The file exists but could not be read. Leave it untouched and
+            // refuse to overwrite it on any later write.
             log::warn!("could not read configuration: {error}");
             let doc = document_from_store(store);
             (
@@ -534,11 +577,16 @@ fn load_or_migrate_document(store: &Store, path: &Path) -> (ConfigDocument, Opti
                 Some(format!(
                     "Could not read the configuration file ({error}); changes will not be saved."
                 )),
+                true,
             )
         }
         Err(config::ConfigError::NoRoot) => {
             let doc = document_from_store(store);
-            (doc, Some("No configuration directory is available.".to_string()))
+            (
+                doc,
+                Some("No configuration directory is available.".to_string()),
+                true,
+            )
         }
     }
 }
@@ -567,6 +615,16 @@ pub fn is_initialized() -> bool {
     lock_state().is_some()
 }
 
+/// Take the one-time start-up warning (for example a quarantined
+/// configuration), so the shell can show it. Returns `None` once taken and on
+/// every later call.
+pub fn take_startup_warning() -> Option<String> {
+    let mut guard = lock_state();
+    guard
+        .as_mut()
+        .and_then(|state| state.startup_warning.take())
+}
+
 /// The persisted user settings, from the configuration document.
 pub fn settings() -> Settings {
     let guard = lock_state();
@@ -583,6 +641,7 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
     let state = guard
         .as_mut()
         .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state.ensure_writable()?;
     let mut settings = settings.clone();
     settings.sync_minutes = Settings::clamp_minutes(settings.sync_minutes);
     let previous = state.config_doc.settings.clone();
@@ -642,6 +701,7 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
     let state = guard
         .as_mut()
         .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state.ensure_writable()?;
 
     let bytes = state
         .config
@@ -683,9 +743,15 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
 
     // The document is durable; now the dropped accounts' secrets must not
     // linger, or a later restore of the same id would silently re-attach one.
+    // A failure is reported rather than hidden: the app cannot both claim a
+    // clean restore and keep the old password.
+    let mut warnings = Vec::new();
     for id in &dropped {
         if let Err(error) = state.config.credentials.delete(id) {
             log::warn!("delete password for restored-away account {id}: {error}");
+            warnings.push(format!(
+                "A stored password for a removed account could not be cleared: {error}"
+            ));
         }
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password for restored-away account {id}: {error}");
@@ -702,6 +768,7 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
     let outcome = ConfigOutcome {
         snapshot: state.build_snapshot(),
         settings: state.config_doc.settings.clone(),
+        warnings,
     };
     drop(guard);
     let _ = sender.send(CoreEvent::SnapshotChanged);
@@ -715,6 +782,7 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
     let state = guard
         .as_mut()
         .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state.ensure_writable()?;
 
     let previous = state.config_doc.clone();
     let ids: Vec<AccountId> = previous
@@ -734,9 +802,11 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
         return Err(format!("update account cache: {error}"));
     }
 
+    let mut warnings = Vec::new();
     for id in &ids {
         if let Err(error) = state.config.credentials.delete(id) {
             log::warn!("delete password during factory reset for {id}: {error}");
+            warnings.push(format!("A stored password could not be cleared: {error}"));
         }
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password during factory reset for {id}: {error}");
@@ -765,6 +835,7 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
     let outcome = ConfigOutcome {
         snapshot: state.build_snapshot(),
         settings: state.config_doc.settings.clone(),
+        warnings,
     };
     drop(guard);
     let _ = sender.send(CoreEvent::SnapshotChanged);

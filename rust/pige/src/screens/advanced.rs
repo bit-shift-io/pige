@@ -73,9 +73,16 @@ pub(crate) fn backup_message(result: &Result<String, String>) -> String {
 /// the user that passwords are not carried in a backup.
 pub(crate) fn restore_message(result: &Result<ConfigOutcome, String>, name: &str) -> String {
     match result {
-        Ok(_) => format!(
-            "Config restored from {name}. Re-enter passwords for any accounts that need them."
-        ),
+        Ok(outcome) => {
+            let mut message = format!(
+                "Config restored from {name}. Re-enter passwords for any accounts that need them."
+            );
+            for warning in &outcome.warnings {
+                message.push(' ');
+                message.push_str(warning);
+            }
+            message
+        }
         Err(error) => format!("Could not restore: {error}"),
     }
 }
@@ -194,6 +201,7 @@ mod tests {
         let outcome = ConfigOutcome {
             snapshot: Default::default(),
             settings: Default::default(),
+            warnings: Vec::new(),
         };
         let message = restore_message(&Ok(outcome), "a.json");
         assert!(message.contains("Config restored from a.json."), "{message}");

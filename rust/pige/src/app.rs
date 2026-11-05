@@ -257,7 +257,10 @@ fn initialize_api() -> (ModelSnapshot, Option<String>) {
     }
 
     match api::init(crate::platform::config()) {
-        Ok(()) => (api::snapshot(), None),
+        // A quarantined or unreadable configuration is surfaced as a start-up
+        // warning (it is emitted before the shell can subscribe to events, so
+        // it is taken directly).
+        Ok(()) => (api::snapshot(), api::take_startup_warning()),
         Err(error) => {
             log::error!("initialize pige api: {error}");
             (

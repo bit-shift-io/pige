@@ -1966,6 +1966,74 @@ async fn restore_rejects_a_bad_name_and_leaves_state() {
 }
 
 #[tokio::test]
+async fn a_corrupt_document_surfaces_a_startup_warning_once() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    seed_sqlite_account(&dir, "recovered", "Recovered");
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let path = pige_core::config::document_path(&config_dir);
+    std::fs::write(&path, b"{ not json").unwrap();
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+
+    let warning = api::take_startup_warning().expect("a warning must reach the shell");
+    assert!(warning.contains("set aside"), "{warning}");
+    assert!(api::take_startup_warning().is_none(), "shown once");
+}
+
+#[tokio::test]
+async fn an_unreadable_configuration_blocks_writes_and_is_preserved() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    seed_sqlite_account(&dir, "acct", "Original");
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    // A directory where the document should be: reading it fails, and it must
+    // never be replaced by a later write.
+    let path = pige_core::config::document_path(&config_dir);
+    std::fs::create_dir(&path).unwrap();
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+    assert!(api::snapshot().accounts.iter().any(|a| a.label == "Original"));
+
+    let result = api::rename_account(&AccountId("acct".to_string()), "Changed").await;
+    assert!(result.is_err(), "a write over an unreadable file must be refused");
+    assert!(path.is_dir(), "the unreadable configuration must be preserved");
+    assert!(api::snapshot().accounts.iter().any(|a| a.label == "Original"));
+}
+
+#[tokio::test]
+async fn restore_reports_credentials_it_could_not_delete() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let kept = api::add_account(input("Keep", "keep@example.com"))
+        .await
+        .unwrap();
+    let keep = api::account(&kept.accounts[0].id).unwrap();
+    api::add_account(input("Drop", "drop@example.com"))
+        .await
+        .unwrap();
+
+    let bytes = backup_document(vec![keep], true);
+    harness
+        .backups
+        .write("pige-backup-2026-10-21-140530.json", &bytes)
+        .unwrap();
+    harness.credentials.fail_delete();
+
+    let outcome = api::restore_config("pige-backup-2026-10-21-140530.json".to_string())
+        .await
+        .expect("restore");
+    assert!(
+        !outcome.warnings.is_empty(),
+        "a password that could not be cleared must be reported"
+    );
+}
+
+#[tokio::test]
 async fn factory_reset_clears_accounts_settings_cache_and_credentials() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
