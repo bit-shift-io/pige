@@ -582,10 +582,12 @@ async fn open_conversation_returns_every_message_in_the_thread() {
     api::init(Config {
         data_dir: dir.path().join("data"),
         cache_dir: dir.path().join("cache"),
+        config_dir: dir.path().join("config"),
         credentials,
         notifier,
         opener,
         transport: factory.clone(),
+        backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
     })
     .expect("init api");
 

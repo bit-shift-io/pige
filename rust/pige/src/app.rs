@@ -39,6 +39,35 @@ pub struct SectionView {
     pub folders: Vec<SectionFolder>,
 }
 
+/// The shell's single brief-message channel. A generation guard means a late
+/// expiry from an older toast cannot dismiss a newer one.
+#[derive(Debug, Default)]
+pub(crate) struct Toast {
+    pub(crate) current: Option<(u64, String)>,
+    generation: u64,
+}
+
+impl Toast {
+    /// Show `message`, replacing any current one, and return the generation
+    /// whose expiry is allowed to clear it.
+    pub(crate) fn show(&mut self, message: String) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.current = Some((self.generation, message));
+        self.generation
+    }
+
+    /// Clear the toast only if it still belongs to `generation`.
+    pub(crate) fn expire(&mut self, generation: u64) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            self.current = None;
+        }
+    }
+}
+
 /// Everything the shell remembers between messages.
 pub struct App {
     /// The latest authoritative cache view.
@@ -60,19 +89,27 @@ pub struct App {
     pub(crate) insets: iced_android::Insets,
     pub(crate) dark: bool,
     pub(crate) list_motion: Motion,
-    pub(crate) error: Option<String>,
+    /// The single shared brief-message channel (a small dark card at the
+    /// bottom). Errors and results both flow through it.
+    pub(crate) toast: Toast,
     /// Whether the reader's earlier-message section is expanded.
     pub(crate) reader_expanded: bool,
     /// Whether the reader's "Move to folder" picker is open.
     pub(crate) move_picker_open: bool,
     /// Whether the reader's permanent-delete confirmation is open.
     pub(crate) delete_confirm_open: bool,
+    /// Candidate backup names shown in the Advanced restore picker.
+    pub(crate) restore_picker: Option<Vec<String>>,
+    /// Whether the Advanced factory-reset confirmation is open.
+    pub(crate) confirm_reset: bool,
     /// Whether the full-window account screen is showing.
     pub accounts_open: bool,
     /// The account list/form/confirmation state.
     pub accounts: AccountsState,
     /// Whether the full-window settings screen is showing.
     pub settings_open: bool,
+    /// Whether the Advanced screen is showing (opened from Settings).
+    pub advanced_open: bool,
     /// The settings being edited. Persisted to the store on `SettingsSave`.
     pub(crate) settings: Settings,
     /// The raw sync-interval text while it is being edited.
@@ -119,6 +156,11 @@ impl App {
                 Err(error) => Message::Error(error),
             }));
         }
+        // An initialization problem (for example an unreadable configuration)
+        // is surfaced through the same toast channel as any other message.
+        if let Some(error) = init_error {
+            startup.push(Task::done(Message::Error(error)));
+        }
         let startup = Task::batch(startup);
 
         (
@@ -134,19 +176,55 @@ impl App {
                 insets: iced_android::Insets::default(),
                 dark,
                 list_motion: Motion::new(),
-                error: init_error,
+                toast: Toast::default(),
                 reader_expanded: false,
                 move_picker_open: false,
                 delete_confirm_open: false,
+                restore_picker: None,
+                confirm_reset: false,
                 accounts_open: false,
                 accounts: AccountsState::default(),
                 settings_open: false,
+                advanced_open: false,
                 settings,
                 settings_sync,
                 compose: None,
             },
             startup,
         )
+    }
+
+    /// A shell with default state for unit tests: no window and no API
+    /// initialization, so nothing is read from or written to the real
+    /// configuration or data directory.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            snapshot: ModelSnapshot::default(),
+            drawer_open: false,
+            selected_account: None,
+            collapsed: HashSet::new(),
+            search: String::new(),
+            search_scope: SearchScope::AllAccounts,
+            search_results: Vec::new(),
+            size: Size::new(900.0, 700.0),
+            insets: iced_android::Insets::default(),
+            dark: true,
+            list_motion: Motion::new(),
+            toast: Toast::default(),
+            reader_expanded: false,
+            move_picker_open: false,
+            delete_confirm_open: false,
+            restore_picker: None,
+            confirm_reset: false,
+            accounts_open: false,
+            accounts: AccountsState::default(),
+            settings_open: false,
+            advanced_open: false,
+            settings: Settings::default(),
+            settings_sync: Settings::default().sync_minutes.to_string(),
+            compose: None,
+        }
     }
 
     /// Install a fresh snapshot and derive the navigation selection in one
@@ -573,6 +651,29 @@ mod tests {
         assert!(row.has_attachment);
         assert_eq!(row.count, 3);
         assert!(!row.date.is_empty());
+    }
+
+    #[test]
+    fn showing_a_toast_replaces_the_previous_one() {
+        let mut toast = Toast::default();
+        let first = toast.show("one".to_string());
+        assert_eq!(toast.current.as_ref().unwrap().1, "one");
+        let second = toast.show("two".to_string());
+        assert_ne!(first, second);
+        assert_eq!(toast.current.as_ref().unwrap().1, "two");
+    }
+
+    #[test]
+    fn expiry_only_clears_its_own_generation() {
+        let mut toast = Toast::default();
+        let first = toast.show("first".to_string());
+        let second = toast.show("second".to_string());
+
+        toast.expire(first);
+        assert!(toast.current.is_some(), "a stale expiry must not dismiss");
+
+        toast.expire(second);
+        assert!(toast.current.is_none());
     }
 
     #[test]

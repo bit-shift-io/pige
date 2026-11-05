@@ -2,7 +2,7 @@
 //! notifications, and the real IMAP transport.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
@@ -10,7 +10,9 @@ use futures::future::BoxFuture;
 use keyring::Entry;
 
 use crate::account::{Account, AccountId};
-use crate::platform::{CredentialStore, CredentialsUnavailable, Opener, Result, TransportFactory};
+use crate::platform::{
+    BackupStore, CredentialStore, CredentialsUnavailable, Opener, Result, TransportFactory,
+};
 use crate::transport::{MailTransport, SmtpSender, imap, smtp};
 
 /// The Secret Service service name every pige secret is filed under.
@@ -228,6 +230,72 @@ impl Opener for LinuxOpener {
 /// [`linux_notify`]: crate::platform::linux_notify
 pub use crate::platform::linux_notify::LinuxNotifier;
 
+/// Downloads-backed backup store using `dirs::download_dir()`. `with_downloads`
+/// points it at a temporary directory so tests never touch a real Downloads
+/// folder; `None` means there is no Downloads location and the store reports
+/// itself unavailable.
+pub struct LinuxBackupStore {
+    downloads: Option<PathBuf>,
+}
+
+impl LinuxBackupStore {
+    pub fn new() -> Self {
+        Self {
+            downloads: dirs::download_dir(),
+        }
+    }
+
+    /// Replace the Downloads folder. For tests.
+    pub fn with_downloads(downloads: Option<PathBuf>) -> Self {
+        Self { downloads }
+    }
+
+    fn dir(&self) -> Result<&PathBuf> {
+        self.downloads
+            .as_ref()
+            .ok_or_else(|| "there is no Downloads folder to save a backup in".to_string())
+    }
+}
+
+impl Default for LinuxBackupStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackupStore for LinuxBackupStore {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        if !crate::platform::backup::is_backup_name(name) {
+            return Err(format!("{name:?} is not a backup file name"));
+        }
+        std::fs::write(self.dir()?.join(name), bytes).map_err(|error| error.to_string())
+    }
+
+    fn list(&self) -> Result<Vec<String>> {
+        let dir = self.dir()?;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let names = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok());
+        Ok(crate::platform::backup::sort_backup_names(names))
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        if !crate::platform::backup::is_backup_name(name) {
+            return Err(format!("{name:?} is not a backup file name"));
+        }
+        std::fs::read(self.dir()?.join(name)).map_err(|error| error.to_string())
+    }
+
+    fn available(&self) -> bool {
+        self.downloads.is_some()
+    }
+}
+
 /// Builds real TLS IMAP connections with passwords from the credential store.
 /// SMTP sending is completed by Task 13.
 pub struct LinuxTransportFactory {
@@ -301,5 +369,25 @@ mod tests {
     fn secrets_are_namespaced_by_account() {
         assert_eq!(username(&AccountId("abc".into())), "account:abc");
         assert_eq!(SERVICE, "pige");
+    }
+
+    #[test]
+    fn downloads_store_round_trips_and_rejects_other_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LinuxBackupStore::with_downloads(Some(dir.path().to_path_buf()));
+        assert!(store.available());
+        store
+            .write("pige-backup-2026-10-20-090000.json", b"payload")
+            .unwrap();
+        assert_eq!(
+            store.list().unwrap(),
+            vec!["pige-backup-2026-10-20-090000.json".to_string()]
+        );
+        assert_eq!(
+            store.read("pige-backup-2026-10-20-090000.json").unwrap(),
+            b"payload"
+        );
+        assert!(store.write("../escape.json", b"x").is_err());
+        assert!(!LinuxBackupStore::with_downloads(None).available());
     }
 }

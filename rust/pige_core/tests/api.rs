@@ -14,7 +14,7 @@ use pige_core::{
     api::{self, AccountInput, Config, CoreEvent, DB_FILE_NAME, MessageBody, SyncStatus},
     html::{Block, Inline, MailDocument},
     platform::{
-        CredentialStore,
+        BackupStore, CredentialStore,
         fake::{FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory},
     },
     transport::{FakeTransport, FolderState, RemoteFolder, RemoteMessage, UidRange},
@@ -30,6 +30,7 @@ struct Harness {
     credentials: Arc<FakeCredentials>,
     notifier: Arc<FakeNotifier>,
     factory: Arc<FakeTransportFactory>,
+    backups: Arc<pige_core::platform::fake::FakeBackupStore>,
 }
 
 impl Harness {
@@ -39,15 +40,18 @@ impl Harness {
         let notifier = Arc::new(FakeNotifier::default());
         let opener = Arc::new(FakeOpener::default());
         let factory = Arc::new(FakeTransportFactory::default());
+        let backups = Arc::new(pige_core::platform::fake::FakeBackupStore::new());
 
         api::reset_for_tests();
         api::init(Config {
             data_dir: dir.path().join("data"),
             cache_dir: dir.path().join("cache"),
+            config_dir: dir.path().join("config"),
             credentials: credentials.clone(),
             notifier: notifier.clone(),
             opener,
             transport: factory.clone(),
+            backups: backups.clone(),
         })
         .expect("init api");
 
@@ -56,6 +60,7 @@ impl Harness {
             credentials,
             notifier,
             factory,
+            backups,
         }
     }
 
@@ -909,7 +914,9 @@ async fn add_account_store_failure_rolls_back_credential() {
     let error = api::add_account(input("Personal", "ada@example.com"))
         .await
         .expect_err("account insert failed");
-    assert!(error.contains("store account"));
+    // The document is saved first, then the SQLite mirror is rebuilt; a mirror
+    // failure rolls the document and the credential back.
+    assert!(error.contains("update account cache"), "{error}");
     assert!(api::snapshot().accounts.is_empty());
     assert_eq!(harness.credentials.deleted().len(), 1);
 }
@@ -1527,4 +1534,482 @@ async fn earlier_messages_carry_their_cached_bodies() {
         detail.messages[1].body.is_some(),
         "the earlier message must expose its cached body"
     );
+}
+
+// --- Portable configuration: the document is the source of truth. ---
+
+fn seeded_account(id: &str, label: &str) -> pige_core::Account {
+    pige_core::Account {
+        id: AccountId(id.to_string()),
+        label: label.to_string(),
+        email: format!("{id}@example.com"),
+        display_name: label.to_string(),
+        username: format!("{id}@example.com"),
+        imap: ServerConfig {
+            host: "imap.example.com".to_string(),
+            port: 993,
+            security: Security::Tls,
+        },
+        smtp: ServerConfig {
+            host: "smtp.example.com".to_string(),
+            port: 465,
+            security: Security::Tls,
+        },
+        auth: pige_core::AuthKind::Password,
+        sort_order: 0,
+    }
+}
+
+fn test_config(dir: &TempDir) -> Config {
+    Config {
+        data_dir: dir.path().join("data"),
+        cache_dir: dir.path().join("cache"),
+        config_dir: dir.path().join("config"),
+        credentials: Arc::new(FakeCredentials::new()),
+        notifier: Arc::new(FakeNotifier::new()),
+        opener: Arc::new(FakeOpener::new()),
+        transport: Arc::new(FakeTransportFactory::new()),
+        backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
+    }
+}
+
+fn seed_sqlite_account(dir: &TempDir, id: &str, label: &str) {
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let store = Store::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    store.migrate().unwrap();
+    store.upsert_account(&seeded_account(id, label)).unwrap();
+}
+
+#[tokio::test]
+async fn first_run_migrates_sqlite_accounts_into_pige_json() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    seed_sqlite_account(&dir, "acct", "Personal");
+    {
+        let store = Store::open(dir.path().join("data").join(DB_FILE_NAME)).unwrap();
+        store
+            .set_meta("settings", r#"{"notifications":false}"#)
+            .unwrap();
+    }
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+
+    let path = pige_core::config::document_path(&dir.path().join("config"));
+    let doc = pige_core::config::load(&path)
+        .unwrap()
+        .expect("document written on first run");
+    assert_eq!(doc.accounts.len(), 1);
+    assert_eq!(doc.accounts[0].label, "Personal");
+    assert!(!doc.settings.notifications);
+}
+
+#[tokio::test]
+async fn a_present_document_is_authoritative_over_sqlite() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    seed_sqlite_account(&dir, "sqlite", "From SQLite");
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mut doc = pige_core::config::ConfigDocument::default();
+    doc.accounts.push(seeded_account("document", "From Document"));
+    pige_core::config::save(&pige_core::config::document_path(&config_dir), &doc).unwrap();
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+    let labels: Vec<String> = api::snapshot()
+        .accounts
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(labels, vec!["From Document".to_string()]);
+}
+
+#[tokio::test]
+async fn corrupt_document_is_quarantined_and_recovered() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    seed_sqlite_account(&dir, "recovered", "Recovered");
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let path = pige_core::config::document_path(&config_dir);
+    std::fs::write(&path, b"{ not json").unwrap();
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+    assert!(std::path::PathBuf::from(format!("{}.corrupt", path.display())).exists());
+    let labels: Vec<String> = api::snapshot()
+        .accounts
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(labels, vec!["Recovered".to_string()]);
+}
+
+#[tokio::test]
+async fn renaming_an_account_keeps_its_cached_mail() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let snapshot = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = snapshot.accounts[0].id.clone();
+
+    let inbox = folder("inbox-1", &account_id, "INBOX", FolderKind::Inbox, 1);
+    {
+        let store = harness.open_store();
+        store.upsert_folder(&inbox).unwrap();
+        store.upsert_message(&stored_message(&inbox, 1)).unwrap();
+    }
+
+    api::rename_account(&account_id, "Renamed")
+        .await
+        .expect("rename");
+
+    let store = harness.open_store();
+    assert_eq!(store.messages(&inbox.id, 10, None).unwrap().len(), 1);
+    let labels: Vec<String> = store
+        .accounts()
+        .unwrap()
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(labels, vec!["Renamed".to_string()]);
+}
+
+#[tokio::test]
+async fn a_failed_document_write_leaves_memory_unchanged() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    seed_sqlite_account(&dir, "acct", "Original");
+    // `config` is a regular file, so the document can be neither read nor
+    // written; the rename must fail without changing what the app shows.
+    std::fs::write(dir.path().join("config"), b"not a directory").unwrap();
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+    let before: Vec<String> = api::snapshot()
+        .accounts
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(before, vec!["Original".to_string()]);
+
+    let result = api::rename_account(&AccountId("acct".to_string()), "Changed").await;
+    assert!(result.is_err());
+
+    let after: Vec<String> = api::snapshot()
+        .accounts
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(after, vec!["Original".to_string()]);
+}
+
+#[tokio::test]
+async fn settings_persist_in_the_document_not_the_meta_table() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+
+    let mut settings = api::settings();
+    settings.notifications = false;
+    settings.sync_minutes = 30;
+    api::save_settings(&settings).unwrap();
+
+    let path = pige_core::config::document_path(&dir.path().join("config"));
+    let doc = pige_core::config::load(&path).unwrap().unwrap();
+    assert!(!doc.settings.notifications);
+    assert_eq!(doc.settings.sync_minutes, 30);
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+    let loaded = api::settings();
+    assert!(!loaded.notifications);
+    assert_eq!(loaded.sync_minutes, 30);
+
+    // The API clamps before writing, so an out-of-range value never reaches
+    // the document.
+    let mut huge = api::settings();
+    huge.sync_minutes = 999;
+    api::save_settings(&huge).unwrap();
+    assert_eq!(api::settings().sync_minutes, 60);
+}
+
+#[tokio::test]
+async fn backup_writes_a_dated_file_without_passwords() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .unwrap();
+
+    let name = api::backup_config().await.expect("backup");
+    assert!(name.starts_with("pige-backup-"), "{name}");
+    assert!(name.ends_with(".json"), "{name}");
+
+    let text = String::from_utf8(harness.backups.read(&name).unwrap()).unwrap();
+    assert!(text.contains("ada@example.com"));
+    assert!(
+        !text.contains("secret-Personal"),
+        "a backup must never contain a password"
+    );
+}
+
+#[tokio::test]
+async fn list_backups_is_newest_first() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    harness
+        .backups
+        .write("pige-backup-2026-10-20-090000.json", b"a")
+        .unwrap();
+    harness
+        .backups
+        .write("pige-backup-2026-10-21-140530.json", b"b")
+        .unwrap();
+
+    assert_eq!(
+        api::list_backups().await.unwrap(),
+        vec![
+            "pige-backup-2026-10-21-140530.json".to_string(),
+            "pige-backup-2026-10-20-090000.json".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn backup_reports_when_downloads_is_unavailable() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    let mut config = test_config(&dir);
+    config.backups =
+        Arc::new(pige_core::platform::fake::FakeBackupStore::without_downloads());
+    api::reset_for_tests();
+    api::init(config).unwrap();
+
+    assert!(api::backup_config().await.is_err());
+}
+
+fn backup_document(accounts: Vec<pige_core::Account>, notifications: bool) -> Vec<u8> {
+    let doc = pige_core::config::ConfigDocument {
+        accounts,
+        settings: pige_core::settings::Settings {
+            notifications,
+            ..pige_core::settings::Settings::default()
+        },
+        ..pige_core::config::ConfigDocument::default()
+    };
+    serde_json::to_vec_pretty(&doc).unwrap()
+}
+
+#[tokio::test]
+async fn restore_replaces_accounts_and_settings() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let added = api::add_account(input("Keep", "keep@example.com"))
+        .await
+        .unwrap();
+    let keep = api::account(&added.accounts[0].id).unwrap();
+    api::add_account(input("Drop", "drop@example.com"))
+        .await
+        .unwrap();
+
+    let bytes = backup_document(vec![keep], false);
+    harness
+        .backups
+        .write("pige-backup-2026-10-21-140530.json", &bytes)
+        .unwrap();
+
+    let outcome = api::restore_config("pige-backup-2026-10-21-140530.json".to_string())
+        .await
+        .expect("restore");
+    assert!(!outcome.settings.notifications);
+
+    let labels: Vec<String> = api::snapshot()
+        .accounts
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(labels, vec!["Keep".to_string()]);
+}
+
+#[tokio::test]
+async fn restore_keeps_surviving_cache_and_drops_the_rest() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let added = api::add_account(input("Keep", "keep@example.com"))
+        .await
+        .unwrap();
+    let keep_id = added.accounts[0].id.clone();
+    let keep = api::account(&keep_id).unwrap();
+    let dropped = api::add_account(input("Drop", "drop@example.com"))
+        .await
+        .unwrap();
+    let drop_id = dropped
+        .accounts
+        .iter()
+        .find(|account| account.label == "Drop")
+        .unwrap()
+        .id
+        .clone();
+
+    let keep_folder = folder("inbox-keep", &keep_id, "INBOX", FolderKind::Inbox, 1);
+    let drop_folder = folder("inbox-drop", &drop_id, "INBOX", FolderKind::Inbox, 1);
+    {
+        let store = harness.open_store();
+        store.upsert_folder(&keep_folder).unwrap();
+        store.upsert_message(&stored_message(&keep_folder, 1)).unwrap();
+        store.upsert_folder(&drop_folder).unwrap();
+        store
+            .upsert_message(&stored_message(&drop_folder, 2))
+            .unwrap();
+    }
+
+    let bytes = backup_document(vec![keep], true);
+    harness
+        .backups
+        .write("pige-backup-2026-10-21-140530.json", &bytes)
+        .unwrap();
+    api::restore_config("pige-backup-2026-10-21-140530.json".to_string())
+        .await
+        .expect("restore");
+
+    let store = harness.open_store();
+    assert_eq!(store.messages(&keep_folder.id, 10, None).unwrap().len(), 1);
+    assert!(
+        store
+            .messages(&drop_folder.id, 10, None)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn restore_deletes_credentials_of_dropped_accounts() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let kept = api::add_account(input("Keep", "keep@example.com"))
+        .await
+        .unwrap();
+    let keep_id = kept.accounts[0].id.clone();
+    let keep = api::account(&keep_id).unwrap();
+    let dropped = api::add_account(input("Drop", "drop@example.com"))
+        .await
+        .unwrap();
+    let drop_id = dropped
+        .accounts
+        .iter()
+        .find(|account| account.label == "Drop")
+        .unwrap()
+        .id
+        .clone();
+    assert!(harness.credentials.get(&drop_id).unwrap().is_some());
+
+    let bytes = backup_document(vec![keep], true);
+    harness
+        .backups
+        .write("pige-backup-2026-10-21-140530.json", &bytes)
+        .unwrap();
+    api::restore_config("pige-backup-2026-10-21-140530.json".to_string())
+        .await
+        .expect("restore");
+
+    assert_eq!(
+        harness.credentials.get(&drop_id).unwrap(),
+        None,
+        "a dropped account's password must not linger"
+    );
+    assert!(harness.credentials.get(&keep_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn restore_writes_a_pre_restore_copy() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let added = api::add_account(input("Keep", "keep@example.com"))
+        .await
+        .unwrap();
+    let keep = api::account(&added.accounts[0].id).unwrap();
+
+    let bytes = backup_document(vec![keep], true);
+    harness
+        .backups
+        .write("pige-backup-2026-10-21-140530.json", &bytes)
+        .unwrap();
+    api::restore_config("pige-backup-2026-10-21-140530.json".to_string())
+        .await
+        .expect("restore");
+
+    let document = harness.dir.path().join("config").join("pige.json");
+    let pre = std::path::PathBuf::from(format!("{}.pre-restore", document.display()));
+    assert!(pre.exists(), "a pre-restore copy must be kept");
+}
+
+#[tokio::test]
+async fn restore_rejects_a_bad_name_and_leaves_state() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .unwrap();
+
+    assert!(
+        api::restore_config("../../etc/passwd".to_string())
+            .await
+            .is_err()
+    );
+    assert_eq!(api::snapshot().accounts.len(), 1);
+    let _ = &harness;
+}
+
+#[tokio::test]
+async fn factory_reset_clears_accounts_settings_cache_and_credentials() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .unwrap();
+    let id = added.accounts[0].id.clone();
+
+    let inbox = folder("inbox-1", &id, "INBOX", FolderKind::Inbox, 1);
+    {
+        let store = harness.open_store();
+        store.upsert_folder(&inbox).unwrap();
+        store.upsert_message(&stored_message(&inbox, 1)).unwrap();
+    }
+    let mut settings = api::settings();
+    settings.notifications = false;
+    api::save_settings(&settings).unwrap();
+
+    let outcome = api::factory_reset().await.expect("factory reset");
+    assert!(outcome.snapshot.accounts.is_empty());
+    assert_eq!(outcome.settings, pige_core::settings::Settings::default());
+    assert_eq!(harness.credentials.get(&id).unwrap(), None);
+
+    let store = harness.open_store();
+    assert!(store.accounts().unwrap().is_empty());
+    assert!(store.messages(&inbox.id, 10, None).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn migrating_settings_clears_the_old_meta_row() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    seed_sqlite_account(&dir, "acct", "Personal");
+    {
+        let store = Store::open(dir.path().join("data").join(DB_FILE_NAME)).unwrap();
+        store
+            .set_meta("settings", r#"{"notifications":false}"#)
+            .unwrap();
+    }
+
+    api::reset_for_tests();
+    api::init(test_config(&dir)).unwrap();
+
+    let store = Store::open(dir.path().join("data").join(DB_FILE_NAME)).unwrap();
+    assert_eq!(store.get_meta("settings").unwrap(), None);
+    assert!(!api::settings().notifications);
 }

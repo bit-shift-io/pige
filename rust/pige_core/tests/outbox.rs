@@ -373,10 +373,12 @@ impl ApiHarness {
         api::init(Config {
             data_dir: dir.path().join("data"),
             cache_dir: dir.path().join("cache"),
+            config_dir: dir.path().join("config"),
             credentials,
             notifier: Arc::new(FakeNotifier::default()),
             opener: Arc::new(FakeOpener::default()),
             transport: factory.clone(),
+            backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
         })
         .unwrap();
         Self { dir, factory }

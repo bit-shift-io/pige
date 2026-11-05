@@ -6,7 +6,7 @@ use std::time::Duration;
 use iced::window;
 use iced::{Subscription, Task};
 use pige_core::account::AccountId;
-use pige_core::api::{self, AccountInput, ModelSnapshot};
+use pige_core::api::{self, AccountInput, ConfigOutcome, ModelSnapshot};
 use pige_core::mail::{FolderId, ThreadId};
 use pige_core::platform::credentials_unavailable;
 use pige_core::settings::{Settings, ThemeMode};
@@ -19,6 +19,37 @@ use crate::screens::accounts::{AccountField, TestState};
 use crate::screens::compose::{ComposeSeed, ComposeState};
 
 impl App {
+    /// Show `message` in the shared toast and schedule its expiry. A newer
+    /// toast supersedes an older one; the generation guard keeps an older
+    /// expiry from clearing a newer message.
+    pub(crate) fn show_toast(&mut self, message: String) -> Task<Message> {
+        let generation = self.toast.show(message);
+        Task::perform(
+            async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                generation
+            },
+            Message::ToastExpired,
+        )
+    }
+
+    /// Apply a restore or reset: refresh the snapshot, adopt the new settings
+    /// (theme and background sync), and keep the edited interval text in step.
+    fn apply_config_outcome(&mut self, outcome: ConfigOutcome) {
+        self.apply_snapshot(outcome.snapshot);
+        self.settings = outcome.settings;
+        self.settings_sync = self.settings.sync_minutes.to_string();
+        match self.settings.theme {
+            ThemeMode::Light => self.set_dark(false),
+            ThemeMode::Dark => self.set_dark(true),
+            ThemeMode::System => {}
+        }
+        crate::platform::apply_background_sync(
+            self.settings.background_sync,
+            self.settings.sync_minutes,
+        );
+    }
+
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Snapshot(snapshot) => self.apply_snapshot(snapshot),
@@ -73,7 +104,7 @@ impl App {
                 if query == self.search && scope == self.search_scope {
                     match result {
                         Ok(hits) => self.search_results = hits,
-                        Err(error) => self.error = Some(error),
+                        Err(error) => return self.show_toast(error),
                     }
                 }
             }
@@ -117,6 +148,8 @@ impl App {
                     self.accounts_open = false;
                     self.accounts.close_form();
                     self.accounts.confirm_remove = None;
+                } else if self.advanced_open {
+                    self.advanced_open = false;
                 } else if self.settings_open {
                     self.settings_open = false;
                 } else if self.drawer_open {
@@ -160,7 +193,7 @@ impl App {
             }
             Message::OpenUrl(url) => {
                 if let Err(error) = api::open_url(&url) {
-                    self.error = Some(error);
+                    return self.show_toast(error);
                 }
             }
             Message::OpenAttachment(message, part) => {
@@ -200,7 +233,7 @@ impl App {
             }
             Message::AccountLoaded(result) => match result {
                 Ok(account) => self.accounts.edit(&account),
-                Err(error) => self.error = Some(error),
+                Err(error) => return self.show_toast(error),
             },
             Message::AccountCancel => self.accounts.close_form(),
             Message::AccountFieldChanged(field, value) => {
@@ -291,7 +324,7 @@ impl App {
                     self.accounts.close_form();
                     self.accounts_open = false;
                     if let Some(warning) = result.warning {
-                        self.error = Some(warning);
+                        return self.show_toast(warning);
                     }
                 }
                 Err(error) => {
@@ -299,7 +332,7 @@ impl App {
                         form.busy = false;
                         form.test = TestState::Failed(error.clone());
                     }
-                    self.error = Some(error);
+                    return self.show_toast(error);
                 }
             },
             Message::AccountRemove(id) => {
@@ -327,7 +360,7 @@ impl App {
                     self.accounts.open(&self.snapshot);
                     self.accounts.notice = Some("Account removed.".to_string());
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => return self.show_toast(error),
             },
             Message::AccountLabelDraft(id, value) => {
                 self.accounts.label_drafts.insert(id, value);
@@ -337,8 +370,7 @@ impl App {
                     return Task::none();
                 };
                 if label.trim().is_empty() {
-                    self.error = Some("Account label is required".to_string());
-                    return Task::none();
+                    return self.show_toast("Account label is required".to_string());
                 }
                 return Task::perform(
                     async move { api::rename_account(&id, &label).await },
@@ -351,10 +383,11 @@ impl App {
                     self.accounts.open(&self.snapshot);
                     self.accounts.notice = Some("Account label updated.".to_string());
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => return self.show_toast(error),
             },
-            Message::Error(error) => self.error = Some(error),
-            Message::DismissError => self.error = None,
+            Message::Error(error) => return self.show_toast(error),
+            Message::Toast(message) => return self.show_toast(message),
+            Message::ToastExpired(generation) => self.toast.expire(generation),
             Message::Compose => {
                 let account = self.selected_account.clone().or_else(|| {
                     self.snapshot
@@ -369,7 +402,7 @@ impl App {
                         self.compose = Some(ComposeState::new(account));
                     }
                     None => {
-                        self.error = Some("Add an account before composing.".to_string());
+                        return self.show_toast("Add an account before composing.".to_string());
                     }
                 }
             }
@@ -381,7 +414,7 @@ impl App {
                     self.accounts_open = false;
                     self.compose = Some(ComposeState::from_message(seed.message, seed.id));
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => return self.show_toast(error),
             },
             Message::OpenDraft(id) => {
                 return Task::perform(async move { api::draft(&id) }, |result| match result {
@@ -430,7 +463,7 @@ impl App {
                 Ok(outcome) => {
                     self.apply_snapshot(outcome.snapshot);
                     self.compose = None;
-                    self.error = Some(if outcome.queued {
+                    return self.show_toast(if outcome.queued {
                         "Message queued; it will send when you are online.".to_string()
                     } else {
                         "Message sent.".to_string()
@@ -441,7 +474,7 @@ impl App {
                         compose.busy = false;
                         compose.notice = Some(error.clone());
                     }
-                    self.error = Some(error);
+                    return self.show_toast(error);
                 }
             },
             Message::ComposeSaveDraft => {
@@ -478,14 +511,14 @@ impl App {
             Message::ComposeSaved(result) => match result {
                 Ok(_) => {
                     self.compose = None;
-                    self.error = Some("Draft saved.".to_string());
+                    return self.show_toast("Draft saved.".to_string());
                 }
                 Err(error) => {
                     if let Some(compose) = self.compose.as_mut() {
                         compose.busy = false;
                         compose.notice = Some(error.clone());
                     }
-                    self.error = Some(error);
+                    return self.show_toast(error);
                 }
             },
             Message::ComposeDiscard => {
@@ -500,7 +533,7 @@ impl App {
             }
             Message::ComposeDiscarded(result) => match result {
                 Ok(snapshot) => self.apply_snapshot(snapshot),
-                Err(error) => self.error = Some(error),
+                Err(error) => return self.show_toast(error),
             },
             Message::Settings => {
                 self.drawer_open = false;
@@ -524,7 +557,88 @@ impl App {
                     }
                 }
             }
-            Message::CloseSettings => self.settings_open = false,
+            Message::CloseSettings => {
+                self.settings_open = false;
+                self.advanced_open = false;
+            }
+            Message::OpenAdvanced => self.advanced_open = true,
+            Message::CloseAdvanced => self.advanced_open = false,
+            Message::Advanced(row) => {
+                use crate::screens::advanced::Row;
+                match row {
+                    Row::Backup => {
+                        return Task::perform(api::backup_config(), Message::BackupDone);
+                    }
+                    Row::Restore => {
+                        // Backups written by a previous install are hidden from
+                        // the scoped query until "All files access" is granted,
+                        // so the permission is checked before listing.
+                        return Task::perform(
+                            async { crate::storage::has_all_files_access() },
+                            Message::RestoreAccessChecked,
+                        );
+                    }
+                    Row::FactoryReset => self.confirm_reset = true,
+                }
+            }
+            Message::BackupDone(result) => {
+                return self.show_toast(crate::screens::advanced::backup_message(&result));
+            }
+            Message::BackupsListed(result) => match result {
+                Ok(names) if names.is_empty() => {
+                    return self.show_toast(crate::screens::advanced::NO_BACKUPS.to_string());
+                }
+                Ok(names) => self.restore_picker = Some(names),
+                Err(error) => return self.show_toast(error),
+            },
+            Message::RestoreAccessChecked(granted) => {
+                if granted {
+                    return Task::perform(api::list_backups(), Message::BackupsListed);
+                }
+                return Task::perform(
+                    async { crate::storage::request_all_files_access() },
+                    Message::RestoreAccessRequested,
+                );
+            }
+            Message::RestoreAccessRequested(result) => {
+                let message = match result {
+                    Ok(()) => crate::screens::advanced::NEEDS_ALL_FILES_ACCESS.to_string(),
+                    Err(error) => error,
+                };
+                return self.show_toast(message);
+            }
+            Message::RestoreChosen(name) => {
+                self.restore_picker = None;
+                let restore_name = name.clone();
+                return Task::perform(
+                    async move { api::restore_config(restore_name).await },
+                    move |result| Message::RestoreDone(name.clone(), result),
+                );
+            }
+            Message::RestoreCancelled => self.restore_picker = None,
+            Message::RestoreDone(name, result) => {
+                let message = crate::screens::advanced::restore_message(&result, &name);
+                self.restore_picker = None;
+                if let Ok(outcome) = result {
+                    self.apply_config_outcome(outcome);
+                }
+                return self.show_toast(message);
+            }
+            Message::ResetConfirmed => {
+                self.confirm_reset = false;
+                return Task::perform(api::factory_reset(), Message::ResetDone);
+            }
+            Message::ResetCancelled => self.confirm_reset = false,
+            Message::ResetDone(result) => {
+                self.confirm_reset = false;
+                match result {
+                    Ok(outcome) => {
+                        self.apply_config_outcome(outcome);
+                        return self.show_toast("The app was reset.".to_string());
+                    }
+                    Err(error) => return self.show_toast(error),
+                }
+            }
             Message::SettingsSyncChanged(value) => self.settings_sync = value,
             Message::SettingsNotificationsToggled(on) => self.settings.notifications = on,
             Message::SettingsBackgroundSyncToggled(on) => self.settings.background_sync = on,
@@ -556,13 +670,13 @@ impl App {
             }
             Message::SettingsSaved(result) => match result {
                 Ok(()) => {
-                    self.error = Some("Settings saved.".to_string());
                     crate::platform::apply_background_sync(
                         self.settings.background_sync,
                         self.settings.sync_minutes,
                     );
+                    return self.show_toast("Settings saved.".to_string());
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => return self.show_toast(error),
             },
             Message::SystemTheme(mode) => {
                 if self.settings.theme == ThemeMode::System
@@ -859,5 +973,41 @@ mod tests {
         assert_eq!(system_theme_dark(iced::theme::Mode::Light), Some(false));
         // A platform that reports no preference must not override the user's.
         assert_eq!(system_theme_dark(iced::theme::Mode::None), None);
+    }
+
+    #[test]
+    fn factory_reset_requires_confirmation() {
+        let mut app = App::for_test();
+        let _ = app.update(Message::Advanced(crate::screens::advanced::Row::FactoryReset));
+        assert!(app.confirm_reset, "the reset must wait for confirmation");
+    }
+
+    #[test]
+    fn empty_backup_list_shows_a_toast_not_a_dialog() {
+        let mut app = App::for_test();
+        let _ = app.update(Message::BackupsListed(Ok(Vec::new())));
+        assert!(app.restore_picker.is_none());
+        assert_eq!(
+            app.toast.current.as_ref().unwrap().1,
+            crate::screens::advanced::NO_BACKUPS
+        );
+    }
+
+    #[test]
+    fn restore_success_applies_settings_and_snapshot_and_closes_the_picker() {
+        let mut app = App::for_test();
+        app.restore_picker = Some(vec!["a.json".to_string()]);
+        let outcome = ConfigOutcome {
+            snapshot: ModelSnapshot::default(),
+            settings: Settings {
+                notifications: false,
+                ..Settings::default()
+            },
+        };
+        let _ = app.update(Message::RestoreDone("a.json".to_string(), Ok(outcome)));
+
+        assert!(app.restore_picker.is_none());
+        assert!(!app.settings.notifications, "restored settings must apply");
+        assert!(app.toast.current.is_some(), "restore reports via toast");
     }
 }

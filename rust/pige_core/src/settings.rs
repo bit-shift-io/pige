@@ -1,8 +1,11 @@
-//! User settings, persisted as one JSON document in the store's `meta` table.
+//! User settings, now persisted inside the configuration document
+//! (`crate::config::ConfigDocument`). The core owns the schema so every shell
+//! (desktop, Android) reads and writes the same values.
 //!
-//! The core owns the schema so every shell (desktop, Android) reads and writes
-//! the same values. Nothing here touches the network or the UI; a settings
-//! screen only edits this struct and hands it back through [`save_settings`].
+//! [`load_settings`] remains for the one-time migration from the old `meta`
+//! table; [`clear_settings`] removes that legacy row after the document has
+//! taken over. New writes go through `api::save_settings`, which edits the
+//! document.
 
 use serde::{Deserialize, Serialize};
 
@@ -78,13 +81,10 @@ pub fn load_settings(store: &Store) -> Settings {
     settings
 }
 
-/// Persist `settings`, normalising the sync interval first so an out-of-range
-/// value can never be stored and read back later.
-pub fn save_settings(store: &Store, settings: &Settings) -> Result<(), StoreError> {
-    let mut settings = settings.clone();
-    settings.sync_minutes = Settings::clamp_minutes(settings.sync_minutes);
-    let raw = serde_json::to_string(&settings)?;
-    store.set_meta(SETTINGS_KEY, &raw)
+/// Remove the legacy `meta` settings row after it has been migrated into the
+/// configuration document, so a later downgrade cannot resurrect it.
+pub fn clear_settings(store: &Store) -> Result<(), StoreError> {
+    store.delete_meta(SETTINGS_KEY)
 }
 
 #[cfg(test)]

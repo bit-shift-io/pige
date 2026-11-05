@@ -35,6 +35,12 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
         notifications_section(app),
         theme_section(app),
         accounts_section(app),
+        components::action_card(
+            "Advanced",
+            "Backup, restore and factory reset.",
+            icons::SETTINGS,
+            Message::OpenAdvanced,
+        ),
     ]
     .spacing(palette.space.lg)
     .width(Fill)

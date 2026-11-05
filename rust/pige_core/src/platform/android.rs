@@ -131,6 +131,16 @@ fn call_void(method: &str, args: &[&str]) -> Result<()> {
     })
 }
 
+/// Call a static bridge method that takes no arguments and returns `boolean`.
+fn call_bool(method: &str) -> Result<bool> {
+    with_env(|env| {
+        let result = env
+            .call_static_method(class()?, method, "()Z", &[])
+            .map_err(|error| jni_error(env, error))?;
+        result.z().map_err(|error| jni_error(env, error))
+    })
+}
+
 /// Call a static bridge method that takes one `int` and returns `void`.
 fn call_void_int(method: &str, value: i32) -> Result<()> {
     with_env(|env| {
@@ -161,10 +171,13 @@ pub fn cancel_sync() -> Result<()> {
 pub struct AndroidPaths {
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
+    /// App-private directory holding `pige.json`.
+    pub config_dir: PathBuf,
 }
 
 impl AndroidPaths {
-    /// Read `Context.filesDir` and `Context.cacheDir` through the bridge.
+    /// Read `Context.filesDir`, `Context.cacheDir`, and the config directory
+    /// through the bridge.
     pub fn load() -> Result<Self> {
         let data_dir = call_string("dataDir")?
             .filter(|path| !path.is_empty())
@@ -172,10 +185,73 @@ impl AndroidPaths {
         let cache_dir = call_string("cacheDir")?
             .filter(|path| !path.is_empty())
             .ok_or_else(|| "PigeBridge.cacheDir returned an empty path".to_string())?;
+        let config_dir = call_string("configDir")?
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "PigeBridge.configDir returned an empty path".to_string())?;
         Ok(Self {
             data_dir: PathBuf::from(data_dir),
             cache_dir: PathBuf::from(cache_dir),
+            config_dir: PathBuf::from(config_dir),
         })
+    }
+}
+
+/// Parse the JSON array of backup names `PigeBridge.listBackups` returns.
+/// Invalid names are dropped, exactly as a filesystem listing would be.
+pub fn parse_backup_names_json(json: &str) -> Result<Vec<String>> {
+    let names: Vec<String> =
+        serde_json::from_str(json).map_err(|error| format!("bad backup list JSON: {error}"))?;
+    Ok(crate::platform::backup::sort_backup_names(names))
+}
+
+/// Whether this install holds "All files access" (`MANAGE_EXTERNAL_STORAGE`).
+/// A reflash attributes a Downloads file to the previous install, so its
+/// backups are hidden from the scoped MediaStore query until this is granted.
+pub fn has_all_files_access() -> Result<bool> {
+    call_bool("hasAllFilesAccess")
+}
+
+/// Open the system "All files access" screen for this app.
+pub fn request_all_files_access() -> Result<()> {
+    call_void("requestAllFilesAccess", &[])
+}
+
+/// Downloads-backed backup store using MediaStore, so backups are visible in
+/// Files and readable by a later install.
+pub struct AndroidBackupStore;
+
+impl AndroidBackupStore {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for AndroidBackupStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::platform::BackupStore for AndroidBackupStore {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let body = std::str::from_utf8(bytes)
+            .map_err(|error| format!("backup is not valid UTF-8: {error}"))?;
+        call_void("writeBackup", &[name, body])
+    }
+
+    fn list(&self) -> Result<Vec<String>> {
+        let json = call_string("listBackups")?.unwrap_or_else(|| "[]".to_string());
+        parse_backup_names_json(&json)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        call_string_arg("readBackup", name)?
+            .map(String::into_bytes)
+            .ok_or_else(|| format!("no backup named {name}"))
+    }
+
+    fn available(&self) -> bool {
+        true
     }
 }
 

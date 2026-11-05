@@ -44,10 +44,12 @@ impl Harness {
         api::init(Config {
             data_dir: dir.path().join("data"),
             cache_dir: dir.path().join("cache"),
+            config_dir: dir.path().join("config"),
             credentials: credentials.clone(),
             notifier: Arc::new(FakeNotifier::default()),
             opener: Arc::new(FakeOpener::default()),
             transport: factory.clone(),
+            backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
         })
         .expect("init api");
 
@@ -469,7 +471,7 @@ async fn failed_update_removes_a_newly_written_secret_when_none_existed() {
     let error = api::update_account(&id, changed)
         .await
         .expect_err("account update failed");
-    assert!(error.contains("store account"));
+    assert!(error.contains("update account cache"), "{error}");
     assert_eq!(
         harness.credentials.get(&id).unwrap(),
         None,

@@ -5,6 +5,8 @@
     <!-- IMAP/SMTP over TLS. Background sync uses WorkManager. -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Reading config backups written by a previous install in Downloads. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
     <application
         android:label="@string/app_name"
         android:allowBackup="false"

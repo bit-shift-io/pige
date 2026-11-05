@@ -20,6 +20,8 @@ impl App {
         let panes = panes_for(breakpoint, self.drawer_open, reading);
         let base = if self.accounts_open {
             crate::screens::accounts::screen(self)
+        } else if self.advanced_open {
+            crate::screens::advanced::view(self)
         } else if self.settings_open {
             crate::screens::settings::screen(self)
         } else {
@@ -33,14 +35,20 @@ impl App {
             None => base,
         };
 
-        if self.error.is_some() {
-            root = stack![root, self.error_overlay()].into();
+        if self.toast.current.is_some() {
+            root = stack![root, self.toast_overlay()].into();
         }
         if self.move_picker_open {
             root = stack![root, crate::screens::reader::move_picker_modal(self)].into();
         }
         if self.delete_confirm_open {
             root = stack![root, crate::screens::reader::delete_confirm_modal()].into();
+        }
+        if let Some(names) = &self.restore_picker {
+            root = stack![root, crate::screens::advanced::restore_picker_modal(names)].into();
+        }
+        if self.confirm_reset {
+            root = stack![root, crate::screens::advanced::reset_confirm_modal()].into();
         }
         if panes.nav && breakpoint != Breakpoint::Expanded {
             root = stack![root, self.drawer()].into();
@@ -123,25 +131,26 @@ impl App {
             .into()
     }
 
-    fn error_overlay(&self) -> Element<'_, Message> {
+    /// The shared toast: a small dark card centred at the bottom, over the
+    /// current screen and inside the system-bar insets.
+    fn toast_overlay(&self) -> Element<'_, Message> {
         let palette = theme::active();
-        let Some(error) = &self.error else {
+        let Some((_, message)) = &self.toast.current else {
             return space().into();
         };
-
-        let bar = row![
-            components::snackbar(error),
-            components::icon_button(icons::CLOSE, "Dismiss", Message::DismissError),
-        ]
-        .spacing(palette.space.sm)
-        .align_y(Alignment::Center)
-        .width(Fill);
-
-        container(bar)
+        let margin = palette.metrics.toast_margin;
+        let insets = self.insets;
+        container(components::toast(message))
             .width(Fill)
             .height(Fill)
-            .padding(palette.space.lg)
+            .align_x(Alignment::Center)
             .align_y(Alignment::End)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: insets.right + margin,
+                bottom: insets.bottom + margin,
+                left: insets.left + margin,
+            })
             .into()
     }
 }

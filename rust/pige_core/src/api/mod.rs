@@ -19,13 +19,14 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 
 use crate::account::{Account, AccountId, AuthKind, ServerConfig};
+use crate::config::{self, ConfigDocument};
 use crate::html::{MailDocument, parse_html, plain_text_document};
 use crate::mail::{
     AttachmentPart, Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner,
     ThreadId, Uid, attachment_bytes, cache_attachment, check_attachment_size, extract_attachments,
     sender_display, thread::participants_of,
 };
-use crate::platform::{CredentialStore, Notifier, Opener, TransportFactory};
+use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
 use crate::search::{SearchHit, SearchScope};
 use crate::send::{
     self, OutboxEntry, OutboxId, OutgoingMessage, compose::forward_message, compose::reply_message,
@@ -70,16 +71,30 @@ pub struct SendOutcome {
     pub queued: bool,
 }
 
+/// The result of a configuration change that also replaces settings (restore
+/// and factory reset). Settings are not part of [`ModelSnapshot`], so the shell
+/// needs them here to refresh the theme and reschedule background sync.
+#[derive(Debug, Clone)]
+pub struct ConfigOutcome {
+    pub snapshot: ModelSnapshot,
+    pub settings: Settings,
+}
+
 /// Everything the core needs from the host process. Built once per process by
 /// the desktop or Android shell and handed to [`init`].
 #[derive(Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
+    /// Where `pige.json` lives (`$XDG_CONFIG_HOME/bitshift/pige` on Linux, an
+    /// app-private directory on Android).
+    pub config_dir: PathBuf,
     pub credentials: Arc<dyn CredentialStore>,
     pub notifier: Arc<dyn Notifier>,
     pub opener: Arc<dyn Opener>,
     pub transport: Arc<dyn TransportFactory>,
+    /// Reads and writes configuration backups in the platform's Downloads.
+    pub backups: Arc<dyn BackupStore>,
 }
 
 /// User-supplied fields when adding an account. The id and sort order are
@@ -181,6 +196,11 @@ impl AccountInput {
 struct AppState {
     config: Config,
     store: Store,
+    /// The authoritative accounts and settings document. The SQLite accounts
+    /// table is a derived mirror kept only so cascade deletes and joins work.
+    config_doc: ConfigDocument,
+    /// `<config_dir>/pige.json`.
+    config_path: PathBuf,
     selected_folder: Option<FolderId>,
     unified_selected: bool,
     conversation_limit: u32,
@@ -233,6 +253,27 @@ impl SearchState {
 }
 
 impl AppState {
+    /// Replace the account list, persisting the document first and then
+    /// rebuilding the SQLite mirror. A failure leaves the in-memory document
+    /// exactly as it was, so the UI cannot show an account the disk does not
+    /// have. Callers own any credential rollback.
+    fn replace_accounts(&mut self, accounts: Vec<Account>) -> Result<(), String> {
+        let previous = self.config_doc.accounts.clone();
+        self.config_doc.accounts = accounts;
+        if let Err(error) = config::save(&self.config_path, &self.config_doc) {
+            self.config_doc.accounts = previous;
+            return Err(format!("save configuration: {error}"));
+        }
+        if let Err(error) = self.store.sync_accounts(&self.config_doc.accounts) {
+            // The document is durable but the mirror failed; put the document
+            // back so the two cannot disagree after a restart.
+            self.config_doc.accounts = previous;
+            let _ = config::save(&self.config_path, &self.config_doc);
+            return Err(format!("update account cache: {error}"));
+        }
+        Ok(())
+    }
+
     fn ensure_selection(&mut self) {
         if self.selected_folder.is_some() || self.unified_selected {
             return;
@@ -392,8 +433,11 @@ pub fn init(config: Config) -> Result<(), String> {
     // Android's `AndroidPaths::load` returns empty paths when app storage is
     // unavailable; refuse them rather than writing `pige.db` to the process
     // working directory.
-    if config.data_dir.as_os_str().is_empty() || config.cache_dir.as_os_str().is_empty() {
-        return Err("data and cache directories must not be empty".to_string());
+    if config.data_dir.as_os_str().is_empty()
+        || config.cache_dir.as_os_str().is_empty()
+        || config.config_dir.as_os_str().is_empty()
+    {
+        return Err("data, cache, and configuration directories must not be empty".to_string());
     }
 
     std::fs::create_dir_all(&config.data_dir)
@@ -407,10 +451,15 @@ pub fn init(config: Config) -> Result<(), String> {
         .migrate()
         .map_err(|error| format!("migrate store: {error}"))?;
 
+    let config_path = config::document_path(&config.config_dir);
+    let (config_doc, warning) = load_or_migrate_document(&store, &config_path);
+
     let sender = events::sender().clone();
     let mut state = AppState {
         config,
         store,
+        config_doc,
+        config_path,
         selected_folder: None,
         unified_selected: false,
         conversation_limit: INITIAL_PAGE,
@@ -424,8 +473,84 @@ pub fn init(config: Config) -> Result<(), String> {
     state.ensure_selection();
 
     *lock_state() = Some(state);
+    if let Some(warning) = warning {
+        let _ = sender.send(CoreEvent::Error(warning));
+    }
     let _ = sender.send(CoreEvent::SnapshotChanged);
     Ok(())
+}
+
+/// Read the configuration document, or create it: from the SQLite cache on a
+/// fresh install, and after quarantining an unreadable file. Returns a warning
+/// to surface when something could not be read or written; never overwrites a
+/// document that exists but could not be read.
+fn load_or_migrate_document(store: &Store, path: &Path) -> (ConfigDocument, Option<String>) {
+    match config::load(path) {
+        Ok(Some(doc)) => {
+            if let Err(error) = store.sync_accounts(&doc.accounts) {
+                log::warn!("sync account mirror from configuration: {error}");
+            }
+            (doc, None)
+        }
+        Ok(None) => {
+            let doc = document_from_store(store);
+            match config::save(path, &doc) {
+                Ok(()) => {
+                    // The document now owns settings; drop the legacy row.
+                    let _ = crate::settings::clear_settings(store);
+                    (doc, None)
+                }
+                Err(error) => {
+                    log::warn!("write configuration document: {error}");
+                    (
+                        doc,
+                        Some(format!(
+                            "Could not write the configuration file ({error}); changes will not be saved."
+                        )),
+                    )
+                }
+            }
+        }
+        Err(config::ConfigError::Json(error)) => {
+            log::warn!("unreadable configuration quarantined: {error}");
+            let _ = config::quarantine(path);
+            let doc = document_from_store(store);
+            let _ = config::save(path, &doc);
+            let _ = crate::settings::clear_settings(store);
+            (
+                doc,
+                Some(
+                    "The saved configuration could not be read and was set aside; pige started from its cache."
+                        .to_string(),
+                ),
+            )
+        }
+        Err(config::ConfigError::Io(error)) => {
+            // The file exists but could not be read. Leave it untouched.
+            log::warn!("could not read configuration: {error}");
+            let doc = document_from_store(store);
+            (
+                doc,
+                Some(format!(
+                    "Could not read the configuration file ({error}); changes will not be saved."
+                )),
+            )
+        }
+        Err(config::ConfigError::NoRoot) => {
+            let doc = document_from_store(store);
+            (doc, Some("No configuration directory is available.".to_string()))
+        }
+    }
+}
+
+/// Build a document from the existing SQLite cache, for the one-time upgrade
+/// from the pre-config-document layout.
+fn document_from_store(store: &Store) -> ConfigDocument {
+    ConfigDocument {
+        version: config::CURRENT_VERSION,
+        accounts: store.accounts().unwrap_or_default(),
+        settings: crate::settings::load_settings(store),
+    }
 }
 
 /// The current view, built from the cache and the current selection.
@@ -442,23 +567,216 @@ pub fn is_initialized() -> bool {
     lock_state().is_some()
 }
 
-/// Load the persisted user settings, or the defaults before [`init`].
+/// The persisted user settings, from the configuration document.
 pub fn settings() -> Settings {
     let guard = lock_state();
     match guard.as_ref() {
-        Some(state) => crate::settings::load_settings(&state.store),
+        Some(state) => state.config_doc.settings.clone(),
         None => Settings::default(),
     }
 }
 
-/// Persist user settings. Requires [`init`] so there is a store to write to.
+/// Persist user settings into the configuration document, normalising the sync
+/// interval first. A failed write leaves the in-memory settings unchanged.
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    let mut guard = lock_state();
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    let mut settings = settings.clone();
+    settings.sync_minutes = Settings::clamp_minutes(settings.sync_minutes);
+    let previous = state.config_doc.settings.clone();
+    state.config_doc.settings = settings;
+    if let Err(error) = config::save(&state.config_path, &state.config_doc) {
+        state.config_doc.settings = previous;
+        return Err(format!("save settings: {error}"));
+    }
+    Ok(())
+}
+
+/// Write the accounts and settings to a dated backup file in the platform's
+/// Downloads folder and return its name. Passwords are never included.
+pub async fn backup_config() -> Result<String, String> {
     let guard = lock_state();
     let state = guard
         .as_ref()
         .ok_or_else(|| "pige api is not initialized".to_string())?;
-    crate::settings::save_settings(&state.store, settings)
-        .map_err(|error| format!("save settings: {error}"))
+    if !state.config.backups.available() {
+        return Err("there is no Downloads folder to save a backup in".to_string());
+    }
+    let bytes = serde_json::to_vec_pretty(&state.config_doc)
+        .map_err(|error| format!("serialise configuration: {error}"))?;
+    let name = crate::platform::backup::backup_name(now_ms());
+    state
+        .config
+        .backups
+        .write(&name, &bytes)
+        .map_err(|error| format!("save backup: {error}"))?;
+    Ok(name)
+}
+
+/// The backup files in Downloads, newest first.
+pub async fn list_backups() -> Result<Vec<String>, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state
+        .config
+        .backups
+        .list()
+        .map_err(|error| format!("list backups: {error}"))
+}
+
+/// Replace accounts and settings with the named backup from Downloads. A bad
+/// name or unreadable file leaves the current configuration untouched; on
+/// success the previous document is kept as `pige.json.pre-restore`, cache for
+/// accounts the backup dropped is cascaded away, and those accounts' stored
+/// passwords are deleted.
+pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> {
+    if !crate::platform::backup::is_backup_name(&file_name) {
+        return Err(format!("{file_name:?} is not a backup file name"));
+    }
+
+    let mut guard = lock_state();
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+
+    let bytes = state
+        .config
+        .backups
+        .read(&file_name)
+        .map_err(|error| format!("read backup: {error}"))?;
+    let restored: ConfigDocument = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("read backup: {error}"))?;
+
+    // Everything below is a committed change; a failure before the document is
+    // durable leaves the running configuration exactly as it was.
+    let previous = state.config_doc.clone();
+    if let Err(error) = config::pre_restore_copy(&state.config_path) {
+        log::warn!("keep pre-restore copy: {error}");
+    }
+
+    let dropped: Vec<AccountId> = previous
+        .accounts
+        .iter()
+        .filter(|account| {
+            !restored
+                .accounts
+                .iter()
+                .any(|candidate| candidate.id == account.id)
+        })
+        .map(|account| account.id.clone())
+        .collect();
+
+    state.config_doc = restored;
+    if let Err(error) = config::save(&state.config_path, &state.config_doc) {
+        state.config_doc = previous;
+        return Err(format!("save configuration: {error}"));
+    }
+    if let Err(error) = state.store.sync_accounts(&state.config_doc.accounts) {
+        state.config_doc = previous;
+        let _ = config::save(&state.config_path, &state.config_doc);
+        return Err(format!("update account cache: {error}"));
+    }
+
+    // The document is durable; now the dropped accounts' secrets must not
+    // linger, or a later restore of the same id would silently re-attach one.
+    for id in &dropped {
+        if let Err(error) = state.config.credentials.delete(id) {
+            log::warn!("delete password for restored-away account {id}: {error}");
+        }
+        if let Err(error) = state.config.credentials.delete_session(id) {
+            log::warn!("clear session password for restored-away account {id}: {error}");
+        }
+    }
+
+    state.selected_folder = None;
+    state.selected_conversation = None;
+    state.server_more = None;
+    state.conversation_limit = INITIAL_PAGE;
+    state.ensure_selection();
+
+    let sender = state.events.clone();
+    let outcome = ConfigOutcome {
+        snapshot: state.build_snapshot(),
+        settings: state.config_doc.settings.clone(),
+    };
+    drop(guard);
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(outcome)
+}
+
+/// Wipe every account, stored password, cached row, and setting, leaving a
+/// working first-run app. Destructive and irreversible.
+pub async fn factory_reset() -> Result<ConfigOutcome, String> {
+    let mut guard = lock_state();
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+
+    let previous = state.config_doc.clone();
+    let ids: Vec<AccountId> = previous
+        .accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect();
+
+    state.config_doc = ConfigDocument::default();
+    if let Err(error) = config::save(&state.config_path, &state.config_doc) {
+        state.config_doc = previous;
+        return Err(format!("save configuration: {error}"));
+    }
+    if let Err(error) = state.store.sync_accounts(&[]) {
+        state.config_doc = previous;
+        let _ = config::save(&state.config_path, &state.config_doc);
+        return Err(format!("update account cache: {error}"));
+    }
+
+    for id in &ids {
+        if let Err(error) = state.config.credentials.delete(id) {
+            log::warn!("delete password during factory reset for {id}: {error}");
+        }
+        if let Err(error) = state.config.credentials.delete_session(id) {
+            log::warn!("clear session password during factory reset for {id}: {error}");
+        }
+    }
+
+    // Cached bodies and attachments live as files outside SQLite; clear them so
+    // nothing from the previous configuration is left on disk.
+    if let Ok(entries) = std::fs::read_dir(&state.config.cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+
+    state.selected_folder = None;
+    state.selected_conversation = None;
+    state.server_more = None;
+    state.conversation_limit = INITIAL_PAGE;
+
+    let sender = state.events.clone();
+    let outcome = ConfigOutcome {
+        snapshot: state.build_snapshot(),
+        settings: state.config_doc.settings.clone(),
+    };
+    drop(guard);
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(outcome)
+}
+
+/// Milliseconds since the Unix epoch, or `0` if the clock is before it.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Search cached mail for the search screen. The SQLite scan runs on a
@@ -555,10 +873,7 @@ async fn add_account_inner(
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
 
-        let accounts = state
-            .store
-            .accounts()
-            .map_err(|error| format!("read accounts: {error}"))?;
+        let accounts = state.config_doc.accounts.clone();
         // len() can tie after a removal because sort_order is user-editable
         // data in later tasks. A strict max + 1 keeps new accounts at the end.
         let sort_order = accounts
@@ -576,16 +891,18 @@ async fn add_account_inner(
 
         set_secret(state, &id, &input.password, target)
             .map_err(|error| format!("store password: {error}"))?;
-        if let Err(error) = state.store.upsert_account(&account) {
+        let mut next = state.config_doc.accounts.clone();
+        next.push(account);
+        if let Err(error) = state.replace_accounts(next) {
             if let Err(rollback) = delete_secret(state, &id, target) {
                 log::error!(
                     "rollback credential for {id} after account insert failure: {rollback}"
                 );
                 return Err(format!(
-                    "store account: {error}; credential rollback failed: {rollback}"
+                    "{error}; credential rollback failed: {rollback}"
                 ));
             }
-            return Err(format!("store account: {error}"));
+            return Err(error);
         }
 
         state.ensure_selection();
@@ -628,11 +945,11 @@ async fn update_account_inner(
             .ok_or_else(|| "pige api is not initialized".to_string())?;
 
         let existing = state
-            .store
-            .accounts()
-            .map_err(|error| format!("read accounts: {error}"))?
-            .into_iter()
+            .config_doc
+            .accounts
+            .iter()
             .find(|account| &account.id == id)
+            .cloned()
             .ok_or_else(|| format!("unknown account {id}"))?;
 
         let wrote_secret = !input.password.is_empty();
@@ -652,7 +969,11 @@ async fn update_account_inner(
         }
 
         let account = input.into_account(id.clone(), existing.sort_order);
-        if let Err(error) = state.store.upsert_account(&account) {
+        let mut next = state.config_doc.accounts.clone();
+        if let Some(slot) = next.iter_mut().find(|candidate| &candidate.id == id) {
+            *slot = account;
+        }
+        if let Err(error) = state.replace_accounts(next) {
             if wrote_secret {
                 // Restore the secret we replaced. With no previous secret, the
                 // newly written one must be removed instead of left orphaned.
@@ -665,11 +986,11 @@ async fn update_account_inner(
                         "rollback credential for {id} after account update failure: {rollback}"
                     );
                     return Err(format!(
-                        "store account: {error}; credential rollback failed: {rollback}"
+                        "{error}; credential rollback failed: {rollback}"
                     ));
                 }
             }
-            return Err(format!("store account: {error}"));
+            return Err(error);
         }
 
         state.ensure_selection();
@@ -696,18 +1017,13 @@ pub async fn rename_account(id: &AccountId, label: &str) -> Result<ModelSnapshot
         let state = guard
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
-        let mut account = state
-            .store
-            .accounts()
-            .map_err(|error| format!("read accounts: {error}"))?
-            .into_iter()
+        let mut next = state.config_doc.accounts.clone();
+        let account = next
+            .iter_mut()
             .find(|account| &account.id == id)
             .ok_or_else(|| format!("unknown account {id}"))?;
         account.label = label.to_string();
-        state
-            .store
-            .upsert_account(&account)
-            .map_err(|error| format!("store account: {error}"))?;
+        state.replace_accounts(next)?;
         state.ensure_selection();
         sender = state.events.clone();
         snapshot = state.build_snapshot();
@@ -731,10 +1047,9 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
             .ok_or_else(|| "pige api is not initialized".to_string())?;
 
         state
-            .store
-            .accounts()
-            .map_err(|error| format!("read accounts: {error}"))?
-            .into_iter()
+            .config_doc
+            .accounts
+            .iter()
             .find(|account| &account.id == id)
             .ok_or_else(|| format!("unknown account {id}"))?;
 
@@ -748,7 +1063,14 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
             log::warn!("clear session password for {id}: {error}");
         }
 
-        if let Err(error) = state.store.remove_account(id) {
+        let next: Vec<Account> = state
+            .config_doc
+            .accounts
+            .iter()
+            .filter(|account| &account.id != id)
+            .cloned()
+            .collect();
+        if let Err(error) = state.replace_accounts(next) {
             if let Some(secret) = previous_secret
                 && let Err(restore) = state.config.credentials.set(id, &secret)
                 && let Err(session_restore) = state.config.credentials.set_session(id, &secret)
@@ -757,10 +1079,10 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
                     "restore credential for {id} after account removal failure: {restore}; {session_restore}"
                 );
                 return Err(format!(
-                    "remove account: {error}; credential restore failed: {restore}"
+                    "{error}; credential restore failed: {restore}"
                 ));
             }
-            return Err(format!("remove account: {error}"));
+            return Err(error);
         }
 
         // Clear any selection that pointed at the removed account, then pick

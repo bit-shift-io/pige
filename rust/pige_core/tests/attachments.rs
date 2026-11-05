@@ -201,10 +201,12 @@ async fn harness(thread: &str) -> Harness {
     api::init(Config {
         data_dir: dir.path().join("data"),
         cache_dir: dir.path().join("cache"),
+        config_dir: dir.path().join("config"),
         credentials: Arc::new(FakeCredentials::new()),
         notifier: Arc::new(FakeNotifier::new()),
         opener: opener.clone(),
         transport: factory.clone(),
+        backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
     })
     .expect("init api");
 

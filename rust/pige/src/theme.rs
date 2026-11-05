@@ -57,9 +57,10 @@ pub struct Palette {
     pub error_container: Color,
     /// Text and icons on `error_container`.
     pub on_error_container: Color,
-    /// Snackbar background.
+    /// Material's inverse surface. Retained as part of the scheme but no longer
+    /// used by the message channel, which is now the shared toast.
     pub inverse_surface: Color,
-    /// Snackbar text.
+    /// Text on [`Self::inverse_surface`].
     pub on_inverse_surface: Color,
     /// Dark text for a light filled surface (avatars, badges).
     pub on_light: Color,
@@ -128,7 +129,9 @@ pub struct Metrics {
     pub small_icon_size: f32,
     pub nav_icon_size: f32,
     pub chip_height: f32,
-    pub snackbar_height: f32,
+    pub toast_max_width: f32,
+    pub toast_radius: f32,
+    pub toast_margin: f32,
     pub badge_height: f32,
     pub unread_dot: f32,
     pub avatar_size: f32,
@@ -387,7 +390,9 @@ const METRICS: Metrics = Metrics {
     small_icon_size: 16.0,
     nav_icon_size: 20.0,
     chip_height: 32.0,
-    snackbar_height: 48.0,
+    toast_max_width: 480.0,
+    toast_radius: 8.0,
+    toast_margin: 16.0,
     badge_height: 18.0,
     unread_dot: 8.0,
     avatar_size: 40.0,

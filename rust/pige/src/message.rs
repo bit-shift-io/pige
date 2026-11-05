@@ -6,18 +6,19 @@
 use iced::Size;
 use pige_core::account::presets::ProviderPreset;
 use pige_core::account::{Account, AccountId, Security};
-use pige_core::api::ModelSnapshot;
+use pige_core::api::{ConfigOutcome, ModelSnapshot};
 use pige_core::mail::{FolderId, MessageId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
 use pige_core::settings::{Settings, ThemeMode};
 
 use crate::screens::accounts::AccountField;
+use crate::screens::advanced::Row as AdvancedRow;
 use crate::screens::compose::{ComposeField, ComposeSeed};
 
 /// The successful result of saving an account. `warning` carries the
 /// session-only credential notice or a failed first sync; it is shown in the
-/// shell snackbar after the account screen closes.
+/// shell toast after the account screen closes.
 #[derive(Debug, Clone)]
 pub struct AccountSaveResult {
     pub snapshot: ModelSnapshot,
@@ -133,6 +134,32 @@ pub enum Message {
     Settings,
     /// Close the settings screen and return to mail.
     CloseSettings,
+    /// Open the Advanced screen from Settings.
+    OpenAdvanced,
+    /// Close the Advanced screen and return to Settings.
+    CloseAdvanced,
+    /// An Advanced-screen action row was pressed.
+    Advanced(AdvancedRow),
+    /// A backup finished; the name is the file written.
+    BackupDone(Result<String, String>),
+    /// The backup list arrived.
+    BackupsListed(Result<Vec<String>, String>),
+    /// Whether the app may read backups from a previous install (Android).
+    RestoreAccessChecked(bool),
+    /// The system "All files access" screen was opened.
+    RestoreAccessRequested(Result<(), String>),
+    /// A backup was chosen from the restore picker.
+    RestoreChosen(String),
+    /// The restore picker was dismissed.
+    RestoreCancelled,
+    /// A restore finished, with the file name it used.
+    RestoreDone(String, Result<ConfigOutcome, String>),
+    /// The factory-reset confirmation was accepted.
+    ResetConfirmed,
+    /// The factory-reset confirmation was dismissed.
+    ResetCancelled,
+    /// A factory reset finished.
+    ResetDone(Result<ConfigOutcome, String>),
     /// Persisted settings arrived from the store (startup and screen open).
     SettingsLoaded(Settings),
     /// The sync-interval field changed. Kept as text until save so partial
@@ -174,6 +201,10 @@ pub enum Message {
     AccountLabelCommit(AccountId),
     AccountLabelRenamed(Result<ModelSnapshot, String>),
     Error(String),
-    DismissError,
+    /// A brief result message for the shared toast.
+    Toast(String),
+    /// The 4-second expiry for the toast with this generation; a stale value
+    /// must not dismiss a newer message.
+    ToastExpired(u64),
     Noop,
 }

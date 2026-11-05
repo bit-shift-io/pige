@@ -240,3 +240,50 @@ mailbox, so the two are not directly comparable.
   out of sync; settings uses `.spacing(0)` instead of a kit token; thin
   settings/notification test coverage; `notify-rust` scoped to Linux rather than
   "not Android"; `Cargo.lock` staged as part of the commit.
+
+---
+
+## 6. Advanced settings, portable config, and backups (2026-11-06)
+
+### What changed
+
+- Accounts and settings now live in a portable `pige.json` document that is the
+  source of truth. On Linux it is `$XDG_CONFIG_HOME/bitshift/pige/pige.json`
+  (`~/.config/bitshift/pige/pige.json`), written atomically with mode `0600`; on
+  Android it is the app-private `config` directory. The SQLite database is
+  demoted to a cache; its `accounts` table is a derived mirror rebuilt on every
+  change so `ON DELETE CASCADE` keeps cleaning up.
+- Backups are `pige-backup-YYYY-MM-DD-HHMMSS.json` in Downloads — Linux
+  `dirs::download_dir()`, Android the shared MediaStore Downloads collection —
+  and exclude passwords. The SQLite `meta` settings row is migrated once and
+  cleared.
+- A new **Advanced** screen (Backup config / Restore config / Factory Reset)
+  built from the shared component kit, plus a shared **toast** that replaces the
+  old full-width snackbar/error bar.
+
+### Measured
+
+| Check | Result |
+| :--- | :--- |
+| `cd rust && cargo test --workspace` | **19 suites green, 0 failed** (pige_core lib 68, pige lib 78, integration suites) |
+| `cd rust && cargo clippy --workspace --all-targets` | **clean, no warnings** |
+| Android debug build (`JAVA_HOME=/opt/jbr-21 bash scripts/build.sh debug`) | **BUILD SUCCESSFUL**; `compileDebugKotlin` and the arm64 Rust `.so` both built |
+
+### Not run
+
+- **Interactive desktop smoke** (Backup / Restore / Factory Reset through the
+  GUI): this pass was executed non-interactively, so no window was driven. The
+  pure and headless tests cover the rows, copy, dialog gating, toast generation
+  guard, and toast layout.
+- **Android on-device verification** (install, write a backup to Downloads,
+  restore it, the "All files access" prompt, factory reset): no device
+  interaction in this pass. The Kotlin bridge compiles; the Rust logic is
+  identical across platforms and covered by the Linux/fake tests.
+
+### Follow-ups (deferred)
+
+- A guided "re-enter passwords" step after a restore is not built; the restore
+  toast points at the existing account editor, and a restored account with no
+  stored password fails sync with the usual message.
+- Android MediaStore behaviour (scoped visibility, `IS_PENDING` handling) still
+  wants one on-device pass.

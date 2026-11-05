@@ -8,7 +8,7 @@
 //! - [`fields`] labelled and search text fields
 //! - [`avatar`] deterministic initial avatars
 //! - [`rows`] message-list and folder rows
-//! - [`chrome`] app bars, section headers, empty states and snackbars
+//! - [`chrome`] app bars, section headers, empty states and toasts
 //! - [`chips`] choice and attachment chips
 //! - [`dialog`] modal cards
 //!
@@ -18,9 +18,10 @@
 //! qlaunch's `components.rs` and companion modules (bitshift, MIT).
 
 use iced::Color;
-use iced::widget::{column, container, text};
+use iced::widget::{button as iced_button, column, container, row, text};
 
 use crate::theme::{self, TextRole, Typography};
+use crate::{Message, icons};
 
 pub mod avatar;
 pub mod buttons;
@@ -37,7 +38,7 @@ pub mod scroll_fade;
 pub use avatar::avatar;
 pub use buttons::{ButtonVariant, button, floating_action_button, icon_button};
 pub use chips::{attachment_chip, chip, format_size};
-pub use chrome::{app_bar, empty_state, snackbar};
+pub use chrome::{app_bar, empty_state, toast};
 pub use dialog::{dialog, dialog_sized};
 pub use fields::{password_field, search_field, text_area, text_field};
 pub use rows::{FolderKind, FolderView, ListRow, folder_row, list_row, section_header};
@@ -71,6 +72,60 @@ pub fn account_header<'a>(
     ]
     .width(iced::Fill)
     .into()
+}
+
+/// A tappable card wrapping a leading icon, a title and a supporting line.
+/// Shared by the Settings and Advanced screens so their action rows match.
+pub fn action_card<'a>(
+    title: &str,
+    subtitle: &str,
+    icon: char,
+    message: Message,
+) -> iced::Element<'a, Message> {
+    let palette = theme::active();
+    let title_style = palette.role(TextRole::TitleSmall);
+    let subtitle_style = palette.role(TextRole::BodySmall);
+
+    let leading = text(icons::glyph(icon))
+        .font(icons::FONT)
+        .size(palette.metrics.icon_size)
+        .color(palette.on_surface_variant);
+
+    let labels = column![
+        styled_text(title.to_string(), title_style, palette.on_surface),
+        styled_text(
+            subtitle.to_string(),
+            subtitle_style,
+            palette.on_surface_variant,
+        ),
+    ]
+    .spacing(palette.space.xs)
+    .width(iced::Fill);
+
+    let content = row![leading, labels]
+        .spacing(palette.space.md)
+        .align_y(iced::Alignment::Center)
+        .width(iced::Fill);
+
+    iced_button(content)
+        .width(iced::Fill)
+        .padding(palette.space.lg)
+        .style(move |_, status| {
+            let background = match status {
+                iced_button::Status::Hovered | iced_button::Status::Pressed => {
+                    palette.surface_container_high
+                }
+                _ => palette.surface_container,
+            };
+            iced_button::Style {
+                background: Some(background.into()),
+                text_color: palette.on_surface,
+                border: iced::border::rounded(palette.radius.md),
+                ..Default::default()
+            }
+        })
+        .on_press(message)
+        .into()
 }
 
 /// A text widget that already carries the palette's type style and colour.

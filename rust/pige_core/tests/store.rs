@@ -190,6 +190,59 @@ fn messages_page_by_date_and_delete_below_uid() {
 }
 
 #[test]
+fn sync_accounts_keeps_surviving_cache_and_drops_removed_accounts() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+
+    let mut first = account();
+    let first_folder = folder(&first.id);
+    store.upsert_account(&first).unwrap();
+    store.upsert_folder(&first_folder).unwrap();
+    store
+        .upsert_message(&message(&first_folder, 1, 1, 1_700_000_000))
+        .unwrap();
+
+    let mut second = account();
+    second.id = AccountId("account-2".to_string());
+    second.label = "Work".to_string();
+    let mut second_folder = folder(&second.id);
+    second_folder.id = FolderId("folder-2".to_string());
+    store.upsert_account(&second).unwrap();
+    store.upsert_folder(&second_folder).unwrap();
+    let mut second_message = message(&second_folder, 1, 1, 1_700_000_100);
+    second_message.id = MessageId("message-second-1".to_string());
+    store.upsert_message(&second_message).unwrap();
+
+    // Rename the first account in place and add a third; drop the second.
+    first.label = "Personal Renamed".to_string();
+    let mut third = account();
+    third.id = AccountId("account-3".to_string());
+    store.sync_accounts(&[first.clone(), third]).unwrap();
+
+    // The renamed account keeps its cached mail (no blind delete-all).
+    assert_eq!(
+        store.messages(&first_folder.id, 10, None).unwrap().len(),
+        1
+    );
+    // The dropped account's cache cascaded away.
+    assert!(
+        store
+            .messages(&second_folder.id, 10, None)
+            .unwrap()
+            .is_empty()
+    );
+    let labels: Vec<String> = store
+        .accounts()
+        .unwrap()
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert!(labels.contains(&"Personal Renamed".to_string()));
+    assert!(!labels.contains(&"Work".to_string()));
+    assert_eq!(labels.len(), 2);
+}
+
+#[test]
 fn conversations_aggregate_messages_by_thread() {
     let dir = TempDir::new().unwrap();
     let store = open_store(&dir);

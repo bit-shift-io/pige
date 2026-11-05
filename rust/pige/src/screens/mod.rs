@@ -1,6 +1,7 @@
 //! Full-screen surfaces assembled from the component kit.
 
 pub mod accounts;
+pub mod advanced;
 pub mod compose;
 pub mod message_list;
 pub mod navigation;

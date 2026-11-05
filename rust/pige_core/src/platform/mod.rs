@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "android")]
 pub mod android;
+pub mod backup;
 pub mod fake;
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -109,4 +110,18 @@ pub trait TransportFactory: Send + Sync {
     }
 
     fn smtp<'a>(&'a self, account: &'a Account) -> BoxFuture<'a, Result<Box<dyn SmtpSender>>>;
+}
+
+/// Reads and writes configuration backups in the platform's Downloads folder.
+/// Linux uses a plain directory; Android needs a `ContentResolver` (MediaStore),
+/// so this can never be a bare file path in the core.
+///
+/// `available` reports whether there is a Downloads location at all; a shell
+/// with no home directory reports `false` and the Advanced screen disables the
+/// Backup and Restore rows rather than failing late.
+pub trait BackupStore: Send + Sync {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<()>;
+    fn list(&self) -> Result<Vec<String>>;
+    fn read(&self, name: &str) -> Result<Vec<u8>>;
+    fn available(&self) -> bool;
 }

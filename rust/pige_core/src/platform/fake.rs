@@ -1,7 +1,7 @@
 //! In-memory platform adapters for tests and for a desktop shell running
 //! without a keychain. They store everything in process; nothing touches disk.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,9 @@ use crate::transport::{
     SendError, SmtpSender, TransportError, UidRange,
 };
 
-use super::{CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, TransportFactory};
+use super::{
+    BackupStore, CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, TransportFactory,
+};
 
 /// In-memory password store.
 #[derive(Default)]
@@ -405,6 +407,76 @@ impl FakeTransportFactory {
     }
 }
 
+/// In-memory Downloads folder for tests.
+#[derive(Debug)]
+pub struct FakeBackupStore {
+    files: Mutex<BTreeMap<String, Vec<u8>>>,
+    available: bool,
+}
+
+impl FakeBackupStore {
+    pub fn new() -> Self {
+        Self {
+            files: Mutex::new(BTreeMap::new()),
+            available: true,
+        }
+    }
+
+    /// A host with no Downloads folder, so Backup and Restore are unavailable.
+    pub fn without_downloads() -> Self {
+        Self {
+            files: Mutex::new(BTreeMap::new()),
+            available: false,
+        }
+    }
+}
+
+impl Default for FakeBackupStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackupStore for FakeBackupStore {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        if !self.available {
+            return Err("there is no Downloads folder to save a backup in".to_string());
+        }
+        if !crate::platform::backup::is_backup_name(name) {
+            return Err(format!("{name:?} is not a backup file name"));
+        }
+        self.files
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<String>> {
+        if !self.available {
+            return Err("there is no Downloads folder to list backups from".to_string());
+        }
+        let names: Vec<String> = self.files.lock().unwrap().keys().cloned().collect();
+        Ok(crate::platform::backup::sort_backup_names(names))
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        if !self.available {
+            return Err("there is no Downloads folder to read a backup from".to_string());
+        }
+        self.files
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("no backup named {name}"))
+    }
+
+    fn available(&self) -> bool {
+        self.available
+    }
+}
+
 impl TransportFactory for FakeTransportFactory {
     fn imap<'a>(&'a self, account: &'a Account) -> BoxFuture<'a, Result<Box<dyn MailTransport>>> {
         let id = account.id.clone();
@@ -429,5 +501,45 @@ impl TransportFactory for FakeTransportFactory {
                 sent: self.smtp_sent.clone(),
             }) as Box<dyn SmtpSender>)
         })
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+    use crate::platform::BackupStore;
+
+    #[test]
+    fn fake_backup_round_trips_and_sorts_newest_first() {
+        let store = FakeBackupStore::new();
+        store
+            .write("pige-backup-2026-10-20-090000.json", b"a")
+            .unwrap();
+        store
+            .write("pige-backup-2026-10-21-140530.json", b"b")
+            .unwrap();
+        assert!(store.available());
+        assert_eq!(
+            store.list().unwrap(),
+            vec![
+                "pige-backup-2026-10-21-140530.json".to_string(),
+                "pige-backup-2026-10-20-090000.json".to_string(),
+            ]
+        );
+        assert_eq!(
+            store.read("pige-backup-2026-10-20-090000.json").unwrap(),
+            b"a"
+        );
+    }
+
+    #[test]
+    fn a_downloads_less_store_reports_unavailable() {
+        let store = FakeBackupStore::without_downloads();
+        assert!(!store.available());
+        assert!(
+            store
+                .write("pige-backup-2026-10-20-090000.json", b"a")
+                .is_err()
+        );
     }
 }

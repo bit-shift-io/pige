@@ -1,4 +1,9 @@
 //! Account persistence.
+//!
+//! The configuration document (`config::ConfigDocument`) is the source of
+//! truth for accounts; this table is a derived mirror kept so `ON DELETE
+//! CASCADE` and account-scoped joins keep working. Every account change in the
+//! API persists the document first and then calls [`Store::sync_accounts`].
 
 use rusqlite::{Connection, Row, params};
 
@@ -12,42 +17,28 @@ const COLUMNS: &str = "id, label, email, display_name, username, \
 
 impl Store {
     pub fn upsert_account(&self, account: &Account) -> Result<(), StoreError> {
+        upsert_account_on(&self.connection(), account)
+    }
+
+    /// Bring the account mirror in line with the configuration document without
+    /// touching the cached mail of accounts that survive: only ids absent from
+    /// `accounts` are deleted (which cascades their cache), and every supplied
+    /// account is upserted. A rename or edit keeps its id and therefore its
+    /// folders, messages, threads, bodies, attachments, and outbox rows.
+    pub fn sync_accounts(&self, accounts: &[Account]) -> Result<(), StoreError> {
         let conn = self.connection();
-        conn.execute(
-            "INSERT INTO accounts (
-                 id, label, email, display_name, username,
-                 imap_host, imap_port, imap_security,
-                 smtp_host, smtp_port, smtp_security, auth_kind, sort_order
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(id) DO UPDATE SET
-                 label = excluded.label,
-                 email = excluded.email,
-                 display_name = excluded.display_name,
-                 username = excluded.username,
-                 imap_host = excluded.imap_host,
-                 imap_port = excluded.imap_port,
-                 imap_security = excluded.imap_security,
-                 smtp_host = excluded.smtp_host,
-                 smtp_port = excluded.smtp_port,
-                 smtp_security = excluded.smtp_security,
-                 auth_kind = excluded.auth_kind,
-                 sort_order = excluded.sort_order",
-            params![
-                account.id.0,
-                account.label,
-                account.email,
-                account.display_name,
-                account.username,
-                account.imap.host,
-                account.imap.port,
-                account.imap.security.as_str(),
-                account.smtp.host,
-                account.smtp.port,
-                account.smtp.security.as_str(),
-                account.auth.as_str(),
-                account.sort_order,
-            ],
-        )?;
+        let tx = conn.unchecked_transaction()?;
+        let keep: std::collections::HashSet<&str> =
+            accounts.iter().map(|account| account.id.0.as_str()).collect();
+        for existing in accounts_on(&tx)? {
+            if !keep.contains(existing.id.0.as_str()) {
+                tx.execute("DELETE FROM accounts WHERE id = ?1", [&existing.id.0])?;
+            }
+        }
+        for account in accounts {
+            upsert_account_on(&tx, account)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -65,6 +56,45 @@ impl Store {
         conn.execute("DELETE FROM accounts WHERE id = ?1", [&id.0])?;
         Ok(())
     }
+}
+
+pub(crate) fn upsert_account_on(conn: &Connection, account: &Account) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO accounts (
+             id, label, email, display_name, username,
+             imap_host, imap_port, imap_security,
+             smtp_host, smtp_port, smtp_security, auth_kind, sort_order
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(id) DO UPDATE SET
+             label = excluded.label,
+             email = excluded.email,
+             display_name = excluded.display_name,
+             username = excluded.username,
+             imap_host = excluded.imap_host,
+             imap_port = excluded.imap_port,
+             imap_security = excluded.imap_security,
+             smtp_host = excluded.smtp_host,
+             smtp_port = excluded.smtp_port,
+             smtp_security = excluded.smtp_security,
+             auth_kind = excluded.auth_kind,
+             sort_order = excluded.sort_order",
+        params![
+            account.id.0,
+            account.label,
+            account.email,
+            account.display_name,
+            account.username,
+            account.imap.host,
+            account.imap.port,
+            account.imap.security.as_str(),
+            account.smtp.host,
+            account.smtp.port,
+            account.smtp.security.as_str(),
+            account.auth.as_str(),
+            account.sort_order,
+        ],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn accounts_on(conn: &Connection) -> Result<Vec<Account>, StoreError> {

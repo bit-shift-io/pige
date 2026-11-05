@@ -172,6 +172,14 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Remove one `meta` value. Used when a setting moves to the configuration
+    /// document, so a later downgrade cannot resurrect the stale value.
+    pub fn delete_meta(&self, key: &str) -> Result<(), StoreError> {
+        self.connection()
+            .execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for Store {

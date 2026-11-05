@@ -1,7 +1,8 @@
-//! Settings persistence: defaults, JSON round trip, and interval clamping.
+//! Settings defaults and the configuration-document round trip.
 
 use pige_core::Store;
-use pige_core::settings::{Settings, ThemeMode, load_settings, save_settings};
+use pige_core::config::{self, ConfigDocument};
+use pige_core::settings::{Settings, ThemeMode, load_settings};
 use tempfile::TempDir;
 
 fn migrated_store() -> (Store, TempDir) {
@@ -25,42 +26,22 @@ fn settings_default_to_15_minutes_notifications_on_and_system_theme() {
 }
 
 #[test]
-fn background_sync_round_trips_when_off() {
-    let (store, _dir) = migrated_store();
+fn settings_round_trip_in_the_configuration_document() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = config::document_path(dir.path());
 
     let settings = Settings {
         sync_minutes: 30,
-        notifications: true,
-        background_sync: false,
-        theme: ThemeMode::System,
-    };
-    save_settings(&store, &settings).expect("save settings");
-
-    let loaded = load_settings(&store);
-    assert!(!loaded.background_sync);
-    assert_eq!(loaded, settings);
-}
-
-#[test]
-fn settings_round_trip_and_clamp_invalid_interval() {
-    let (store, _dir) = migrated_store();
-
-    let mut settings = Settings {
-        sync_minutes: 30,
         notifications: false,
-        background_sync: true,
+        background_sync: false,
         theme: ThemeMode::Dark,
     };
-    save_settings(&store, &settings).expect("save settings");
-    assert_eq!(load_settings(&store), settings);
+    let doc = ConfigDocument {
+        settings: settings.clone(),
+        ..ConfigDocument::default()
+    };
+    config::save(&path, &doc).expect("save document");
 
-    // 0 means "use the default" rather than "never".
-    settings.sync_minutes = 0;
-    save_settings(&store, &settings).expect("save zero");
-    assert_eq!(load_settings(&store).sync_minutes, 15);
-
-    // Anything above the maximum is pinned to the maximum.
-    settings.sync_minutes = 999;
-    save_settings(&store, &settings).expect("save huge");
-    assert_eq!(load_settings(&store).sync_minutes, 60);
+    let loaded = config::load(&path).expect("load document").expect("document");
+    assert_eq!(loaded.settings, settings);
 }

@@ -661,10 +661,12 @@ async fn api_search_mail_returns_hits_and_updates_the_snapshot() {
     api::init(Config {
         data_dir: data_dir.clone(),
         cache_dir: dir.path().join("cache"),
+        config_dir: dir.path().join("config"),
         credentials: Arc::new(FakeCredentials::new()),
         notifier: Arc::new(FakeNotifier::new()),
         opener: Arc::new(FakeOpener::new()),
         transport: Arc::new(FakeTransportFactory::new()),
+        backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
     })
     .expect("init api");
 
