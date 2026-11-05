@@ -300,5 +300,53 @@ the UI and checked both on screen and on disk (`run-as bitshift.pige`):
 - A guided "re-enter passwords" step after a restore is not built; the restore
   toast points at the existing account editor, and a restored account with no
   stored password fails sync with the usual message.
-- Android MediaStore behaviour (scoped visibility, `IS_PENDING` handling) still
-  wants one on-device pass.
+- The MediaStore round trip and the "All files access" flow are verified above,
+  but edge cases (scoped visibility after a reflash, an interrupted
+  `IS_PENDING` write) have not been exercised.
+
+### Deferred review minors (2026-11-06)
+
+A fresh code review of the whole change raised these; none block the feature,
+and each is recorded here so it is not lost with the review notes.
+
+1. **Config-directory permissions.** The directory is created with
+   `create_dir_all`, so it inherits the umask (~0755); only `pige.json` is
+   `0600`. Purpose: create the directory `0700` as well, so its *listing* is not
+   readable by other local users — the spec says the directory is owner-only.
+
+2. **One config-root rule.** The desktop shell computes `bitshift/pige` itself
+   and accepts a relative `XDG_CONFIG_HOME`, while the core's tested
+   `config_root_from` rejects a relative value; that core function is currently
+   unused in production. Purpose: have the shell call the tested core function,
+   so the XDG rule lives in one place and the two cannot drift.
+
+3. **Bounded restore picker.** The picker is an unbounded column of buttons
+   inside the dialog. Purpose: wrap it in a height-limited `scrollable`, so a
+   long list of backups cannot push the Cancel action off-screen.
+
+4. **Backup-name collision.** The name stamps to the second, but its doc comment
+   says "same minute"; two backups within one second resolve to the same name
+   and the later write wins. Purpose: correct the comment and (optionally) add a
+   short suffix, so a rapid second backup is not silently lost.
+
+5. **Quarantine collision.** `quarantine` renames the bad file to
+   `pige.json.corrupt`, overwriting any earlier quarantine. Purpose: choose a
+   unique suffix, so a second corrupt configuration does not destroy the first
+   quarantined copy.
+
+6. **Document vs mirror reads.** Snapshots read accounts from the SQLite mirror,
+   not the document (a deliberate call to avoid touching every call site), and a
+   mirror-sync failure at start-up is only logged. Purpose: surface that failure
+   as a warning, so the "document is the source of truth" invariant cannot
+   silently diverge.
+
+7. **Document version validation.** `ConfigDocument.version` is read but never
+   checked, and there is no migration for an older or newer version. Purpose:
+   validate on load and migrate (or refuse clearly), so a future v2 document
+   shape is not silently misread.
+
+8. **Ignored tests touch the real config.** The `#[ignore]`d shell layout/perf
+   tests call `App::new()`, which runs the real platform `init` and would write
+   a real `~/.config/bitshift/pige/pige.json` if run. Purpose: point them at the
+   test-only `App::for_test()`, so running ignored tests cannot touch a
+   developer's actual configuration.
