@@ -36,4 +36,10 @@ cp "$ROOT/rust/target/aarch64-linux-android/$MODE/libpige.so" \
     "$ROOT/android/app/src/main/jniLibs/arm64-v8a/"
 JAVA_SRC="$(cargo metadata --locked --format-version 1 --filter-platform aarch64-linux-android --manifest-path "$ROOT/rust/Cargo.toml" | \
     python3 -c 'import json,sys,pathlib; p=next(p for p in json.load(sys.stdin)["packages"] if p["name"]=="iced_android"); print(pathlib.Path(p["manifest_path"]).parent / "java")')"
-"${GRADLE[@]}" -p "$ROOT/android" "-PicedAndroidJava=$JAVA_SRC" "$TASK"
+# The workspace Cargo version is the single source of truth; Android's
+# versionCode falls out of YYYY.MM.DD as YYYYMMDD.
+VERSION="$(bash "$ROOT/scripts/version.sh")"
+IFS=. read -r V_MAJOR V_MINOR V_PATCH <<<"$VERSION"
+VERSION_CODE=$((10#$V_MAJOR * 10000 + 10#$V_MINOR * 100 + 10#$V_PATCH))
+"${GRADLE[@]}" -p "$ROOT/android" "-PicedAndroidJava=$JAVA_SRC" \
+    "-PqlaunchVersionName=$VERSION" "-PqlaunchVersionCode=$VERSION_CODE" "$TASK"

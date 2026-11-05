@@ -5,6 +5,9 @@
 resolver = "2"
 members = ["pige_core", "pige"]
 
+[workspace.package]
+version = "2026.11.5"
+
 [patch.crates-io]
 android-activity = { git = "https://github.com/Santuzius/android-activity", tag = "iced_android-v0.1.1" }
 

@@ -3327,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "pige"
-version = "0.1.0"
+version = "2026.11.5"
 dependencies = [
  "android_logger",
  "futures",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "pige_core"
-version = "0.1.0"
+version = "2026.11.5"
 dependencies = [
  "ammonia",
  "async-imap",
