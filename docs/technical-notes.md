@@ -275,10 +275,25 @@ mailbox, so the two are not directly comparable.
   GUI): this pass was executed non-interactively, so no window was driven. The
   pure and headless tests cover the rows, copy, dialog gating, toast generation
   guard, and toast layout.
-- **Android on-device verification** (install, write a backup to Downloads,
-  restore it, the "All files access" prompt, factory reset): no device
-  interaction in this pass. The Kotlin bridge compiles; the Rust logic is
-  identical across platforms and covered by the Linux/fake tests.
+- **Android on-device verification** — *run* on `6bfcc911` (Android 14), debug
+  APK from this branch. Details below.
+
+### On-device verification (Android, `6bfcc911`, 2026-11-06)
+
+Debug APK from this branch, force-stopped and cold-started with
+`am start -W -S`: `Status: ok` (`LaunchState: COLD`), and no `FATAL EXCEPTION`,
+`AndroidRuntime`, or `panic` in `logcat`. Every flow below was driven through
+the UI and checked both on screen and on disk (`run-as bitshift.pige`):
+
+| Step | Result |
+| :--- | :--- |
+| First run | `files/config/pige.json` created, mode `0600`, default settings |
+| Settings → Advanced | three action cards (Backup / Restore / Factory Reset) render with icons |
+| Backup config | wrote `pige-backup-2026-11-05-202915.json` to shared Downloads; small dark bottom toast "Backup saved to Downloads/…"; the screen behind stayed visible |
+| Restore, no All-files access | opened the system "All files access" page for pige |
+| Restore, access granted | picker listed the backup; choosing it restored settings, wrote `pige.json.pre-restore`, and toasted the password note |
+| Change setting + Save | `pige.json` updated (`notifications: false`) |
+| Factory Reset | destructive confirmation, then `pige.json` back to defaults and the cache directory emptied; toast "The app was reset." |
 
 ### Follow-ups (deferred)
 
