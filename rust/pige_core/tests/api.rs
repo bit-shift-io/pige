@@ -1083,6 +1083,137 @@ async fn snapshot_reads_are_consistent_during_writes() {
 }
 
 #[tokio::test]
+async fn snapshot_revisions_increase_across_selection_changes() {
+    let _guard = TEST_LOCK.lock().await;
+    let _harness = Harness::new();
+    let first = api::snapshot();
+    let selected = api::select_unified().await.unwrap();
+    let latest = api::snapshot();
+    assert!(first.revision > 0);
+    assert!(selected.revision > first.revision);
+    assert!(latest.revision > selected.revision);
+}
+
+#[tokio::test]
+async fn prefetch_skips_reused_uids_from_a_different_mailbox_epoch() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = seed_prefetch(&harness, b"Subject: wrong\r\n\r\nwrong message").await;
+    let mut transport = harness.factory.transport(&account).await.unwrap();
+    transport.states.insert(
+        "INBOX".into(),
+        FolderState {
+            uidvalidity: 2,
+            uidnext: 2,
+            exists: 1,
+        },
+    );
+    harness.factory.add_transport(account.clone(), transport);
+    api::prefetch_bodies().await;
+    assert!(
+        harness
+            .factory
+            .transport(&account)
+            .await
+            .unwrap()
+            .fetch_body_calls
+            .is_empty()
+    );
+    assert!(
+        harness
+            .open_store()
+            .body(&MessageId("inbox-message-1".into()))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn prefetch_does_not_cache_when_local_message_epoch_changes_during_fetch() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = seed_prefetch(&harness, b"Subject: old\r\n\r\nold epoch").await;
+    let started = Arc::new(Semaphore::new(0));
+    let pause = Arc::new(Semaphore::new(0));
+    let mut transport = harness.factory.transport(&account).await.unwrap();
+    transport.fetch_body_started = Some(started.clone());
+    transport.fetch_body_pause = Some(pause.clone());
+    harness.factory.add_transport(account.clone(), transport);
+    let prefetch = tokio::spawn(api::prefetch_bodies());
+    let _ = started.acquire().await.unwrap();
+    let store = harness.open_store();
+    store.reset_folder(&account, "INBOX", 2).unwrap();
+    let inbox = store.folders(&account).unwrap().remove(0);
+    let mut replacement = stored_message(&inbox, 1);
+    replacement.id = MessageId("inbox-message-1".into());
+    replacement.uidvalidity = 2;
+    store.upsert_message(&replacement).unwrap();
+    pause.add_permits(1);
+    prefetch.await.unwrap();
+    assert!(
+        store.body(&replacement.id).unwrap().is_none(),
+        "old epoch bytes cannot attach to a reused local id"
+    );
+}
+
+#[tokio::test]
+async fn prefetch_stops_after_account_removal_restore_or_reset() {
+    let _guard = TEST_LOCK.lock().await;
+    for action in ["remove", "restore", "reset"] {
+        let harness = Harness::new();
+        let account = seed_prefetch(&harness, b"Subject: A\r\n\r\nbody").await;
+        let store = harness.open_store();
+        let inbox = store.folders(&account).unwrap().remove(0);
+        seed_conversation(&store, &inbox, 2, 2, "B", "thread-b");
+        let started = Arc::new(Semaphore::new(0));
+        let pause = Arc::new(Semaphore::new(0));
+        let mut transport = harness.factory.transport(&account).await.unwrap();
+        transport.fetch_body_started = Some(started.clone());
+        transport.fetch_body_pause = Some(pause.clone());
+        harness.factory.add_transport(account.clone(), transport);
+        let prefetch = tokio::spawn(api::prefetch_bodies());
+        let permit = started.acquire().await.unwrap();
+        permit.forget();
+        match action {
+            "remove" => {
+                api::remove_account(&account).await.unwrap();
+            }
+            "restore" => {
+                use pige_core::platform::BackupStore;
+                let name = "pige-backup-2026-10-21-140530.json";
+                harness
+                    .backups
+                    .write(name, &backup_document(vec![], true))
+                    .unwrap();
+                api::restore_config(name.into()).await.unwrap();
+            }
+            _ => {
+                api::factory_reset().await.unwrap();
+            }
+        }
+        pause.add_permits(1);
+        prefetch.await.unwrap();
+        assert_eq!(
+            harness
+                .factory
+                .transport(&account)
+                .await
+                .unwrap()
+                .fetch_body_calls
+                .len(),
+            1,
+            "{action} must prevent the next fetch"
+        );
+        assert!(
+            store
+                .body(&MessageId("inbox-message-2".into()))
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn prefetch_caches_inbox_bodies_when_enabled() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
@@ -1234,7 +1365,93 @@ async fn prefetch_gives_up_quietly_without_a_transport() {
     seed_conversation(&store, &inbox, 1, 1, "A", "thread-a");
     let before = api::snapshot();
     api::prefetch_bodies().await;
-    assert_eq!(api::snapshot(), before);
+    let mut after = api::snapshot();
+    after.revision = before.revision;
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn delayed_mutation_of_a_does_not_cancel_a_newer_open_of_b() {
+    let _guard = TEST_LOCK.lock().await;
+    for action in ["archive", "trash", "move"] {
+        let harness = Harness::new();
+        let account = seed_prefetch(&harness, b"Subject: A\r\n\r\nalpha").await;
+        let store = harness.open_store();
+        let inbox = store.folders(&account).unwrap().remove(0);
+        seed_conversation(&store, &inbox, 2, 2, "B", "thread-b");
+        let dest = folder(
+            "dest",
+            &account,
+            "Destination",
+            if action == "trash" {
+                FolderKind::Trash
+            } else {
+                FolderKind::Archive
+            },
+            0,
+        );
+        store.upsert_folder(&dest).unwrap();
+        let started = Arc::new(Semaphore::new(0));
+        let pause = Arc::new(Semaphore::new(0));
+        let mut transport = harness.factory.transport(&account).await.unwrap();
+        transport.capabilities_started = Some(started.clone());
+        transport.capabilities_pause = Some(pause.clone());
+        harness.factory.add_transport(account.clone(), transport);
+        let mutation = tokio::spawn(async move {
+            let a = ThreadId("thread-a".into());
+            match action {
+                "archive" => api::archive_thread(&a).await,
+                "trash" => api::trash_thread(&a).await,
+                _ => api::move_thread(&a, &dest.id).await,
+            }
+        });
+        let _ = started.acquire().await.unwrap();
+        // Independent IMAP session for the newer open, as in production.
+        let body_started = Arc::new(Semaphore::new(0));
+        let body_pause = Arc::new(Semaphore::new(0));
+        harness.factory.add_transport(
+            account,
+            FakeTransport {
+                bodies: HashMap::from([(
+                    "INBOX".into(),
+                    HashMap::from([(Uid(2), b"Subject: B\r\n\r\nbravo".to_vec())]),
+                )]),
+                fetch_body_started: Some(body_started.clone()),
+                fetch_body_pause: Some(body_pause.clone()),
+                ..FakeTransport::default()
+            },
+        );
+        let open =
+            tokio::spawn(async { api::open_conversation(&ThreadId("thread-b".into())).await });
+        let _ = body_started.acquire().await.unwrap();
+        pause.add_permits(1);
+        // Move follows removal with a destination sync. The fake shares B's
+        // session, so observe the removal, then release B before awaiting it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store
+                .message(&MessageId("inbox-message-1".into()))
+                .unwrap()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let during = api::snapshot().selected_conversation;
+        body_pause.add_permits(1);
+        mutation.await.unwrap().unwrap();
+        let resolved = open.await.unwrap().unwrap();
+        assert_eq!(
+            during.as_ref().map(|d| &d.thread_id),
+            Some(&ThreadId("thread-b".into())),
+            "{action} must preserve the newer loading reader"
+        );
+        assert!(matches!(
+            resolved.selected_conversation.unwrap().messages[0].body,
+            Some(MessageBody::Document(_))
+        ));
+    }
 }
 
 #[tokio::test]

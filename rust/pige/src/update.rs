@@ -1032,6 +1032,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delayed_loading_snapshot_cannot_replace_newer_selection_or_back() {
+        let loading = |revision, thread: &str| ModelSnapshot {
+            revision,
+            selected_conversation: Some(api::ConversationDetail {
+                thread_id: ThreadId(thread.into()),
+                account_id: AccountId("acc".into()),
+                subject: thread.into(),
+                messages: vec![api::MessageSummary {
+                    id: pige_core::mail::MessageId(thread.into()),
+                    sender: "Ada".into(),
+                    to: "Me".into(),
+                    date: 0,
+                    snippet: String::new(),
+                    flags: pige_core::mail::Flags::default(),
+                    has_attachments: false,
+                    attachments: vec![],
+                    body: Some(api::MessageBody::Loading),
+                }],
+            }),
+            ..ModelSnapshot::default()
+        };
+        let mut app = App::for_test();
+        let _ = app.update(Message::Snapshot(loading(2, "B")));
+        let _ = app.update(Message::Snapshot(loading(1, "A")));
+        assert_eq!(
+            app.snapshot
+                .selected_conversation
+                .as_ref()
+                .unwrap()
+                .thread_id,
+            ThreadId("B".into())
+        );
+        let _ = app.update(Message::Snapshot(ModelSnapshot {
+            revision: 3,
+            ..ModelSnapshot::default()
+        }));
+        let _ = app.update(Message::Snapshot(loading(2, "B")));
+        assert!(app.snapshot.selected_conversation.is_none());
+    }
+
+    #[test]
     fn a_saved_account_closes_the_dialog_and_schedules_the_first_sync() {
         let mut app = App::for_test();
         app.accounts_open = true;

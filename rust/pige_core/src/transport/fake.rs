@@ -58,6 +58,9 @@ pub struct FakeTransport {
     /// Signal and optionally pause an in-flight body fetch.
     pub fetch_body_started: Option<Arc<Semaphore>>,
     pub fetch_body_pause: Option<Arc<Semaphore>>,
+    /// Control connection/capability timing in mutation ordering tests.
+    pub capabilities_started: Option<Arc<Semaphore>>,
+    pub capabilities_pause: Option<Arc<Semaphore>>,
 
     /// Internal: the folder most recently selected, if any.
     pub current: Option<String>,
@@ -88,6 +91,12 @@ impl FakeTransport {
 #[async_trait]
 impl MailTransport for FakeTransport {
     async fn capabilities(&mut self) -> Result<Capabilities, TransportError> {
+        if let Some(started) = &self.capabilities_started {
+            started.add_permits(1);
+        }
+        if let Some(pause) = &self.capabilities_pause {
+            let _ = pause.acquire().await;
+        }
         Ok(self.capabilities)
     }
 

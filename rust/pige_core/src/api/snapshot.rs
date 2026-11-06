@@ -107,6 +107,8 @@ pub enum SyncStatus {
 /// Everything the UI needs to render the current view.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelSnapshot {
+    /// Process-wide snapshot order; shells discard delayed older deliveries.
+    pub revision: u64,
     pub accounts: Vec<AccountSummary>,
     pub sections: Vec<AccountSection>,
     /// Unread across every account's Inbox folders; rendered above sections.

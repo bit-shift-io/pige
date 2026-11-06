@@ -13,6 +13,7 @@ pub mod snapshot;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::StreamExt;
@@ -32,7 +33,7 @@ use crate::search::{SearchHit, SearchScope};
 use crate::send::{
     self, OutboxEntry, OutboxId, OutgoingMessage, compose::forward_message, compose::reply_message,
 };
-use crate::store::{Body, Store};
+use crate::store::{Body, PrefetchCandidate, Store};
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{Capabilities, RemoteFolder, UidRange};
 
@@ -66,6 +67,8 @@ const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
 const PREFETCH_LIMIT: u32 = 50;
 const PREFETCH_CONCURRENCY: usize = 2;
 static PREFETCH_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+// Never reset on init/restore: an older task may still deliver its snapshot.
+static SNAPSHOT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// The result of submitting a message: the refreshed cache view plus whether it
 /// is still waiting in the outbox for a network connection.
@@ -219,6 +222,7 @@ struct AppState {
     conversation_limit: u32,
     selected_conversation: Option<ConversationDetail>,
     open_generation: u64,
+    prefetch_generation: u64,
     /// Last search query, scope, results, and the generation used to reject
     /// slower completions from an older query.
     search: SearchState,
@@ -290,6 +294,7 @@ impl AppState {
             let _ = config::save(&self.config_path, &self.config_doc);
             return Err(format!("update account cache: {error}"));
         }
+        self.prefetch_generation = self.prefetch_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -325,6 +330,7 @@ impl AppState {
     /// folders, and conversations. Store errors degrade to an empty view rather
     /// than failing a UI refresh.
     fn build_snapshot(&self) -> ModelSnapshot {
+        let revision = SNAPSHOT_REVISION.fetch_add(1, Ordering::Relaxed);
         let limit = self.conversation_limit.max(1);
         let view =
             match self
@@ -335,6 +341,7 @@ impl AppState {
                 Err(error) => {
                     log::warn!("read snapshot view: {error}");
                     return ModelSnapshot {
+                        revision,
                         status: self.status.clone(),
                         unified_selected: self.unified_selected,
                         search_query: self.search.query.clone(),
@@ -411,6 +418,7 @@ impl AppState {
         let drafts = self.store.outbox_drafts(None).unwrap_or_default();
 
         ModelSnapshot {
+            revision,
             accounts,
             sections,
             unified_inbox_unread,
@@ -498,6 +506,7 @@ pub fn init(config: Config) -> Result<(), String> {
         conversation_limit: INITIAL_PAGE,
         selected_conversation: None,
         open_generation: 0,
+        prefetch_generation: 0,
         search: SearchState::default(),
         server_more: None,
         capabilities: HashMap::new(),
@@ -770,6 +779,7 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
 
     state.selected_folder = None;
     state.invalidate_open();
+    state.prefetch_generation = state.prefetch_generation.wrapping_add(1);
     state.selected_conversation = None;
     state.server_more = None;
     state.conversation_limit = INITIAL_PAGE;
@@ -839,6 +849,7 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
 
     state.selected_folder = None;
     state.invalidate_open();
+    state.prefetch_generation = state.prefetch_generation.wrapping_add(1);
     state.selected_conversation = None;
     state.server_more = None;
     state.conversation_limit = INITIAL_PAGE;
@@ -1585,7 +1596,7 @@ pub async fn prefetch_bodies() {
     let Ok(_prefetch) = PREFETCH_LOCK.try_lock() else {
         return;
     };
-    let (config, candidates) = {
+    let (config, candidates, generation) = {
         let guard = lock_state();
         let Some(state) = guard.as_ref() else { return };
         if !state.config_doc.settings.prefetch_bodies {
@@ -1601,7 +1612,7 @@ pub async fn prefetch_bodies() {
                 return;
             }
         };
-        (state.config.clone(), candidates)
+        (state.config.clone(), candidates, state.prefetch_generation)
     };
     if candidates.is_empty() {
         return;
@@ -1638,7 +1649,7 @@ pub async fn prefetch_bodies() {
                         .imap(&account)
                         .await
                         .map_err(|e| e.to_string())?;
-                    transport
+                    let selected = transport
                         .select(&RemoteFolder {
                             name: folder.name,
                             delimiter: folder.delimiter,
@@ -1647,12 +1658,22 @@ pub async fn prefetch_bodies() {
                         .await
                         .map_err(|e| e.to_string())?;
                     for candidate in candidates {
-                        // Settings may have changed while the connection was opening.
-                        if !lock_state()
-                            .as_ref()
-                            .is_some_and(|s| s.config_doc.settings.prefetch_bodies)
+                        if candidate.uidvalidity != selected.uidvalidity {
+                            log::debug!("skip prefetch after UIDVALIDITY change for {folder_id}");
+                            continue;
+                        }
+                        // A removed/replaced account or reset invalidates this batch.
                         {
-                            break;
+                            let guard = lock_state();
+                            let Some(state) = guard.as_ref() else { break };
+                            if generation != state.prefetch_generation
+                                || !state.config_doc.settings.prefetch_bodies
+                            {
+                                break;
+                            }
+                            if !prefetch_candidate_is_current(state, &candidate) {
+                                continue;
+                            }
                         }
                         match store.body(&candidate.message_id) {
                             Ok(Some(_)) => continue,
@@ -1664,7 +1685,14 @@ pub async fn prefetch_bodies() {
                         }
                         match transport.fetch_body(candidate.uid).await {
                             Ok(raw) => {
-                                cache_fetched_body(store, &candidate.message_id, &raw);
+                                // Revalidate and cache atomically with respect to reset/removal.
+                                let guard = lock_state();
+                                if let Some(state) = guard.as_ref()
+                                    && generation == state.prefetch_generation
+                                    && prefetch_candidate_is_current(state, &candidate)
+                                {
+                                    cache_fetched_body(&state.store, &candidate.message_id, &raw);
+                                }
                             }
                             Err(error) => log::warn!("prefetch {}: {error}", candidate.message_id),
                         }
@@ -1680,6 +1708,26 @@ pub async fn prefetch_bodies() {
         .buffer_unordered(PREFETCH_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
+}
+
+fn prefetch_candidate_is_current(state: &AppState, candidate: &PrefetchCandidate) -> bool {
+    state
+        .config_doc
+        .accounts
+        .iter()
+        .any(|a| a.id == candidate.account_id)
+        && state
+            .store
+            .message(&candidate.message_id)
+            .ok()
+            .flatten()
+            .is_some_and(|m| {
+                m.account_id == candidate.account_id
+                    && m.folder_id == candidate.folder_id
+                    && m.uid == candidate.uid
+                    && m.uidvalidity == candidate.uidvalidity
+                    && m.header.size <= MAX_BODY_BYTES
+            })
 }
 
 /// Open a conversation for the reader: load its messages, resolve the newest

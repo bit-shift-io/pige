@@ -234,6 +234,9 @@ impl App {
     /// Install a fresh snapshot and derive the navigation selection in one
     /// place for both event-driven and tick refreshes.
     pub(crate) fn apply_snapshot(&mut self, snapshot: ModelSnapshot) {
+        if snapshot.revision < self.snapshot.revision {
+            return;
+        }
         self.selected_account = selection_account(&snapshot);
         if snapshot_matches_search(&snapshot, &self.search, &self.search_scope) {
             self.search_results = snapshot.search_results.clone();

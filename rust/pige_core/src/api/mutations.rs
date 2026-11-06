@@ -464,8 +464,16 @@ fn remove_optimistically(target: &Target, sender: &Sender) -> Result<(), String>
             .store
             .delete_messages(&ids)
             .map_err(|error| format!("delete conversation: {error}"))?;
-        state.selected_conversation = None;
-        state.invalidate_open();
+        if state.selected_conversation.as_ref().is_some_and(|detail| {
+            detail.account_id == target.account.id
+                && detail
+                    .messages
+                    .iter()
+                    .any(|message| ids.contains(&message.id))
+        }) {
+            state.invalidate_open();
+            state.selected_conversation = None;
+        }
     }
     let _ = sender.send(CoreEvent::SnapshotChanged);
     Ok(())

@@ -23,6 +23,7 @@ pub struct PrefetchCandidate {
     pub folder_id: FolderId,
     pub message_id: MessageId,
     pub uid: Uid,
+    pub uidvalidity: u32,
 }
 
 impl Store {
@@ -44,7 +45,7 @@ impl Store {
                 FROM inbox WHERE thread_rank = 1 AND size <= ?1 AND body_state = 'headers'
                     AND NOT EXISTS (SELECT 1 FROM bodies WHERE message_id = inbox.id)
             )
-            SELECT account_id, folder_id, id, uid FROM candidates WHERE account_rank <= ?2
+            SELECT account_id, folder_id, id, uid, uidvalidity FROM candidates WHERE account_rank <= ?2
             ORDER BY account_id, unread DESC, date DESC, uid DESC"
         )?;
         let rows = stmt.query_map(params![max_bytes, per_account], |row| {
@@ -53,6 +54,7 @@ impl Store {
                 folder_id: FolderId(row.get(1)?),
                 message_id: MessageId(row.get(2)?),
                 uid: Uid(row.get(3)?),
+                uidvalidity: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
