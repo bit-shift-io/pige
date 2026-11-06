@@ -17,6 +17,15 @@ pub struct Body {
 }
 
 impl Store {
+    /// Record a successful fetch with no readable text so prefetch skips it.
+    pub fn set_body_state(&self, id: &MessageId, state: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE messages SET body_state = ?1 WHERE id = ?2",
+            params![state, id.0],
+        )?;
+        Ok(())
+    }
+
     /// Read the cached body for a message, if one has been stored.
     pub fn body(&self, message_id: &MessageId) -> Result<Option<Body>, StoreError> {
         let conn = self.connection();

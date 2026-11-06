@@ -25,6 +25,7 @@ use messages::{conversations_on, message_count_on, unified_conversations_on};
 
 pub use attachments::StoredAttachment;
 pub use bodies::Body;
+pub use messages::PrefetchCandidate;
 
 /// A consistent read of the cache used to build one UI snapshot.
 #[derive(Debug, Default)]

@@ -234,15 +234,29 @@ async fn sync_does_not_notify_when_notifications_are_off() {
     use pige_core::settings::Settings;
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
-    api::save_settings(&Settings { notifications: false, ..Settings::default() }).unwrap();
-    let added = api::add_account(input("Personal", "ada@example.com")).await.unwrap();
+    api::save_settings(&Settings {
+        notifications: false,
+        ..Settings::default()
+    })
+    .unwrap();
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .unwrap();
     let id = added.accounts[0].id.clone();
-    harness.factory.add_transport(id.clone(), inbox_transport(vec![remote_message(1, "one", "a@example.com")]));
+    harness.factory.add_transport(
+        id.clone(),
+        inbox_transport(vec![remote_message(1, "one", "a@example.com")]),
+    );
     let mut events = api::subscribe();
     let synced = api::sync_account(&id).await.unwrap();
     assert_eq!(synced.conversations.len(), 1);
-    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, CoreEvent::NewMail(_))));
-    assert!(harness.notifier.notifications().is_empty(), "notifications were off");
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, CoreEvent::NewMail(_)))
+    );
+    assert!(
+        harness.notifier.notifications().is_empty(),
+        "notifications were off"
+    );
 }
 
 #[tokio::test]
@@ -1069,6 +1083,161 @@ async fn snapshot_reads_are_consistent_during_writes() {
 }
 
 #[tokio::test]
+async fn prefetch_caches_inbox_bodies_when_enabled() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = seed_prefetch(&harness, b"Content-Type: text/plain\r\n\r\nprefetched").await;
+    let store = harness.open_store();
+    let inbox = store.folders(&account).unwrap().remove(0);
+    let mut boundary = stored_message(&inbox, 2);
+    boundary.id = MessageId("boundary".into());
+    boundary.thread_id = ThreadId("boundary".into());
+    boundary.header.size = 10 * 1024 * 1024;
+    store.upsert_message(&boundary).unwrap();
+    let mut oversized = boundary.clone();
+    oversized.id = MessageId("oversized".into());
+    oversized.thread_id = ThreadId("oversized".into());
+    oversized.uid = Uid(3);
+    oversized.header.size += 1;
+    store.upsert_message(&oversized).unwrap();
+    api::prefetch_bodies().await;
+    assert!(
+        store
+            .body(&MessageId("inbox-message-1".into()))
+            .unwrap()
+            .is_some()
+    );
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert!(
+        transport
+            .fetch_body_calls
+            .contains(&("INBOX".into(), Uid(2))),
+        "exact size cap is fetched"
+    );
+    assert!(
+        !transport
+            .fetch_body_calls
+            .contains(&("INBOX".into(), Uid(3))),
+        "over cap is not fetched"
+    );
+    assert_eq!(
+        transport
+            .fetch_body_calls
+            .iter()
+            .filter(|(_, uid)| *uid == Uid(1))
+            .count(),
+        1
+    );
+    assert!(store.body(&oversized.id).unwrap().is_none());
+}
+
+async fn seed_prefetch(harness: &Harness, raw: &[u8]) -> AccountId {
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    seed_conversation(&store, &inbox, 1, 1, "A", "thread-a");
+    harness.factory.add_transport(
+        account.clone(),
+        FakeTransport {
+            bodies: HashMap::from([("INBOX".into(), HashMap::from([(Uid(1), raw.to_vec())]))]),
+            ..FakeTransport::default()
+        },
+    );
+    account
+}
+
+#[tokio::test]
+async fn prefetch_fetches_nothing_when_disabled() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = seed_prefetch(&harness, b"Subject: A\r\n\r\nbody").await;
+    api::save_settings(&api::Settings {
+        prefetch_bodies: false,
+        ..api::Settings::default()
+    })
+    .unwrap();
+    api::prefetch_bodies().await;
+    assert!(
+        harness
+            .factory
+            .transport(&account)
+            .await
+            .unwrap()
+            .fetch_body_calls
+            .is_empty()
+    );
+    assert!(
+        harness
+            .open_store()
+            .body(&MessageId("inbox-message-1".into()))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn prefetch_marks_unreadable_bodies_and_does_not_refetch() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = seed_prefetch(
+        &harness,
+        b"Content-Type: application/octet-stream\r\n\r\nbinary",
+    )
+    .await;
+    api::prefetch_bodies().await;
+    assert!(
+        harness
+            .open_store()
+            .body(&MessageId("inbox-message-1".into()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        harness
+            .open_store()
+            .prefetch_candidates(10 * 1024 * 1024, 50)
+            .unwrap()
+            .is_empty()
+    );
+    api::prefetch_bodies().await;
+    assert_eq!(
+        harness
+            .factory
+            .transport(&account)
+            .await
+            .unwrap()
+            .fetch_body_calls
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn prefetch_gives_up_quietly_without_a_transport() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    seed_conversation(&store, &inbox, 1, 1, "A", "thread-a");
+    let before = api::snapshot();
+    api::prefetch_bodies().await;
+    assert_eq!(api::snapshot(), before);
+}
+
+#[tokio::test]
 async fn a_slow_open_does_not_overwrite_a_newer_one() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
@@ -1076,19 +1245,42 @@ async fn a_slow_open_does_not_overwrite_a_newer_one() {
     let mut pending = Vec::new();
     // Three overlapping taps, resolved in reverse order.
     for name in ["a", "b", "c"] {
-        let snapshot = api::add_account(input(name, &format!("{name}@example.com"))).await.unwrap();
-        let account = snapshot.accounts.iter().find(|a| a.email == format!("{name}@example.com")).unwrap().id.clone();
-        let inbox = folder(&format!("{name}-inbox"), &account, "INBOX", FolderKind::Inbox, 0);
+        let snapshot = api::add_account(input(name, &format!("{name}@example.com")))
+            .await
+            .unwrap();
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.email == format!("{name}@example.com"))
+            .unwrap()
+            .id
+            .clone();
+        let inbox = folder(
+            &format!("{name}-inbox"),
+            &account,
+            "INBOX",
+            FolderKind::Inbox,
+            0,
+        );
         store.upsert_folder(&inbox).unwrap();
         seed_conversation(&store, &inbox, 1, 1, name, &format!("thread-{name}"));
         let started = Arc::new(Semaphore::new(0));
         let pause = Arc::new(Semaphore::new(0));
-        harness.factory.add_transport(account, FakeTransport {
-            bodies: HashMap::from([("INBOX".into(), HashMap::from([(Uid(1), format!("Subject: {name}\r\n\r\nbody {name}").into_bytes())]))]),
-            fetch_body_started: Some(started.clone()),
-            fetch_body_pause: Some(pause.clone()),
-            ..FakeTransport::default()
-        });
+        harness.factory.add_transport(
+            account,
+            FakeTransport {
+                bodies: HashMap::from([(
+                    "INBOX".into(),
+                    HashMap::from([(
+                        Uid(1),
+                        format!("Subject: {name}\r\n\r\nbody {name}").into_bytes(),
+                    )]),
+                )]),
+                fetch_body_started: Some(started.clone()),
+                fetch_body_pause: Some(pause.clone()),
+                ..FakeTransport::default()
+            },
+        );
         let thread = ThreadId(format!("thread-{name}"));
         let open = tokio::spawn(async move { api::open_conversation(&thread).await });
         let _ = started.acquire().await.unwrap();
@@ -1097,10 +1289,18 @@ async fn a_slow_open_does_not_overwrite_a_newer_one() {
     for (pause, open) in pending.into_iter().rev() {
         pause.add_permits(1);
         let result = open.await.unwrap().unwrap();
-        assert_eq!(result.selected_conversation.unwrap().thread_id, ThreadId("thread-c".into()));
+        assert_eq!(
+            result.selected_conversation.unwrap().thread_id,
+            ThreadId("thread-c".into())
+        );
     }
     for name in ["a", "b", "c"] {
-        assert!(store.body(&MessageId(format!("{name}-inbox-message-1"))).unwrap().is_some());
+        assert!(
+            store
+                .body(&MessageId(format!("{name}-inbox-message-1")))
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -1108,26 +1308,45 @@ async fn a_slow_open_does_not_overwrite_a_newer_one() {
 async fn leaving_invalidates_an_in_flight_open() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
-    let account = api::add_account(input("A", "a@example.com")).await.unwrap().accounts[0].id.clone();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
     let store = harness.open_store();
     let inbox = folder("inbox", &account, "INBOX", FolderKind::Inbox, 0);
     store.upsert_folder(&inbox).unwrap();
     seed_conversation(&store, &inbox, 1, 1, "A", "thread-a");
     let started = Arc::new(Semaphore::new(0));
     let pause = Arc::new(Semaphore::new(0));
-    harness.factory.add_transport(account, FakeTransport {
-        bodies: HashMap::from([("INBOX".into(), HashMap::from([(Uid(1), b"Subject: A\r\n\r\nalpha".to_vec())]))]),
-        fetch_body_started: Some(started.clone()),
-        fetch_body_pause: Some(pause.clone()),
-        ..FakeTransport::default()
-    });
+    harness.factory.add_transport(
+        account,
+        FakeTransport {
+            bodies: HashMap::from([(
+                "INBOX".into(),
+                HashMap::from([(Uid(1), b"Subject: A\r\n\r\nalpha".to_vec())]),
+            )]),
+            fetch_body_started: Some(started.clone()),
+            fetch_body_pause: Some(pause.clone()),
+            ..FakeTransport::default()
+        },
+    );
     let open = tokio::spawn(async { api::open_conversation(&ThreadId("thread-a".into())).await });
     let _ = started.acquire().await.unwrap();
     api::select_unified().await.unwrap();
     pause.add_permits(1);
     let result = open.await.unwrap().unwrap();
-    assert!(result.selected_conversation.is_none(), "a stale open must not resurrect selection");
-    assert!(store.body(&MessageId("inbox-message-1".into())).unwrap().is_some());
+    assert!(
+        result.selected_conversation.is_none(),
+        "a stale open must not resurrect selection"
+    );
+    assert!(
+        store
+            .body(&MessageId("inbox-message-1".into()))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]

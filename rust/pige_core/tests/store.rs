@@ -81,6 +81,63 @@ fn open_store(dir: &TempDir) -> Store {
 }
 
 #[test]
+fn prefetch_candidates_are_inbox_newest_uncached_unread_first() {
+    use pige_core::store::Body;
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    let inbox = folder(&account.id);
+    store.upsert_account(&account).unwrap();
+    store.upsert_folder(&inbox).unwrap();
+    let mut sent = inbox.clone();
+    sent.id = FolderId("sent".into());
+    sent.name = "Sent".into();
+    sent.kind = FolderKind::Sent;
+    store.upsert_folder(&sent).unwrap();
+    for uid in 1..=9 {
+        let mut m = message(if uid == 9 { &sent } else { &inbox }, uid, 7, uid as i64);
+        m.header.size = match uid {
+            3 => 10 * 1024 * 1024,
+            4 => 10 * 1024 * 1024 + 1,
+            _ => 100,
+        };
+        m.flags.seen = uid != 1;
+        if uid == 7 {
+            m.thread_id = ThreadId("thread-8".into());
+        }
+        store.upsert_message(&m).unwrap();
+    }
+    for uid in [5, 8] {
+        store
+            .upsert_body(
+                &MessageId(format!("message-{uid}")),
+                &Body {
+                    plain_text: Some("cached".into()),
+                    ..Body::default()
+                },
+            )
+            .unwrap();
+    }
+    store
+        .set_body_state(&MessageId("message-6".into()), "none")
+        .unwrap();
+    let candidates = store.prefetch_candidates(10 * 1024 * 1024, 50).unwrap();
+    assert_eq!(
+        candidates.iter().map(|c| c.uid.0).collect::<Vec<_>>(),
+        vec![1, 3, 2]
+    );
+    assert_eq!(
+        store
+            .prefetch_candidates(10 * 1024 * 1024, 2)
+            .unwrap()
+            .iter()
+            .map(|c| c.uid.0)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+}
+
+#[test]
 fn account_and_folder_round_trip() {
     let dir = TempDir::new().unwrap();
     let store = open_store(&dir);
@@ -220,10 +277,7 @@ fn sync_accounts_keeps_surviving_cache_and_drops_removed_accounts() {
     store.sync_accounts(&[first.clone(), third]).unwrap();
 
     // The renamed account keeps its cached mail (no blind delete-all).
-    assert_eq!(
-        store.messages(&first_folder.id, 10, None).unwrap().len(),
-        1
-    );
+    assert_eq!(store.messages(&first_folder.id, 10, None).unwrap().len(), 1);
     // The dropped account's cache cascaded away.
     assert!(
         store

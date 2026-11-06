@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use futures::StreamExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 
@@ -62,6 +63,9 @@ const SYNC_WINDOW: u32 = 300;
 /// shown a "message too large" state instead of fetching hundreds of MiB.
 /// This is separate from the sanitizer's 2 MiB HTML input cap.
 const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
+const PREFETCH_LIMIT: u32 = 50;
+const PREFETCH_CONCURRENCY: usize = 2;
+static PREFETCH_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 /// The result of submitting a message: the refreshed cache view plus whether it
 /// is still waiting in the outbox for a network connection.
@@ -1575,6 +1579,109 @@ pub async fn load_older_unified() -> Result<ModelSnapshot, String> {
     Ok(snapshot())
 }
 
+/// Quietly cache likely-to-be-read Inbox bodies, with bounded connections.
+/// This runs only in foreground shells, not in Android's background worker.
+pub async fn prefetch_bodies() {
+    let Ok(_prefetch) = PREFETCH_LOCK.try_lock() else {
+        return;
+    };
+    let (config, candidates) = {
+        let guard = lock_state();
+        let Some(state) = guard.as_ref() else { return };
+        if !state.config_doc.settings.prefetch_bodies {
+            return;
+        }
+        let candidates = match state
+            .store
+            .prefetch_candidates(MAX_BODY_BYTES, PREFETCH_LIMIT)
+        {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                log::warn!("prefetch candidates: {error}");
+                return;
+            }
+        };
+        (state.config.clone(), candidates)
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let store = match Store::open(database_path(&config.data_dir)) {
+        Ok(store) => store,
+        Err(error) => {
+            log::warn!("open prefetch cache: {error}");
+            return;
+        }
+    };
+    let mut groups = HashMap::<_, Vec<_>>::new();
+    for candidate in candidates {
+        groups
+            .entry((candidate.account_id.clone(), candidate.folder_id.clone()))
+            .or_default()
+            .push(candidate);
+    }
+    futures::stream::iter(groups)
+        .map(|((account_id, folder_id), candidates)| {
+            let store = &store;
+            let config = &config;
+            async move {
+                let result: Result<(), String> = async {
+                    let account = find_account(store, &account_id)?;
+                    let folder = store
+                        .folders(&account_id)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .find(|f| f.id == folder_id)
+                        .ok_or("prefetch folder missing")?;
+                    let mut transport = config
+                        .transport
+                        .imap(&account)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    transport
+                        .select(&RemoteFolder {
+                            name: folder.name,
+                            delimiter: folder.delimiter,
+                            kind: folder.kind,
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    for candidate in candidates {
+                        // Settings may have changed while the connection was opening.
+                        if !lock_state()
+                            .as_ref()
+                            .is_some_and(|s| s.config_doc.settings.prefetch_bodies)
+                        {
+                            break;
+                        }
+                        match store.body(&candidate.message_id) {
+                            Ok(Some(_)) => continue,
+                            Ok(None) => {}
+                            Err(error) => {
+                                log::warn!("prefetch cache check: {error}");
+                                continue;
+                            }
+                        }
+                        match transport.fetch_body(candidate.uid).await {
+                            Ok(raw) => {
+                                cache_fetched_body(store, &candidate.message_id, &raw);
+                            }
+                            Err(error) => log::warn!("prefetch {}: {error}", candidate.message_id),
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    log::warn!("prefetch {account_id}: {error}");
+                }
+            }
+        })
+        .buffer_unordered(PREFETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+}
+
 /// Open a conversation for the reader: load its messages, resolve the newest
 /// message's body (from cache or through the account's transport), and install
 /// the resulting [`ConversationDetail`] as the selected conversation.
@@ -2135,6 +2242,11 @@ fn cache_fetched_body(store: &Store, message_id: &MessageId, raw: &[u8]) -> Opti
         fetched_at: now_unix(),
     };
     let document = document_from_body(&body);
+    if document.is_none()
+        && let Err(error) = store.set_body_state(message_id, "none")
+    {
+        log::warn!("record unreadable body {message_id}: {error}");
+    }
     if document.is_some()
         && let Err(error) = store.upsert_body(message_id, &body)
     {
@@ -2499,7 +2611,9 @@ async fn sync_one(
     // notification is suppressed when the user has turned notifications off.
     let notify_new_mail = {
         let guard = lock_state();
-        guard.as_ref().is_none_or(|state| state.config_doc.settings.notifications)
+        guard
+            .as_ref()
+            .is_none_or(|state| state.config_doc.settings.notifications)
     };
     for mail in &report.new_inbox {
         if notify_new_mail {

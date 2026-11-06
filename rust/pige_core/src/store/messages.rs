@@ -16,7 +16,49 @@ const COLUMNS: &str = "id, account_id, folder_id, uid, uidvalidity, \
      message_id, in_reply_to, references_json, thread_id, subject, \
      from_json, to_json, cc_json, date, size, flags, snippet, has_attachments";
 
+/// The newest uncached Inbox message in a conversation.
+#[derive(Debug, Clone)]
+pub struct PrefetchCandidate {
+    pub account_id: AccountId,
+    pub folder_id: FolderId,
+    pub message_id: MessageId,
+    pub uid: Uid,
+}
+
 impl Store {
+    /// Unread conversations first, then recent ones, bounded per account.
+    pub fn prefetch_candidates(
+        &self,
+        max_bytes: u32,
+        per_account: u32,
+    ) -> Result<Vec<PrefetchCandidate>, StoreError> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "WITH inbox AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (PARTITION BY account_id, thread_id ORDER BY date DESC, uid DESC) AS thread_rank,
+                    MAX(CASE WHEN (flags & 1) = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY account_id, thread_id) AS unread
+                FROM messages WHERE folder_id IN (SELECT id FROM folders WHERE kind = 'inbox')
+            ), candidates AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY unread DESC, date DESC, uid DESC) AS account_rank
+                FROM inbox WHERE thread_rank = 1 AND size <= ?1 AND body_state = 'headers'
+                    AND NOT EXISTS (SELECT 1 FROM bodies WHERE message_id = inbox.id)
+            )
+            SELECT account_id, folder_id, id, uid FROM candidates WHERE account_rank <= ?2
+            ORDER BY account_id, unread DESC, date DESC, uid DESC"
+        )?;
+        let rows = stmt.query_map(params![max_bytes, per_account], |row| {
+            Ok(PrefetchCandidate {
+                account_id: AccountId(row.get(0)?),
+                folder_id: FolderId(row.get(1)?),
+                message_id: MessageId(row.get(2)?),
+                uid: Uid(row.get(3)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn upsert_message(&self, message: &StoredMessage) -> Result<(), StoreError> {
         let references_json = encode_json(&message.header.references)?;
         let from_json = encode_json(&message.header.from)?;
