@@ -45,6 +45,8 @@ pub const ACCOUNT_CIRCLE: char = '\u{e043}';
 pub const PERSON_ADD: char = '\u{e492}';
 pub const CREATE_NEW_FOLDER: char = '\u{e19e}';
 pub const UNARCHIVE: char = '\u{e68b}';
+pub const PRINT: char = '\u{e8ad}';
+pub const BLOCK: char = '\u{e14b}';
 
 /// The glyph as owned text, for `text(...).font(FONT)`.
 pub fn glyph(character: char) -> String {
@@ -65,6 +67,8 @@ mod tests {
         assert_eq!(SEND, '\u{e571}');
         assert_eq!(ATTACH_FILE, '\u{e0b1}');
         assert_eq!(EXPAND_MORE, '\u{e246}');
+        assert_eq!(PRINT, '\u{e8ad}');
+        assert_eq!(BLOCK, '\u{e14b}');
     }
 
     #[test]

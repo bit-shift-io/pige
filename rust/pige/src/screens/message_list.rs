@@ -2,7 +2,6 @@
 
 use iced::widget::{column, container, scrollable};
 use iced::{Element, Fill, Length};
-use pige_core::api::SyncStatus;
 use pige_core::mail::FolderKind;
 
 use crate::app::{
@@ -26,11 +25,28 @@ pub fn list_pane<'a>(
     let palette = theme::active();
     let leading = (breakpoint != Breakpoint::Expanded)
         .then(|| components::icon_button(icons::MENU, "Open navigation", Message::ToggleDrawer));
-    let actions = vec![
-        components::icon_button(icons::REFRESH, "Sync now", Message::SyncNow),
-        components::icon_button(icons::SEARCH, "Search", Message::OpenSearch),
-        components::icon_button(icons::EDIT, "Compose", Message::Compose),
-    ];
+    // While any sync runs, the refresh button becomes a spinner; this shows
+    // Syncing without shifting the list (only a pull moves the list).
+    let mut actions: Vec<Element<'a, Message>> = Vec::new();
+    if app.syncing() {
+        actions.push(components::toolbar_spinner(app.spin_phase as f32));
+    } else {
+        actions.push(components::icon_button(
+            icons::REFRESH,
+            "Sync now",
+            Message::SyncNow,
+        ));
+    }
+    actions.push(components::icon_button(
+        icons::SEARCH,
+        "Search",
+        Message::OpenSearch,
+    ));
+    actions.push(components::icon_button(
+        icons::EDIT,
+        "Compose",
+        Message::Compose,
+    ));
 
     let mut pane = column![].spacing(0).width(Fill).height(Fill);
     pane = pane.push(components::app_bar(folder_title(app), leading, actions));
@@ -104,11 +120,7 @@ pub fn list_pane<'a>(
                 .height(Fill)
                 .style(palette.scrollable())
                 .into();
-        let scroller = components::pull_refresh::wrap(
-            scroller,
-            app.snapshot.status == SyncStatus::Syncing,
-            Message::Refresh,
-        );
+        let scroller = components::pull_refresh::wrap(scroller, app.refreshing, Message::Refresh);
         pane = pane.push(elastic_scroll::wrap(
             scroller,
             app.list_motion.clone(),

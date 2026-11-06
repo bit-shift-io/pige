@@ -1287,6 +1287,15 @@ async fn prefetch_caches_inbox_bodies_when_enabled() {
             .unwrap()
             .is_some()
     );
+    assert_eq!(
+        store
+            .message(&MessageId("inbox-message-1".into()))
+            .unwrap()
+            .unwrap()
+            .snippet,
+        "prefetched",
+        "a cached decoded body must repair the list preview"
+    );
     let transport = harness.factory.transport(&account).await.unwrap();
     assert!(
         transport
@@ -1309,6 +1318,21 @@ async fn prefetch_caches_inbox_bodies_when_enabled() {
         1
     );
     assert!(store.body(&oversized.id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn block_sender_persists_normalised_addresses_without_duplicates() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    api::block_sender("  Bob@Example.com ").unwrap();
+    api::block_sender("bob@example.com").unwrap();
+    assert!(api::block_sender("not-an-address").is_err());
+    assert!(api::block_sender("   ").is_err());
+
+    let path = pige_core::config::document_path(&harness.dir.path().join("config"));
+    let document = pige_core::config::load(&path).unwrap().unwrap();
+    assert_eq!(document.blocked_senders, vec!["bob@example.com".to_string()]);
 }
 
 async fn seed_prefetch(harness: &Harness, raw: &[u8]) -> AccountId {

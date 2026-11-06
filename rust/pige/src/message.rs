@@ -109,6 +109,16 @@ pub enum Message {
     OpenMovePicker,
     /// The reader toolbar: dismiss the "Move to folder" picker.
     CloseMovePicker,
+    /// The reader app-bar overflow menu was opened.
+    OpenReaderMenu,
+    /// The reader app-bar overflow menu was dismissed.
+    CloseReaderMenu,
+    /// Move the open conversation to the account's spam folder.
+    ReportSpam,
+    /// Remember the open conversation's sender as blocked, and file it as spam.
+    BlockSender,
+    /// Printing is not built yet; the menu item reports that.
+    PrintConversation,
     /// The reader toolbar: move the conversation to a chosen folder.
     MoveConversation(FolderId),
     /// The reader toolbar: open the permanent-delete confirmation dialog.

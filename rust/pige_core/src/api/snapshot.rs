@@ -84,6 +84,9 @@ pub enum MessageBody {
 pub struct MessageSummary {
     pub id: MessageId,
     pub sender: String,
+    /// The sender's bare email address, for actions that must name the sender
+    /// (blocking). Empty when the header carried no from address.
+    pub sender_email: String,
     pub to: String,
     pub date: i64,
     pub snippet: String,

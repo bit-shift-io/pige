@@ -20,7 +20,7 @@ pub use attachment::{
 pub use message::{Conversation, Flags, MessageHeader, StoredMessage};
 pub use parse::{
     ParseError, decode_rfc2047, normalized_subject, parse_flags, parse_header_block,
-    snippet_from_message,
+    snippet_from_message, snippet_from_parts,
 };
 pub use thread::ThreadAssigner;
 

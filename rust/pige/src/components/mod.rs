@@ -35,12 +35,12 @@ pub mod pull_refresh;
 pub mod rows;
 pub mod scroll_fade;
 pub mod spinner;
-pub use spinner::spinner;
+pub use spinner::{spinner, toolbar_spinner};
 
 pub use avatar::avatar;
 pub use buttons::{ButtonVariant, button, floating_action_button, icon_button};
 pub use chips::{attachment_chip, chip, format_size};
-pub use chrome::{app_bar, empty_state, toast};
+pub use chrome::{app_bar, app_bar_actions, empty_state, menu_row, toast};
 pub use dialog::{dialog, dialog_sized};
 pub use fields::{password_field, search_field, text_area, text_field};
 pub use rows::{FolderKind, FolderView, ListRow, folder_row, list_row, section_header};

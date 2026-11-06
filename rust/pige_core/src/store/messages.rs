@@ -157,6 +157,30 @@ impl Store {
         Ok(())
     }
 
+    /// Replace one message's list preview, keeping its thread aggregate in
+    /// step. Used when a decoded body lets the shell repair a preview that was
+    /// cached before the transfer-encoding decoder landed.
+    pub fn set_snippet(&self, id: &MessageId, snippet: &str) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let thread: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM messages WHERE id = ?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute(
+            "UPDATE messages SET snippet = ?1 WHERE id = ?2",
+            params![snippet, id.0],
+        )?;
+        if let Some(thread) = thread {
+            recompute_thread_on(&tx, &ThreadId(thread))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Newest-first page of a folder's messages. `before_date` is the exclusive
     /// Unix-seconds cursor used by "load older".
     pub fn messages(

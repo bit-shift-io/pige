@@ -251,9 +251,27 @@ pub(crate) async fn sync_folder(
         inserted.push(stored);
     }
 
-    // Fill snippets for the newest messages without fetching full bodies.
+    // Fill snippets for the newest messages without fetching full bodies. New
+    // messages are read first; cached messages whose snippet is empty are
+    // refilled too, which restores previews cleared by the v4 repair migration.
+    let mut own_ids: std::collections::HashMap<Uid, MessageId> = inserted
+        .iter()
+        .map(|message| (message.uid, message.id.clone()))
+        .chain(
+            cached
+                .iter()
+                .map(|message| (message.uid, message.id.clone())),
+        )
+        .collect();
     let mut newest: Vec<Uid> = fetched.iter().map(|m| m.uid).collect();
+    let mut missing: Vec<Uid> = cached
+        .iter()
+        .filter(|message| message.snippet.trim().is_empty())
+        .map(|message| message.uid)
+        .collect();
+    newest.append(&mut missing);
     newest.sort_unstable_by(|a, b| b.cmp(a));
+    newest.dedup();
     newest.truncate(SNIPPET_COUNT);
     if !newest.is_empty() {
         let texts = transport
@@ -261,11 +279,9 @@ pub(crate) async fn sync_folder(
             .await
             .map_err(|e| format!("snippets {}: {e}", remote.name))?;
         for (uid, text) in texts {
-            if let Some(stored) = inserted.iter().find(|m| m.uid == uid) {
-                let mut updated = stored.clone();
-                updated.snippet = text;
+            if let Some(id) = own_ids.remove(&uid) {
                 store
-                    .upsert_message(&updated)
+                    .set_snippet(&id, &text)
                     .map_err(|e| format!("store {}: {e}", remote.name))?;
             }
         }

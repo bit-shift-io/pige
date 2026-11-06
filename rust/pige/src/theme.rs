@@ -142,6 +142,8 @@ pub struct Metrics {
     pub scrollbar_width: f32,
     pub dialog_width: f32,
     pub dialog_padding: f32,
+    /// Width of the reader's overflow dropdown card.
+    pub menu_width: f32,
     pub compose_width: f32,
     pub compose_body_height: f32,
     pub dialog_shadow_blur: f32,
@@ -403,6 +405,7 @@ const METRICS: Metrics = Metrics {
     scrollbar_width: 6.0,
     dialog_width: 480.0,
     dialog_padding: 24.0,
+    menu_width: 240.0,
     compose_width: 640.0,
     compose_body_height: 220.0,
     dialog_shadow_blur: 16.0,

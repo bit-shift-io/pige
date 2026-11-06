@@ -329,3 +329,73 @@ fn conversations_aggregate_messages_by_thread() {
     assert_eq!(conversation.date, 1_700_000_100);
     assert!(conversation.has_attachments);
 }
+
+#[test]
+fn set_snippet_updates_the_conversation_preview() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    let inbox = folder(&account.id);
+    store.upsert_account(&account).unwrap();
+    store.upsert_folder(&inbox).unwrap();
+    store
+        .upsert_message(&message(&inbox, 1, 7, 1_700_000_000))
+        .unwrap();
+
+    store
+        .set_snippet(&MessageId("message-1".into()), "a decoded preview")
+        .unwrap();
+
+    let conversations = store.conversations(&inbox.id, 10, None).unwrap();
+    assert_eq!(conversations[0].snippet, "a decoded preview");
+}
+
+#[test]
+fn migration_repairs_stale_previews_from_cached_bodies() {
+    use pige_core::store::Body;
+
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    let inbox = folder(&account.id);
+    store.upsert_account(&account).unwrap();
+    store.upsert_folder(&inbox).unwrap();
+
+    // A message whose preview was cached as raw base64, with a decoded body
+    // already on disk: the body wins.
+    let mut decoded = message(&inbox, 1, 7, 1_700_000_000);
+    decoded.snippet = "SGVsbG8gd29ybGQ=".to_string();
+    store.upsert_message(&decoded).unwrap();
+    store
+        .upsert_body(
+            &decoded.id,
+            &Body {
+                plain_text: Some("Hello world from a cached body".to_string()),
+                ..Body::default()
+            },
+        )
+        .unwrap();
+
+    // A message with only an encoded preview and no body: the stale preview is
+    // cleared so gibberish is never shown.
+    let mut stale = message(&inbox, 2, 7, 1_700_000_100);
+    stale.snippet = "aGVsbG8gd29ybGQ=".to_string();
+    store.upsert_message(&stale).unwrap();
+
+    // Rewind the recorded version and replay v4.
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("pige.db")).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    }
+    store.migrate().unwrap();
+
+    assert_eq!(
+        store.message(&decoded.id).unwrap().unwrap().snippet,
+        "Hello world from a cached body"
+    );
+    assert_eq!(store.message(&stale.id).unwrap().unwrap().snippet, "");
+}

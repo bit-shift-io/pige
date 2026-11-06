@@ -28,6 +28,10 @@ pub struct ConfigDocument {
     pub accounts: Vec<Account>,
     #[serde(default)]
     pub settings: Settings,
+    /// Bare sender addresses the user has blocked. Informational for now: no
+    /// inbox filtering reads this yet, it only records the choice.
+    #[serde(default)]
+    pub blocked_senders: Vec<String>,
 }
 
 impl Default for ConfigDocument {
@@ -36,6 +40,7 @@ impl Default for ConfigDocument {
             version: CURRENT_VERSION,
             accounts: Vec::new(),
             settings: Settings::default(),
+            blocked_senders: Vec::new(),
         }
     }
 }
@@ -236,6 +241,19 @@ mod tests {
         save(&path, &doc).unwrap();
 
         assert_eq!(load(&path).unwrap(), Some(doc));
+    }
+
+    #[test]
+    fn blocked_senders_round_trip_and_an_old_document_still_loads() {
+        let mut doc = ConfigDocument::default();
+        doc.blocked_senders.push("spam@example.com".to_string());
+        let json = serde_json::to_string(&doc).unwrap();
+        let parsed: ConfigDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.blocked_senders, vec!["spam@example.com".to_string()]);
+
+        let old = r#"{"version":1,"accounts":[],"settings":{"sync_minutes":15}}"#;
+        let parsed: ConfigDocument = serde_json::from_str(old).unwrap();
+        assert!(parsed.blocked_senders.is_empty());
     }
 
     #[test]

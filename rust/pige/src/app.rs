@@ -103,6 +103,11 @@ pub struct App {
     pub(crate) spin_phase: u32,
     /// Whether the reader's "Move to folder" picker is open.
     pub(crate) move_picker_open: bool,
+    /// Whether the reader app-bar overflow menu is open.
+    pub(crate) reader_menu_open: bool,
+    /// True from a pull-to-refresh until that sync finishes. Drives only the
+    /// pull indicator, so background and app-bar syncs never shift the list.
+    pub(crate) refreshing: bool,
     /// Whether the reader's permanent-delete confirmation is open.
     pub(crate) delete_confirm_open: bool,
     /// Candidate backup names shown in the Advanced restore picker.
@@ -188,6 +193,8 @@ impl App {
                 reader_expanded: false,
                 spin_phase: 0,
                 move_picker_open: false,
+                reader_menu_open: false,
+                refreshing: false,
                 delete_confirm_open: false,
                 restore_picker: None,
                 restore_confirm: None,
@@ -227,6 +234,8 @@ impl App {
             reader_expanded: false,
             spin_phase: 0,
             move_picker_open: false,
+            reader_menu_open: false,
+            refreshing: false,
             delete_confirm_open: false,
             restore_picker: None,
             restore_confirm: None,
@@ -252,6 +261,12 @@ impl App {
             self.search_results = snapshot.search_results.clone();
         }
         self.snapshot = snapshot;
+    }
+
+    /// Whether any sync is running. Drives the app bar's progress spinner; it
+    /// never moves the list (only a pull does that via [`App::refreshing`]).
+    pub(crate) fn syncing(&self) -> bool {
+        self.snapshot.status == pige_core::api::SyncStatus::Syncing
     }
 
     /// Follow the Android system font scale. The renderer scales the whole
@@ -547,9 +562,19 @@ pub fn search_row_view(hit: &SearchHit, account_color: Option<Color>) -> ListRow
 mod tests {
     use super::*;
 
-    use pige_core::api::{AccountSection, FolderSummary, ModelSnapshot};
+    use pige_core::api::{AccountSection, FolderSummary, ModelSnapshot, SyncStatus};
     use pige_core::mail::{FolderId, ThreadId};
     use pige_core::search::{SearchHit, SearchScope};
+
+    #[test]
+    fn syncing_tracks_the_sync_status() {
+        let mut app = App::for_test();
+        assert!(!app.syncing());
+        app.snapshot.status = SyncStatus::Syncing;
+        assert!(app.syncing());
+        app.snapshot.status = SyncStatus::Idle;
+        assert!(!app.syncing());
+    }
 
     #[test]
     fn initials_use_first_and_last_words() {

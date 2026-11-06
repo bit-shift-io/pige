@@ -6,7 +6,7 @@ use iced::{Alignment, Element, Fill};
 
 use crate::app::App;
 use crate::components::{self, PaneTone};
-use crate::layout::{Breakpoint, Panes, panes_for};
+use crate::layout::{Breakpoint, LIST_WIDTH, NAV_WIDTH, Panes, panes_for};
 use crate::message::Message;
 use crate::theme;
 
@@ -36,6 +36,13 @@ impl App {
 
         if self.toast.current.is_some() {
             root = stack![root, self.toast_overlay()].into();
+        }
+        if self.reader_menu_open {
+            root = stack![
+                root,
+                crate::screens::reader::reader_menu(self, self.reader_pane_width(breakpoint))
+            ]
+            .into();
         }
         if self.move_picker_open {
             root = stack![root, crate::screens::reader::move_picker_modal(self)].into();
@@ -86,7 +93,10 @@ impl App {
             if panes.list {
                 layout = layout.push(components::divider());
             }
-            layout = layout.push(self.reader_pane());
+            layout = layout.push(crate::screens::reader::reader_pane(
+                self,
+                self.reader_pane_width(breakpoint),
+            ));
         }
 
         // Compose lives in the app bar on every width; a floating button would
@@ -98,8 +108,17 @@ impl App {
             .into()
     }
 
-    fn reader_pane(&self) -> Element<'_, Message> {
-        crate::screens::reader::reader_pane(self)
+    /// The reader pane's width in logical points for a breakpoint, from the
+    /// window size and the fixed pane widths. Used both to lay the pane out and
+    /// to decide how many toolbar actions fit before the overflow.
+    fn reader_pane_width(&self, breakpoint: Breakpoint) -> f32 {
+        let content = (self.size.width - self.insets.left - self.insets.right).max(0.0);
+        let border = theme::active().metrics.border_width;
+        match breakpoint {
+            Breakpoint::Compact => content,
+            Breakpoint::Medium => (content - LIST_WIDTH - border).max(0.0),
+            Breakpoint::Expanded => (content - NAV_WIDTH - border - LIST_WIDTH - border).max(0.0),
+        }
     }
 
     fn drawer(&self) -> Element<'_, Message> {

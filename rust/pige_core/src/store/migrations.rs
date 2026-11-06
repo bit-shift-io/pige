@@ -4,6 +4,7 @@
 
 mod v2;
 mod v3;
+mod v4;
 
 use rusqlite::OptionalExtension;
 
@@ -19,7 +20,8 @@ impl Store {
     ///
     /// Versions are applied stepwise. v1 is the original cache schema; v2 adds
     /// the FTS5 index and backfills every message already cached; v3 records
-    /// attachment disposition for the reader's attachment chips.
+    /// attachment disposition for the reader's attachment chips; v4 repairs
+    /// list previews cached before the transfer-encoding decoder landed.
     pub fn migrate(&self) -> Result<(), StoreError> {
         let mut version = self.existing_schema_version()?.unwrap_or(0);
         if version == SCHEMA_VERSION {
@@ -46,6 +48,10 @@ impl Store {
         if version < 3 {
             v3::apply(&tx)?;
             version = 3;
+        }
+        if version < 4 {
+            v4::apply(&tx)?;
+            version = 4;
         }
 
         debug_assert_eq!(version, SCHEMA_VERSION);

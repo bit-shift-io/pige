@@ -27,7 +27,7 @@ pub use store::{Body, Store, StoreError};
 
 /// Bumped whenever the persisted schema changes; later tasks version the store
 /// against this so a mismatched database can be migrated or rebuilt.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[cfg(test)]
 mod tests {

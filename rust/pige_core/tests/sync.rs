@@ -382,6 +382,42 @@ async fn newest_snippets_are_filled_without_fetching_full_bodies() {
 }
 
 #[tokio::test]
+async fn cached_messages_with_empty_snippets_are_refilled() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    store.upsert_account(&account).unwrap();
+
+    // The first sync stores the header but the transport has no text scripted,
+    // so the preview lands empty (as the v4 repair migration leaves it).
+    let mut fake = FakeTransport {
+        folders: vec![folder("INBOX", FolderKind::Inbox)],
+        messages: HashMap::from([("INBOX".to_string(), vec![msg(1, "one", "a@example.com")])]),
+        states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+        ..FakeTransport::default()
+    };
+    sync_account(&store, &account, &mut fake, 10).await.unwrap();
+
+    let folders = store.folders(&account.id).unwrap();
+    assert_eq!(
+        store.messages(&folders[0].id, 10, None).unwrap()[0].snippet,
+        ""
+    );
+
+    // A later sync with no new mail still revisits the empty preview.
+    fake.texts = HashMap::from([(
+        "INBOX".to_string(),
+        HashMap::from([(Uid(1), "recovered preview".to_string())]),
+    )]);
+    let report = sync_account(&store, &account, &mut fake, 10).await.unwrap();
+    assert!(report.errors.is_empty());
+
+    let messages = store.messages(&folders[0].id, 10, None).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].snippet, "recovered preview");
+}
+
+#[tokio::test]
 async fn one_failing_folder_does_not_abort_the_account() {
     let dir = TempDir::new().unwrap();
     let store = open_store(&dir);

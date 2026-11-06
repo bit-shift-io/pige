@@ -28,7 +28,7 @@ use crate::html::{MailDocument, parse_html, plain_text_document};
 use crate::mail::{
     AttachmentPart, Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner,
     ThreadId, Uid, attachment_bytes, cache_attachment, check_attachment_size, extract_attachments,
-    sender_display, thread::participants_of,
+    sender_display, snippet_from_parts, thread::participants_of,
 };
 use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
 use crate::search::{SearchHit, SearchScope};
@@ -634,6 +634,7 @@ fn document_from_store(store: &Store) -> ConfigDocument {
         version: config::CURRENT_VERSION,
         accounts: store.accounts().unwrap_or_default(),
         settings: crate::settings::load_settings(store),
+        blocked_senders: Vec::new(),
     }
 }
 
@@ -1175,6 +1176,31 @@ pub async fn set_account_color(id: &AccountId, color: &str) -> Result<ModelSnaps
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
     Ok(snapshot)
+}
+
+/// Remember a sender address as blocked. This only records the choice in the
+/// configuration document; no inbox filtering reads it yet. The address is
+/// trimmed and lowercased so duplicates with different casing collapse.
+pub fn block_sender(address: &str) -> Result<(), String> {
+    let address = address.trim().to_lowercase();
+    if address.is_empty() || !address.contains('@') {
+        return Err("this message has no sender address to block".to_string());
+    }
+
+    let mut guard = lock_state();
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state.ensure_writable()?;
+    if state.config_doc.blocked_senders.contains(&address) {
+        return Ok(());
+    }
+    state.config_doc.blocked_senders.push(address);
+    if let Err(error) = config::save(&state.config_path, &state.config_doc) {
+        state.config_doc.blocked_senders.pop();
+        return Err(format!("save blocked senders: {error}"));
+    }
+    Ok(())
 }
 
 /// Remove an account, its stored password, and every cached row that belongs
@@ -2354,6 +2380,14 @@ fn cache_fetched_body(store: &Store, message_id: &MessageId, raw: &[u8]) -> Opti
     {
         log::warn!("cache body {message_id}: {error}");
     }
+    // A decoded body also repairs the list preview. Snippets cached before the
+    // decoder landed held the raw transfer-encoded text; rewriting them here
+    // keeps prefetched and opened mail readable.
+    if let Some(snippet) = snippet_from_parts(body.plain_text.as_deref(), body.html.as_deref())
+        && let Err(error) = store.set_snippet(message_id, &snippet)
+    {
+        log::warn!("update preview {message_id}: {error}");
+    }
     document
 }
 
@@ -2396,6 +2430,12 @@ fn build_conversation_detail(
         .map(|(index, message)| MessageSummary {
             id: message.id.clone(),
             sender: sender_display(&message.header.from),
+            sender_email: message
+                .header
+                .from
+                .first()
+                .map(|address| address.email.clone())
+                .unwrap_or_default(),
             to: sender_display(&message.header.to),
             date: message.header.date,
             snippet: message.snippet.clone(),

@@ -109,6 +109,17 @@ impl Pull<'_> {
         query.at_top.unwrap_or(true)
     }
 
+    /// The displacement the content is drawn with this frame. `draw` and
+    /// `update` must agree on it: the draw translates the content, so the
+    /// update has to translate pointer hit-testing by the same amount.
+    fn display_pull(&self, state: &State) -> f32 {
+        if self.refreshing {
+            self.palette.metrics.pull_threshold
+        } else {
+            state.pull
+        }
+    }
+
     fn begin(&self, state: &mut State, finger: Option<touch::Finger>, position: Point) {
         state.drag = Some(Drag {
             finger,
@@ -293,6 +304,17 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Pull<'_> {
             _ => {}
         }
 
+        // The content is drawn translated down by the pull, so hit-testing must
+        // see the finger at the same offset. Otherwise a tap during a refresh
+        // lands on the row above the one under the finger. While a pull is
+        // actively changing the offset the finger is dragging, not tapping, and
+        // this offset is constant (the refresh threshold).
+        let cursor = if self.refreshing {
+            cursor - Vector::new(0.0, self.palette.metrics.pull_threshold)
+        } else {
+            cursor
+        };
+
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -316,11 +338,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Pull<'_> {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State>();
-        let pull = if self.refreshing {
-            self.palette.metrics.pull_threshold
-        } else {
-            state.pull
-        };
+        let pull = self.display_pull(state);
         let bounds = layout.bounds();
 
         if pull <= 0.0 {
@@ -375,6 +393,12 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Pull<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
+        // Keep hover feedback on the same offset as the drawn content.
+        let cursor = if self.refreshing {
+            cursor - Vector::new(0.0, self.palette.metrics.pull_threshold)
+        } else {
+            cursor
+        };
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
             layout,
@@ -440,5 +464,104 @@ mod tests {
         let metrics = theme::palette(true).metrics;
         let pull = resistance(140.0, metrics.pull_limit);
         assert!(triggers(pull, metrics.pull_threshold), "{pull}");
+    }
+
+    mod hit_testing {
+        use super::*;
+        use iced::advanced::renderer::Headless;
+        use iced::widget::{button, column, container, scrollable, text};
+        use iced::{Fill, Size};
+
+        thread_local! {
+            static RENDERER: std::cell::OnceCell<&'static iced::Renderer> =
+                const { std::cell::OnceCell::new() };
+        }
+
+        /// One adapter per test thread, leaked so wgpu teardown cannot run during
+        /// thread-local destruction. Mirrors `elastic_scroll`'s harness.
+        fn with_renderer<T>(f: impl FnOnce(&iced::Renderer) -> T) -> T {
+            RENDERER.with(|cell| {
+                let renderer = *cell.get_or_init(|| {
+                    Box::leak(Box::new(
+                        futures::executor::block_on(<iced::Renderer as Headless>::new(
+                            iced::Font::DEFAULT,
+                            16.0.into(),
+                            None,
+                        ))
+                        .expect("headless wgpu adapter"),
+                    ))
+                });
+                f(renderer)
+            })
+        }
+
+        fn row(label: &str, message: Message) -> Element<'static, Message> {
+            button(container(text(label.to_string())).width(Fill).height(48.0))
+                .width(Fill)
+                .padding(0)
+                .on_press(message)
+                .into()
+        }
+
+        /// While refreshing, the pull wrapper draws the list shifted down by the
+        /// indicator offset. A tap must still open the row under the finger, so
+        /// hit-testing has to follow the same offset.
+        #[test]
+        #[ignore = "requires a headless wgpu adapter; run explicitly with --ignored"]
+        fn a_tap_while_refreshing_hits_the_row_under_the_finger() {
+            let mut rows = column!().width(Fill).spacing(0);
+            for (index, label) in ["A", "B", "C", "D"].iter().enumerate() {
+                rows = rows.push(row(label, Message::Toast(format!("r{index}"))));
+            }
+            let scroller: Element<'static, Message> =
+                scrollable(rows).width(Fill).height(Fill).into();
+            let mut element = wrap(scroller, true, Message::Refresh);
+            let mut tree = Tree::new(&element);
+            let node = with_renderer(|renderer| {
+                element.as_widget_mut().layout(
+                    &mut tree,
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(300.0, 200.0)),
+                )
+            });
+
+            let metrics = theme::palette(true).metrics;
+            // Visual centre of the second row: its layout bounds are [48, 96),
+            // drawn shifted down by the refresh offset.
+            let position = Point::new(150.0, 72.0 + metrics.pull_threshold);
+            let cursor = mouse::Cursor::Available(position);
+
+            let mut messages = Vec::new();
+            for event in [
+                Event::Touch(touch::Event::FingerPressed {
+                    id: touch::Finger(1),
+                    position,
+                }),
+                Event::Touch(touch::Event::FingerLifted {
+                    id: touch::Finger(1),
+                    position,
+                }),
+            ] {
+                let mut shell = Shell::new(&mut messages);
+                with_renderer(|renderer| {
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        cursor,
+                        renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut shell,
+                        &Rectangle::with_size(Size::new(300.0, 200.0)),
+                    );
+                });
+            }
+
+            let chosen = messages.iter().find_map(|message| match message {
+                Message::Toast(text) => Some(text.clone()),
+                _ => None,
+            });
+            assert_eq!(chosen.as_deref(), Some("r1"), "{messages:?}");
+        }
     }
 }

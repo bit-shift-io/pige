@@ -7,7 +7,7 @@ use iced::window;
 use iced::{Subscription, Task};
 use pige_core::account::AccountId;
 use pige_core::api::{self, AccountInput, ConfigOutcome, ModelSnapshot};
-use pige_core::mail::{FolderId, ThreadId};
+use pige_core::mail::{FolderId, FolderKind, ThreadId};
 use pige_core::platform::credentials_unavailable;
 use pige_core::settings::{Settings, ThemeMode};
 use tokio::sync::broadcast::error::RecvError;
@@ -87,16 +87,25 @@ impl App {
                     return snapshot_task(async move { api::load_older(&folder).await });
                 }
             }
-            Message::SyncNow | Message::Refresh => {
+            Message::SyncNow => {
                 return synced_with_prefetch(api::sync_all());
             }
-            Message::Synced(result) => match result {
-                Ok(snapshot) => {
-                    self.apply_snapshot(snapshot);
-                    return prefetch_task();
+            Message::Refresh => {
+                // Only a user pull shows the list's refresh indicator; a
+                // background or app-bar sync must not shift the list.
+                self.refreshing = true;
+                return synced_with_prefetch(api::sync_all());
+            }
+            Message::Synced(result) => {
+                self.refreshing = false;
+                match result {
+                    Ok(snapshot) => {
+                        self.apply_snapshot(snapshot);
+                        return prefetch_task();
+                    }
+                    Err(error) => return self.show_toast(error),
                 }
-                Err(error) => return self.show_toast(error),
-            },
+            }
             Message::OpenSearch => self.search_open = true,
             Message::CloseSearch => {
                 self.search_open = false;
@@ -153,7 +162,9 @@ impl App {
             Message::ToggleEarlier => self.reader_expanded = !self.reader_expanded,
             Message::ConversationBack => return self.reader_back(),
             Message::Back => {
-                if self.delete_confirm_open {
+                if self.reader_menu_open {
+                    self.reader_menu_open = false;
+                } else if self.delete_confirm_open {
                     self.delete_confirm_open = false;
                 } else if self.move_picker_open {
                     self.move_picker_open = false;
@@ -178,27 +189,83 @@ impl App {
                 }
             }
             Message::ArchiveConversation => {
+                self.reader_menu_open = false;
                 if let Some(thread) = self.open_thread() {
                     return snapshot_task(async move { api::archive_thread(&thread).await });
                 }
             }
             Message::TrashConversation => {
+                self.reader_menu_open = false;
                 if let Some(thread) = self.open_thread() {
                     return snapshot_task(async move { api::trash_thread(&thread).await });
                 }
             }
             Message::MarkUnread => {
+                self.reader_menu_open = false;
                 if let Some(thread) = self.open_thread() {
                     return snapshot_task(async move { api::set_read(&thread, false).await });
                 }
             }
-            Message::OpenMovePicker => self.move_picker_open = true,
+            Message::OpenMovePicker => {
+                self.reader_menu_open = false;
+                self.move_picker_open = true;
+            }
             Message::CloseMovePicker => self.move_picker_open = false,
             Message::MoveConversation(folder) => {
                 self.move_picker_open = false;
+                self.reader_menu_open = false;
                 if let Some(thread) = self.open_thread() {
                     return snapshot_task(async move { api::move_thread(&thread, &folder).await });
                 }
+            }
+            Message::OpenReaderMenu => self.reader_menu_open = true,
+            Message::CloseReaderMenu => self.reader_menu_open = false,
+            Message::ReportSpam => {
+                self.reader_menu_open = false;
+                let Some(detail) = self.snapshot.selected_conversation.as_ref() else {
+                    return Task::none();
+                };
+                let thread = detail.thread_id.clone();
+                let Some(junk) = self.junk_folder(&detail.account_id) else {
+                    return self.show_toast("This account has no spam folder.".to_string());
+                };
+                return snapshot_task(async move { api::move_thread(&thread, &junk).await });
+            }
+            Message::BlockSender => {
+                self.reader_menu_open = false;
+                let Some(detail) = self.snapshot.selected_conversation.as_ref() else {
+                    return Task::none();
+                };
+                let thread = detail.thread_id.clone();
+                let address = detail
+                    .messages
+                    .first()
+                    .map(|message| message.sender_email.clone())
+                    .unwrap_or_default();
+                if address.trim().is_empty() {
+                    return self
+                        .show_toast("This message has no sender address to block.".to_string());
+                }
+                let junk = self.junk_folder(&detail.account_id);
+                let confirmation = Task::done(Message::Toast(format!("Blocked {address}.")));
+                let action = Task::perform(
+                    async move {
+                        api::block_sender(&address)?;
+                        if let Some(junk) = junk {
+                            api::move_thread(&thread, &junk).await?;
+                        }
+                        Ok(api::snapshot())
+                    },
+                    |result| match result {
+                        Ok(snapshot) => Message::Snapshot(snapshot),
+                        Err(error) => Message::Error(error),
+                    },
+                );
+                return Task::batch([action, confirmation]);
+            }
+            Message::PrintConversation => {
+                self.reader_menu_open = false;
+                return self.show_toast("Printing isn't supported yet.".to_string());
             }
             Message::OpenDeleteConfirm => self.delete_confirm_open = true,
             Message::CancelDeleteConfirm => self.delete_confirm_open = false,
@@ -852,6 +919,19 @@ impl App {
             .map(|detail| detail.thread_id.clone())
     }
 
+    /// The account's spam folder, when it has one. Used by Report spam and
+    /// Block sender.
+    fn junk_folder(&self, account: &AccountId) -> Option<FolderId> {
+        self.snapshot
+            .sections
+            .iter()
+            .find(|section| &section.account_id == account)?
+            .folders
+            .iter()
+            .find(|folder| folder.kind == FolderKind::Junk)
+            .map(|folder| folder.id.clone())
+    }
+
     /// Return to the list, re-selecting the current view so the reader clears.
     fn reader_back(&mut self) -> Task<Message> {
         if self.snapshot.unified_selected {
@@ -897,8 +977,10 @@ impl App {
         } else {
             Subscription::none()
         };
-        Subscription::batch([
-            if self
+        // The spinner animates while a body loads and while any sync runs (the
+        // list app bar shows it in place of the refresh button).
+        let spinning = self.syncing()
+            || self
                 .snapshot
                 .selected_conversation
                 .as_ref()
@@ -906,8 +988,9 @@ impl App {
                     d.messages
                         .iter()
                         .any(|m| matches!(m.body, Some(api::MessageBody::Loading)))
-                })
-            {
+                });
+        Subscription::batch([
+            if spinning {
                 iced::time::every(Duration::from_millis(80)).map(|_| Message::Spin)
             } else {
                 Subscription::none()
@@ -1069,6 +1152,7 @@ mod tests {
                 messages: vec![api::MessageSummary {
                     id: pige_core::mail::MessageId(thread.into()),
                     sender: "Ada".into(),
+                    sender_email: "ada@example.com".into(),
                     to: "Me".into(),
                     date: 0,
                     snippet: String::new(),
@@ -1268,5 +1352,63 @@ mod tests {
         assert!(app.restore_picker.is_none());
         assert!(!app.settings.notifications, "restored settings must apply");
         assert!(app.toast.current.is_some(), "restore reports via toast");
+    }
+
+    #[test]
+    fn only_a_pull_sets_the_refresh_indicator_and_it_clears_on_sync() {
+        let mut app = App::for_test();
+
+        let _ = app.update(Message::SyncNow);
+        assert!(!app.refreshing, "an app-bar sync must not shift the list");
+
+        let _ = app.update(Message::Refresh);
+        assert!(app.refreshing, "a pull shows the indicator");
+
+        let _ = app.update(Message::Synced(Ok(ModelSnapshot::default())));
+        assert!(!app.refreshing, "the indicator clears when the sync ends");
+
+        let _ = app.update(Message::Refresh);
+        assert!(app.refreshing);
+        let _ = app.update(Message::Synced(Err("boom".to_string())));
+        assert!(!app.refreshing, "a failed sync still clears the indicator");
+    }
+
+    #[test]
+    fn back_closes_the_reader_overflow_menu_before_the_conversation() {
+        let mut app = App::for_test();
+        app.reader_menu_open = true;
+        let _ = app.update(Message::Back);
+        assert!(!app.reader_menu_open);
+    }
+
+    #[test]
+    fn junk_folder_resolves_the_accounts_spam_folder() {
+        use pige_core::api::{AccountSection, FolderSummary};
+
+        let mut app = App::for_test();
+        let account = AccountId("acc".into());
+        app.snapshot.sections = vec![AccountSection {
+            account_id: account.clone(),
+            label: "A".into(),
+            email: "a@example.com".into(),
+            unread: 0,
+            capabilities: Default::default(),
+            folders: vec![
+                FolderSummary {
+                    id: FolderId("inbox".into()),
+                    name: "Inbox".into(),
+                    kind: FolderKind::Inbox,
+                    unread: 0,
+                },
+                FolderSummary {
+                    id: FolderId("junk".into()),
+                    name: "Spam".into(),
+                    kind: FolderKind::Junk,
+                    unread: 0,
+                },
+            ],
+        }];
+        assert_eq!(app.junk_folder(&account), Some(FolderId("junk".into())));
+        assert_eq!(app.junk_folder(&AccountId("other".into())), None);
     }
 }

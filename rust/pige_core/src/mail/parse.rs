@@ -80,7 +80,24 @@ const SNIPPET_PARSE_BYTES: usize = 1024;
 pub fn snippet_from_message(bytes: &[u8]) -> Option<String> {
     let message = MessageParser::new().parse(bytes)?;
     let preview = message.body_preview(SNIPPET_PARSE_BYTES)?;
-    let text = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalize_snippet(&preview)
+}
+
+/// Build a readable one-line preview from already-decoded body parts. Plain
+/// text is preferred; an HTML-only body is reduced to its visible text. This
+/// is the same normalization [`snippet_from_message`] applies, for callers
+/// holding the cached `bodies` row rather than the raw message.
+pub fn snippet_from_parts(plain_text: Option<&str>, html: Option<&str>) -> Option<String> {
+    let text = plain_text
+        .filter(|text| !text.trim().is_empty())
+        .map(std::borrow::Cow::Borrowed)
+        .or_else(|| html.map(|html| std::borrow::Cow::Owned(mail_parser::html_to_text(html))))?;
+    normalize_snippet(&text)
+}
+
+/// Collapse whitespace to single spaces and cap the preview length.
+fn normalize_snippet(text: &str) -> Option<String> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let text: String = text.chars().take(SNIPPET_CHARS).collect();
     (!text.trim().is_empty()).then_some(text)
 }
@@ -400,6 +417,20 @@ mod tests {
     fn snippet_is_none_without_a_body() {
         let raw = b"From: a@example.com\r\nSubject: Empty\r\n\r\n";
         assert_eq!(snippet_from_message(raw), None);
+    }
+
+    #[test]
+    fn snippet_from_parts_prefers_plain_text_and_strips_html() {
+        assert_eq!(
+            snippet_from_parts(Some("  Hello   world\n"), Some("<p>ignored</p>")).as_deref(),
+            Some("Hello world")
+        );
+        assert_eq!(
+            snippet_from_parts(None, Some("<p>Hello <b>world</b></p>")).as_deref(),
+            Some("Hello world")
+        );
+        assert_eq!(snippet_from_parts(Some("   "), None), None);
+        assert_eq!(snippet_from_parts(None, None), None);
     }
 
     #[test]
