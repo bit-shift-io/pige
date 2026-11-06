@@ -688,6 +688,7 @@ mod tests {
         let result = AccountSaveResult {
             snapshot: ModelSnapshot::default(),
             warning: Some("session only".to_string()),
+            account_id: AccountId("acc".into()),
         };
         assert!(result.warning.as_deref() == Some("session only"));
     }

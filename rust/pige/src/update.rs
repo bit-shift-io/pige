@@ -331,9 +331,17 @@ impl App {
                     self.apply_snapshot(result.snapshot);
                     self.accounts.close_form();
                     self.accounts_open = false;
-                    if let Some(warning) = result.warning {
-                        return self.show_toast(warning);
-                    }
+                    let warning = result
+                        .warning
+                        .map(|warning| self.show_toast(warning))
+                        .unwrap_or_else(Task::none);
+                    let id = result.account_id;
+                    let sync_id = id.clone();
+                    let sync =
+                        Task::perform(async move { api::sync_account(&sync_id).await }, move |r| {
+                            Message::AccountSynced(id.clone(), r)
+                        });
+                    return Task::batch([warning, sync]);
                 }
                 Err(error) => {
                     if let Some(form) = self.accounts.form.as_mut() {
@@ -354,6 +362,16 @@ impl App {
                 }
                 self.accounts.confirm_remove = Some(id);
             }
+            Message::AccountSynced(id, result) => match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    return prefetch_task();
+                }
+                Err(error) => {
+                    log::warn!("first sync {id}: {error}");
+                    return self.show_toast(format!("First sync failed: {error}"));
+                }
+            },
             Message::AccountRemoveConfirmed(id) => {
                 self.accounts.confirm_remove = None;
                 return Task::perform(
@@ -902,9 +920,7 @@ impl App {
     }
 }
 
-/// Test, then create or update, then kick off the first sync. The account is
-/// saved even if the first sync fails, but the failure becomes a warning so the
-/// user knows the mailbox has no mail yet.
+/// Validate and save only. AccountSaved schedules the first sync separately.
 async fn save_account(
     editing: Option<AccountId>,
     input: AccountInput,
@@ -934,14 +950,11 @@ async fn save_account(
         },
     };
 
-    if let Err(error) = api::sync_account(&id).await {
-        warning = Some(match warning {
-            Some(warning) => format!("{warning} The first sync failed: {error}"),
-            None => format!("Account saved, but the first sync failed: {error}"),
-        });
-    }
-
-    Ok(AccountSaveResult { snapshot, warning })
+    Ok(AccountSaveResult {
+        snapshot,
+        warning,
+        account_id: id,
+    })
 }
 
 /// Map the OS theme preference to the shell's dark flag. `None` (the platform
@@ -1019,13 +1032,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_saved_account_closes_the_dialog_and_schedules_the_first_sync() {
+        let mut app = App::for_test();
+        app.accounts_open = true;
+        app.accounts.start_new();
+        let task = app.update(Message::AccountSaved(Ok(AccountSaveResult {
+            snapshot: ModelSnapshot::default(),
+            warning: None,
+            account_id: AccountId("acc".into()),
+        })));
+        assert!(app.accounts.form.is_none());
+        assert!(!app.accounts_open);
+        assert!(task.units() > 0, "first sync is scheduled");
+    }
+
+    #[test]
+    fn a_failed_first_sync_reports_a_toast_and_keeps_the_account() {
+        let mut app = App::for_test();
+        let before = app.snapshot.clone();
+        let _ = app.update(Message::AccountSynced(
+            AccountId("acc".into()),
+            Err("offline".into()),
+        ));
+        assert_eq!(app.snapshot, before);
+        assert!(
+            app.toast
+                .current
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("First sync failed")
+        );
+    }
+
+    #[test]
+    fn a_rejected_account_keeps_the_dialog_open_for_editing() {
+        let mut app = App::for_test();
+        app.accounts_open = true;
+        app.accounts.start_new();
+        let _ = app.update(Message::AccountSaved(Err("bad credentials".into())));
+        assert!(app.accounts.form.is_some());
+        assert!(app.accounts_open);
+    }
+
+    #[test]
     fn successful_sync_applies_snapshot_and_schedules_separate_prefetch() {
         let mut app = App::for_test();
-        let mut snapshot = ModelSnapshot::default();
-        snapshot.unified_inbox_unread = 7;
+        let snapshot = ModelSnapshot {
+            unified_inbox_unread: 7,
+            ..ModelSnapshot::default()
+        };
         let task = app.update(Message::Synced(Ok(snapshot)));
         assert_eq!(app.snapshot.unified_inbox_unread, 7);
-        assert!(task.units() > 0, "prefetch is scheduled after applying mail");
+        assert!(
+            task.units() > 0,
+            "prefetch is scheduled after applying mail"
+        );
     }
 
     #[test]

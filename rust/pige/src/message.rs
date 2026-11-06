@@ -17,12 +17,13 @@ use crate::screens::advanced::Row as AdvancedRow;
 use crate::screens::compose::{ComposeField, ComposeSeed};
 
 /// The successful result of saving an account. `warning` carries the
-/// session-only credential notice or a failed first sync; it is shown in the
+/// session-only credential notice; it is shown in the
 /// shell toast after the account screen closes.
 #[derive(Debug, Clone)]
 pub struct AccountSaveResult {
     pub snapshot: ModelSnapshot,
     pub warning: Option<String>,
+    pub account_id: AccountId,
 }
 
 /// A password in flight through the update loop. Its `Debug` implementation
@@ -72,6 +73,7 @@ pub enum Message {
     SyncNow,
     /// A user-facing sync finished; successful syncs schedule quiet prefetch.
     Synced(Result<ModelSnapshot, String>),
+    AccountSynced(AccountId, Result<ModelSnapshot, String>),
     /// Pull-to-refresh from the list.
     Refresh,
     /// The search field changed.
