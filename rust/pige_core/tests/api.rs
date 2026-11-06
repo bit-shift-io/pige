@@ -1053,6 +1053,68 @@ async fn snapshot_reads_are_consistent_during_writes() {
 }
 
 #[tokio::test]
+async fn a_slow_open_does_not_overwrite_a_newer_one() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let store = harness.open_store();
+    let mut pending = Vec::new();
+    // Three overlapping taps, resolved in reverse order.
+    for name in ["a", "b", "c"] {
+        let snapshot = api::add_account(input(name, &format!("{name}@example.com"))).await.unwrap();
+        let account = snapshot.accounts.iter().find(|a| a.email == format!("{name}@example.com")).unwrap().id.clone();
+        let inbox = folder(&format!("{name}-inbox"), &account, "INBOX", FolderKind::Inbox, 0);
+        store.upsert_folder(&inbox).unwrap();
+        seed_conversation(&store, &inbox, 1, 1, name, &format!("thread-{name}"));
+        let started = Arc::new(Semaphore::new(0));
+        let pause = Arc::new(Semaphore::new(0));
+        harness.factory.add_transport(account, FakeTransport {
+            bodies: HashMap::from([("INBOX".into(), HashMap::from([(Uid(1), format!("Subject: {name}\r\n\r\nbody {name}").into_bytes())]))]),
+            fetch_body_started: Some(started.clone()),
+            fetch_body_pause: Some(pause.clone()),
+            ..FakeTransport::default()
+        });
+        let thread = ThreadId(format!("thread-{name}"));
+        let open = tokio::spawn(async move { api::open_conversation(&thread).await });
+        let _ = started.acquire().await.unwrap();
+        pending.push((pause, open));
+    }
+    for (pause, open) in pending.into_iter().rev() {
+        pause.add_permits(1);
+        let result = open.await.unwrap().unwrap();
+        assert_eq!(result.selected_conversation.unwrap().thread_id, ThreadId("thread-c".into()));
+    }
+    for name in ["a", "b", "c"] {
+        assert!(store.body(&MessageId(format!("{name}-inbox-message-1"))).unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn leaving_invalidates_an_in_flight_open() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com")).await.unwrap().accounts[0].id.clone();
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    seed_conversation(&store, &inbox, 1, 1, "A", "thread-a");
+    let started = Arc::new(Semaphore::new(0));
+    let pause = Arc::new(Semaphore::new(0));
+    harness.factory.add_transport(account, FakeTransport {
+        bodies: HashMap::from([("INBOX".into(), HashMap::from([(Uid(1), b"Subject: A\r\n\r\nalpha".to_vec())]))]),
+        fetch_body_started: Some(started.clone()),
+        fetch_body_pause: Some(pause.clone()),
+        ..FakeTransport::default()
+    });
+    let open = tokio::spawn(async { api::open_conversation(&ThreadId("thread-a".into())).await });
+    let _ = started.acquire().await.unwrap();
+    api::select_unified().await.unwrap();
+    pause.add_permits(1);
+    let result = open.await.unwrap().unwrap();
+    assert!(result.selected_conversation.is_none(), "a stale open must not resurrect selection");
+    assert!(store.body(&MessageId("inbox-message-1".into())).unwrap().is_some());
+}
+
+#[tokio::test]
 async fn open_conversation_shows_loading_before_the_body_arrives() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();

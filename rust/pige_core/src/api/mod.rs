@@ -214,6 +214,7 @@ struct AppState {
     unified_selected: bool,
     conversation_limit: u32,
     selected_conversation: Option<ConversationDetail>,
+    open_generation: u64,
     /// Last search query, scope, results, and the generation used to reject
     /// slower completions from an older query.
     search: SearchState,
@@ -262,6 +263,10 @@ impl SearchState {
 }
 
 impl AppState {
+    fn invalidate_open(&mut self) {
+        self.open_generation = self.open_generation.wrapping_add(1);
+    }
+
     /// Replace the account list, persisting the document first and then
     /// rebuilding the SQLite mirror. A failure leaves the in-memory document
     /// exactly as it was, so the UI cannot show an account the disk does not
@@ -488,6 +493,7 @@ pub fn init(config: Config) -> Result<(), String> {
         unified_selected: false,
         conversation_limit: INITIAL_PAGE,
         selected_conversation: None,
+        open_generation: 0,
         search: SearchState::default(),
         server_more: None,
         capabilities: HashMap::new(),
@@ -759,6 +765,7 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
     }
 
     state.selected_folder = None;
+    state.invalidate_open();
     state.selected_conversation = None;
     state.server_more = None;
     state.conversation_limit = INITIAL_PAGE;
@@ -827,6 +834,7 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
     }
 
     state.selected_folder = None;
+    state.invalidate_open();
     state.selected_conversation = None;
     state.server_more = None;
     state.conversation_limit = INITIAL_PAGE;
@@ -1169,6 +1177,7 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
         if !selected_still_exists {
             state.selected_folder = None;
         }
+        state.invalidate_open();
         state.selected_conversation = None;
         state.server_more = None;
         state.conversation_limit = INITIAL_PAGE;
@@ -1402,6 +1411,7 @@ pub async fn select_folder(id: &FolderId) -> Result<ModelSnapshot, String> {
         state.selected_folder = Some(id.clone());
         state.unified_selected = false;
         state.conversation_limit = INITIAL_PAGE;
+        state.invalidate_open();
         state.selected_conversation = None;
         state.server_more = None;
         let needs_sync = locate_folder(&state.store, id).is_ok_and(|(_, folder)| {
@@ -1435,6 +1445,7 @@ pub async fn select_unified() -> Result<ModelSnapshot, String> {
         state.selected_folder = None;
         state.unified_selected = true;
         state.conversation_limit = INITIAL_PAGE;
+        state.invalidate_open();
         state.selected_conversation = None;
         state.server_more = None;
         sender = state.events.clone();
@@ -1457,6 +1468,7 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
         if state.selected_folder.as_ref() != Some(folder) {
             state.selected_folder = Some(folder.clone());
             state.conversation_limit = INITIAL_PAGE;
+            state.invalidate_open();
             state.selected_conversation = None;
             state.server_more = None;
         }
@@ -1572,7 +1584,7 @@ pub async fn load_older_unified() -> Result<ModelSnapshot, String> {
 /// `body: None` so the reader always renders its chrome even offline.
 pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
     // Phase 1: read the conversation, its cached body, and the fetch decision.
-    let (messages, config, account, folder, cached, too_large, events, initial) = {
+    let (messages, config, account, folder, cached, too_large, events, initial, generation) = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
@@ -1603,6 +1615,8 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             .body(&messages[0].id)
             .map_err(|error| format!("read cached body: {error}"))?;
         let too_large = messages[0].header.size > MAX_BODY_BYTES;
+        state.invalidate_open();
+        let generation = state.open_generation;
         let body = if too_large {
             Some(MessageBody::TooLarge)
         } else if let Some(cached) = &cached {
@@ -1627,6 +1641,7 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             too_large,
             state.events.clone(),
             initial,
+            generation,
         )
     };
     let _ = events.send(CoreEvent::SnapshotChanged);
@@ -1661,6 +1676,9 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             fetched.as_deref(),
             too_large,
         );
+        if generation != state.open_generation {
+            return Ok(state.build_snapshot());
+        }
         state.selected_conversation = Some(conversation_detail_from_store(
             &state.store,
             thread_id,
