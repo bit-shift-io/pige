@@ -30,6 +30,7 @@ fn account() -> Account {
         },
         auth: AuthKind::Password,
         sort_order: 3,
+        color: None,
     }
 }
 

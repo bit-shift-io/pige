@@ -37,6 +37,7 @@ fn account(id: &str, email: &str, order: i64) -> Account {
         },
         auth: AuthKind::Password,
         sort_order: order,
+        color: None,
     }
 }
 

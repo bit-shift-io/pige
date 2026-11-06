@@ -10,8 +10,10 @@ use crate::mail::{
 use crate::store::{Store, StoreError};
 use crate::transport::{MailTransport, RemoteFolder, RemoteMessage, TransportError, UidRange};
 
-/// How many bytes of text to fetch per message to fill snippets.
-const SNIPPET_BYTES: usize = 2048;
+/// How many bytes of each message to fetch to fill snippets. The prefix
+/// includes the MIME headers, and multipart mail can put its text part behind
+/// a sizable header block and an HTML sibling.
+const SNIPPET_BYTES: usize = 8192;
 /// How many of the newest messages get snippets filled each sync.
 const SNIPPET_COUNT: usize = 100;
 

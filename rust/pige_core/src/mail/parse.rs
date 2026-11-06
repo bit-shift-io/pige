@@ -64,6 +64,27 @@ pub fn parse_header_block(bytes: &[u8]) -> Result<MessageHeader, ParseError> {
     })
 }
 
+/// Maximum number of characters kept in a list preview.
+const SNIPPET_CHARS: usize = 160;
+/// Bytes requested from the parser before the preview is normalized. Larger
+/// than [`SNIPPET_CHARS`] so encoded words and HTML markup have room to decode.
+const SNIPPET_PARSE_BYTES: usize = 1024;
+
+/// Build a readable one-line preview from a raw message.
+///
+/// `bytes` may be a message prefix rather than a complete message, as fetched
+/// by the IMAP snippet request. The parser decodes transfer encodings and
+/// charsets; HTML-only mail is reduced to its visible text. Runs of whitespace
+/// collapse to a single space and the result is capped at [`SNIPPET_CHARS`].
+/// Returns `None` when the message has no readable body text.
+pub fn snippet_from_message(bytes: &[u8]) -> Option<String> {
+    let message = MessageParser::new().parse(bytes)?;
+    let preview = message.body_preview(SNIPPET_PARSE_BYTES)?;
+    let text = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text: String = text.chars().take(SNIPPET_CHARS).collect();
+    (!text.trim().is_empty()).then_some(text)
+}
+
 /// Decode RFC 2047 encoded words in an unstructured header value.
 pub fn decode_rfc2047(input: &str) -> String {
     HeaderForm::Text
@@ -352,5 +373,41 @@ mod tests {
         assert_eq!(normalized_subject("[URGENT] Outage"), "[urgent] outage");
         assert_eq!(normalized_subject("[ANN] New release"), "[ann] new release");
         assert_eq!(normalized_subject("   "), "");
+    }
+
+    #[test]
+    fn snippet_decodes_quoted_printable_and_collapses_whitespace() {
+        let raw = b"From: a@example.com\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20world=21\r\n\r\nSecond   line";
+        assert_eq!(
+            snippet_from_message(raw).as_deref(),
+            Some("Hello world! Second line")
+        );
+    }
+
+    #[test]
+    fn snippet_decodes_base64_text() {
+        let raw = b"From: a@example.com\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nSGVsbG8gd29ybGQh\r\n";
+        assert_eq!(snippet_from_message(raw).as_deref(), Some("Hello world!"));
+    }
+
+    #[test]
+    fn snippet_extracts_visible_text_from_html_only_mail() {
+        let raw = b"From: a@example.com\r\nContent-Type: text/html\r\n\r\n<p>Hello <b>world</b></p><script>bad()</script>";
+        assert_eq!(snippet_from_message(raw).as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn snippet_is_none_without_a_body() {
+        let raw = b"From: a@example.com\r\nSubject: Empty\r\n\r\n";
+        assert_eq!(snippet_from_message(raw), None);
+    }
+
+    #[test]
+    fn snippet_caps_long_previews() {
+        let body = "word ".repeat(200);
+        let raw = format!("From: a@example.com\r\nContent-Type: text/plain\r\n\r\n{body}");
+        let snippet = snippet_from_message(raw.as_bytes()).expect("snippet");
+        assert!(snippet.chars().count() <= 160);
+        assert!(snippet.starts_with("word word"));
     }
 }

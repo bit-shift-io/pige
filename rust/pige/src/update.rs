@@ -60,6 +60,7 @@ impl App {
                 }
             }
             Message::Insets(insets) => self.insets = insets,
+            Message::SystemScale(scale) => self.apply_system_scale(scale),
             Message::Spin => self.spin_phase = self.spin_phase.wrapping_add(1),
             Message::Tick => {
                 // Keep SQLite work off the UI thread; the executor produces a
@@ -96,6 +97,12 @@ impl App {
                 }
                 Err(error) => return self.show_toast(error),
             },
+            Message::OpenSearch => self.search_open = true,
+            Message::CloseSearch => {
+                self.search_open = false;
+                self.search.clear();
+                self.search_results.clear();
+            }
             Message::SearchChanged(query) => {
                 self.search = query;
                 return self.run_search();
@@ -164,6 +171,10 @@ impl App {
                     self.drawer_open = false;
                 } else if self.snapshot.selected_conversation.is_some() {
                     return self.reader_back();
+                } else if self.search_open {
+                    self.search_open = false;
+                    self.search.clear();
+                    self.search_results.clear();
                 }
             }
             Message::ArchiveConversation => {
@@ -408,6 +419,20 @@ impl App {
                     self.apply_snapshot(snapshot);
                     self.accounts.open(&self.snapshot);
                     self.accounts.notice = Some("Account label updated.".to_string());
+                }
+                Err(error) => return self.show_toast(error),
+            },
+            Message::SetAccountColor(id, color) => {
+                return Task::perform(
+                    async move { api::set_account_color(&id, &color).await },
+                    Message::AccountColorSet,
+                );
+            }
+            Message::AccountColorSet(result) => match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    self.accounts.open(&self.snapshot);
+                    self.accounts.notice = Some("Account colour updated.".to_string());
                 }
                 Err(error) => return self.show_toast(error),
             },
@@ -894,6 +919,8 @@ impl App {
             // of the status bar, navigation bar, cutout, and soft keyboard.
             // Other platforms return an empty subscription.
             iced_android::insets().map(Message::Insets),
+            // Android reports the user's font-size setting; desktop emits none.
+            iced_android::system_scale().map(Message::SystemScale),
             Subscription::run(core_events),
             iced::time::every(Duration::from_secs(30)).map(|_| Message::Tick),
             // Android 13+ stops calling `onBackPressed` once
@@ -1129,6 +1156,32 @@ mod tests {
             task.units() > 0,
             "prefetch is scheduled after applying mail"
         );
+    }
+
+    #[test]
+    fn search_starts_hidden_and_closing_it_clears_the_query() {
+        let mut app = App::for_test();
+        assert!(!app.search_open);
+
+        let _ = app.update(Message::OpenSearch);
+        assert!(app.search_open);
+
+        app.search = "invoice".into();
+        let _ = app.update(Message::CloseSearch);
+        assert!(!app.search_open);
+        assert!(app.search.is_empty());
+        assert!(app.search_results.is_empty());
+    }
+
+    #[test]
+    fn back_closes_search_before_leaving_the_list() {
+        let mut app = App::for_test();
+        app.search_open = true;
+        app.search = "invoice".into();
+
+        let _ = app.update(Message::Back);
+        assert!(!app.search_open);
+        assert!(app.search.is_empty());
     }
 
     #[test]

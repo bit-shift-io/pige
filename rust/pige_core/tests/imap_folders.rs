@@ -60,6 +60,7 @@ async fn lists_folders_against_a_real_server() {
         },
         auth: AuthKind::Password,
         sort_order: 0,
+        color: None,
     };
 
     let mut transport = connect(&account, &password)

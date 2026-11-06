@@ -9,14 +9,16 @@ use iced::{Element, Fill};
 use pige_core::api::ModelSnapshot;
 use pige_core::search::SearchScope;
 
-use crate::app::{App, account_for_folder, search_row_view};
+use crate::app::{App, account_color, account_for_folder, search_row_view};
 use crate::components;
+use crate::icons;
 use crate::message::Message;
 use crate::theme;
 
-/// Whether the list should show search results instead of recent mail.
+/// Whether the list should show search results instead of recent mail. A
+/// closed search never shows results, even if an old query is still stored.
 pub fn is_active(app: &App) -> bool {
-    !app.search.trim().is_empty()
+    app.search_open && !app.search.trim().is_empty()
 }
 
 /// The query field and, once a query exists, the cycling scope chip. The shell
@@ -33,6 +35,11 @@ pub fn controls<'a>(app: &'a App) -> Element<'a, Message> {
     if is_active(app) {
         controls = controls.push(scope_chip(app));
     }
+    controls = controls.push(components::icon_button(
+        icons::CLOSE,
+        "Close search",
+        Message::CloseSearch,
+    ));
     controls.into()
 }
 
@@ -94,7 +101,7 @@ pub fn results<'a>(app: &'a App) -> Element<'a, Message> {
     let mut rows = column![].spacing(0).width(Fill);
     for hit in &app.search_results {
         rows = rows.push(components::list_row(
-            search_row_view(hit),
+            search_row_view(hit, account_color(&app.snapshot, &hit.account_id)),
             Message::OpenConversation(hit.thread_id.clone()),
         ));
     }

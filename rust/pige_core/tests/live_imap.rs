@@ -73,6 +73,7 @@ fn live_account(user: &str, imap_host: &str, smtp_host: &str) -> Account {
         },
         auth: AuthKind::Password,
         sort_order: 0,
+        color: None,
     }
 }
 

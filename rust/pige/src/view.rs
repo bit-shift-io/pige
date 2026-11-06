@@ -6,7 +6,6 @@ use iced::{Alignment, Element, Fill};
 
 use crate::app::App;
 use crate::components::{self, PaneTone};
-use crate::icons;
 use crate::layout::{Breakpoint, Panes, panes_for};
 use crate::message::Message;
 use crate::theme;
@@ -90,29 +89,13 @@ impl App {
             layout = layout.push(self.reader_pane());
         }
 
-        let base: Element<'_, Message> = container(layout)
+        // Compose lives in the app bar on every width; a floating button would
+        // cover the newest message and duplicate that action.
+        container(layout)
             .width(Fill)
             .height(Fill)
             .style(components::pane_style(PaneTone::Page))
-            .into();
-
-        // The spec asks for a floating compose button on compact layouts; wide
-        // layouts keep the toolbar compose button instead.
-        if breakpoint == Breakpoint::Compact && panes.list {
-            let palette = theme::active();
-            let fab = container(components::floating_action_button(
-                icons::EDIT,
-                "Compose",
-                Message::Compose,
-            ))
-            .width(Fill)
-            .height(Fill)
-            .padding(palette.space.lg)
-            .align_x(Alignment::End)
-            .align_y(Alignment::End);
-            return stack![base, fab].into();
-        }
-        base
+            .into()
     }
 
     fn reader_pane(&self) -> Element<'_, Message> {

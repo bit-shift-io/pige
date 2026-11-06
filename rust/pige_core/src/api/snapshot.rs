@@ -16,6 +16,8 @@ pub struct AccountSummary {
     pub email: String,
     /// Every unread message cached for this account (all folders).
     pub unread: u32,
+    /// Resolved `#rrggbb` accent colour used to tag the account in the UI.
+    pub color: String,
 }
 
 /// One account's expandable folder group.

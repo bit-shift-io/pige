@@ -7,7 +7,7 @@ use base64::Engine as _;
 use futures::TryStreamExt;
 
 use crate::account::Account;
-use crate::mail::{Flags, FolderKind, Uid};
+use crate::mail::{Flags, FolderKind, Uid, snippet_from_message};
 use crate::transport::{
     Capabilities, FlagOp, FolderState, MailTransport, RemoteFolder, RemoteMessage, TransportError,
     UidRange,
@@ -180,7 +180,10 @@ impl MailTransport for ImapTransport {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let query = format!("(BODY.PEEK[TEXT]<0.{max_bytes}>)");
+        // Fetch a prefix of the whole message, not just the text section: the
+        // snippet decoder needs the MIME headers to undo base64/quoted-printable
+        // encoding and to find the text part of a multipart message.
+        let query = format!("(BODY.PEEK[]<0.{max_bytes}>)");
         let stream = self
             .session
             .uid_fetch(uid_set(uids), query)
@@ -191,8 +194,10 @@ impl MailTransport for ImapTransport {
         let mut texts = Vec::new();
         while let Some(fetch) = stream.try_next().await.map_err(transport_err)? {
             let Some(uid) = fetch.uid else { continue };
-            if let Some(text) = fetch.text() {
-                texts.push((Uid(uid), String::from_utf8_lossy(text).into_owned()));
+            if let Some(body) = fetch.body()
+                && let Some(snippet) = snippet_from_message(body)
+            {
+                texts.push((Uid(uid), snippet));
             }
         }
         Ok(texts)

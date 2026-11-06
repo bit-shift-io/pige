@@ -76,6 +76,10 @@ pub enum Message {
     AccountSynced(AccountId, Result<ModelSnapshot, String>),
     /// Pull-to-refresh from the list.
     Refresh,
+    /// Reveal the search field under the app bar.
+    OpenSearch,
+    /// Hide search and clear its query and results.
+    CloseSearch,
     /// The search field changed.
     SearchChanged(String),
     /// The user cycled the search scope chip.
@@ -185,6 +189,8 @@ pub enum Message {
     SettingsSaved(Result<(), String>),
     /// The operating system reported its light/dark preference.
     SystemTheme(iced::theme::Mode),
+    /// The Android system font scale changed.
+    SystemScale(f32),
     /// The account screen is open.
     OpenAccounts,
     CloseAccounts,
@@ -208,6 +214,9 @@ pub enum Message {
     AccountLabelDraft(AccountId, String),
     AccountLabelCommit(AccountId),
     AccountLabelRenamed(Result<ModelSnapshot, String>),
+    /// Choose a new accent colour for an account.
+    SetAccountColor(AccountId, String),
+    AccountColorSet(Result<ModelSnapshot, String>),
     Error(String),
     /// A brief result message for the shared toast.
     Toast(String),

@@ -43,6 +43,9 @@ pub fn run() -> iced::Result {
             }
         })
         .subscription(App::subscription)
+        // Multiply every logical unit by the Android system font scale. The
+        // shell divides its logical size in step so breakpoints stay stable.
+        .scale_factor(|app: &App, _| app.scale)
         .default_font(fonts::DEFAULT_FONT);
 
     for font in fonts::all() {

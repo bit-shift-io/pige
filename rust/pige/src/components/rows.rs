@@ -24,6 +24,8 @@ pub struct ListRow {
     pub unread: bool,
     pub has_attachment: bool,
     pub count: u32,
+    /// The account's accent colour, drawn as a block behind the avatar.
+    pub account_color: Option<Color>,
 }
 
 /// The icon a navigation folder draws.
@@ -139,25 +141,27 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
     let sender_color = if item.unread { primary } else { secondary };
     let subject_color = if item.unread { primary } else { secondary };
 
-    let mut top = row![label::fitted(
-        item.sender.clone(),
-        sender_style,
-        sender_color,
-        false,
-        None
-    )]
-    .align_y(iced::Alignment::Center)
-    .spacing(palette.space.xs);
-
+    // Date sits at the top right, with the paperclip directly beneath it, so
+    // attachments are readable without stealing room from the sender line.
+    let mut date_column = column![styled_text(item.date.clone(), date_style, secondary)]
+        .align_x(iced::Alignment::End)
+        .spacing(0.0);
     if item.has_attachment {
-        top = top.push(
+        date_column = date_column.push(
             iced::widget::text(icons::glyph(icons::ATTACH_FILE))
                 .font(icons::FONT)
                 .size(palette.metrics.small_icon_size)
                 .color(secondary),
         );
     }
-    top = top.push(styled_text(item.date.clone(), date_style, secondary));
+
+    let top = row![
+        label::fitted(item.sender.clone(), sender_style, sender_color, false, None),
+        date_column,
+    ]
+    .align_y(iced::Alignment::Start)
+    .spacing(palette.space.xs)
+    .width(Fill);
 
     let mut trailing = column![]
         .width(palette.space.lg)
@@ -183,18 +187,32 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
     .spacing(0)
     .width(Fill);
 
-    let content = row![
-        avatar::avatar(
-            &item.initials,
-            item.avatar_color,
-            palette.metrics.avatar_size
-        ),
-        lines,
-        trailing,
-    ]
-    .spacing(palette.space.md)
-    .align_y(iced::Alignment::Center)
-    .width(Fill);
+    let avatar = avatar::avatar(
+        &item.initials,
+        item.avatar_color,
+        palette.metrics.avatar_size,
+    );
+    // A rounded block behind the circular avatar keeps accounts visually
+    // distinct even when two senders hash to the same avatar colour.
+    let avatar: Element<'a, Message> = match item.account_color {
+        Some(color) => {
+            let block = palette.metrics.avatar_size + palette.space.xs * 2.0;
+            container(avatar)
+                .padding(palette.space.xs)
+                .style(move |_| container::Style {
+                    background: Some(color.into()),
+                    border: iced::border::rounded(block / 2.0),
+                    ..Default::default()
+                })
+                .into()
+        }
+        None => avatar,
+    };
+
+    let content = row![avatar, lines, trailing,]
+        .spacing(palette.space.md)
+        .align_y(iced::Alignment::Center)
+        .width(Fill);
 
     let background = if item.unread {
         palette.surface_container
@@ -358,6 +376,7 @@ mod tests {
             unread: true,
             has_attachment: true,
             count: 3,
+            account_color: Some(Color::from_rgb8(0x00, 0x89, 0x7b)),
         };
         assert_eq!(row.count, 3);
         assert!(row.unread);

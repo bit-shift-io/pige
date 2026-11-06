@@ -414,6 +414,19 @@ const METRICS: Metrics = Metrics {
     pull_indicator_height: 4.0,
 };
 
+/// Parse a `#rrggbb` accent colour. Anything else, including a missing `#` or
+/// short/long forms, is rejected so a corrupt config cannot paint junk.
+pub fn parse_hex_color(value: &str) -> Option<Color> {
+    let digits = value.strip_prefix('#')?;
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let red = u8::from_str_radix(&digits[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&digits[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&digits[4..6], 16).ok()?;
+    Some(Color::from_rgb8(red, green, blue))
+}
+
 /// Resolves either complete Material 3 scheme.
 pub const fn palette(dark: bool) -> Palette {
     if dark { DARK } else { LIGHT }
@@ -514,6 +527,17 @@ mod tests {
         let p = palette(true);
         assert_eq!(p.on_color(Color::WHITE), Color::from_rgb8(0x1d, 0x1b, 0x20));
         assert_eq!(p.on_color(Color::BLACK), Color::from_rgb8(0xff, 0xff, 0xff));
+    }
+
+    #[test]
+    fn account_hex_colours_parse_and_reject_junk() {
+        assert_eq!(
+            parse_hex_color("#7c4dff"),
+            Some(Color::from_rgb8(0x7c, 0x4d, 0xff))
+        );
+        assert_eq!(parse_hex_color("7c4dff"), None);
+        assert_eq!(parse_hex_color("#xyzxyz"), None);
+        assert_eq!(parse_hex_color("#12345"), None);
     }
 
     #[test]

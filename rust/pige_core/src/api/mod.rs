@@ -20,7 +20,9 @@ use futures::StreamExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 
-use crate::account::{Account, AccountId, AuthKind, ServerConfig};
+use crate::account::{
+    Account, AccountId, AuthKind, ServerConfig, default_account_color, is_supported_account_color,
+};
 use crate::config::{self, ConfigDocument};
 use crate::html::{MailDocument, parse_html, plain_text_document};
 use crate::mail::{
@@ -199,6 +201,7 @@ impl AccountInput {
             smtp: self.smtp,
             auth: AuthKind::Password,
             sort_order,
+            color: Some(default_account_color(sort_order).to_string()),
         }
     }
 }
@@ -356,6 +359,15 @@ impl AppState {
         let mut sections = Vec::with_capacity(view.sections.len());
         let mut unified_inbox_unread = 0;
 
+        // The SQLite account mirror does not carry presentation-only fields, so
+        // resolve colours from the authoritative configuration document.
+        let account_colors: HashMap<&str, &str> = self
+            .config_doc
+            .accounts
+            .iter()
+            .map(|account| (account.id.0.as_str(), account.resolved_color()))
+            .collect();
+
         for section in view.sections {
             let mut section_unread = 0;
             let mut folder_summaries = Vec::with_capacity(section.folders.len());
@@ -377,6 +389,11 @@ impl AppState {
                 label: section.account.label.clone(),
                 email: section.account.email.clone(),
                 unread: section_unread,
+                color: account_colors
+                    .get(section.account.id.0.as_str())
+                    .copied()
+                    .unwrap_or_else(|| section.account.resolved_color())
+                    .to_string(),
             });
             sections.push(AccountSection {
                 account_id: section.account.id.clone(),
@@ -1060,7 +1077,13 @@ async fn update_account_inner(
                 .map_err(|error| format!("store password: {error}"))?;
         }
 
-        let account = input.into_account(id.clone(), existing.sort_order);
+        let mut account = input.into_account(id.clone(), existing.sort_order);
+        // Editing connection details must not silently reset a colour the user
+        // picked. Only fall back to the default when the old account had none.
+        account.color = existing
+            .color
+            .clone()
+            .or_else(|| Some(default_account_color(existing.sort_order).to_string()));
         let mut next = state.config_doc.accounts.clone();
         if let Some(slot) = next.iter_mut().find(|candidate| &candidate.id == id) {
             *slot = account;
@@ -1113,6 +1136,37 @@ pub async fn rename_account(id: &AccountId, label: &str) -> Result<ModelSnapshot
             .find(|account| &account.id == id)
             .ok_or_else(|| format!("unknown account {id}"))?;
         account.label = label.to_string();
+        state.replace_accounts(next)?;
+        state.ensure_selection();
+        sender = state.events.clone();
+        snapshot = state.build_snapshot();
+    }
+
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(snapshot)
+}
+
+/// Change only an account's accent colour. The value must come from
+/// [`crate::account::ACCOUNT_COLORS`], so snapshots always contain a colour the
+/// UI knows how to parse.
+pub async fn set_account_color(id: &AccountId, color: &str) -> Result<ModelSnapshot, String> {
+    if !is_supported_account_color(color) {
+        return Err(format!("unsupported account colour: {color}"));
+    }
+
+    let sender;
+    let snapshot;
+    {
+        let mut guard = lock_state();
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let mut next = state.config_doc.accounts.clone();
+        let account = next
+            .iter_mut()
+            .find(|account| &account.id == id)
+            .ok_or_else(|| format!("unknown account {id}"))?;
+        account.color = Some(color.to_string());
         state.replace_accounts(next)?;
         state.ensure_selection();
         sender = state.events.clone();

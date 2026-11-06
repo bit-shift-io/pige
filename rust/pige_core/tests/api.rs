@@ -230,6 +230,55 @@ async fn add_account_appears_in_snapshot_with_no_folders() {
 }
 
 #[tokio::test]
+async fn account_colors_are_persisted_and_exposed_in_snapshots() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let snapshot = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let id = snapshot.accounts[0].id.clone();
+    assert!(
+        pige_core::account::ACCOUNT_COLORS.contains(&snapshot.accounts[0].color.as_str()),
+        "a new account gets a supported colour"
+    );
+
+    let chosen = pige_core::account::ACCOUNT_COLORS[3];
+    let snapshot = api::set_account_color(&id, chosen)
+        .await
+        .expect("set colour");
+    assert_eq!(snapshot.accounts[0].color, chosen);
+
+    let path = harness.dir.path().join("config").join("pige.json");
+    let document = pige_core::config::load(&path)
+        .expect("read config")
+        .expect("config exists");
+    assert_eq!(document.accounts[0].color.as_deref(), Some(chosen));
+}
+
+#[tokio::test]
+async fn account_colors_must_come_from_the_supported_palette() {
+    let _guard = TEST_LOCK.lock().await;
+    Harness::new();
+
+    let snapshot = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let id = snapshot.accounts[0].id.clone();
+    let error = api::set_account_color(&id, "#123456")
+        .await
+        .expect_err("unsupported colour is rejected");
+    assert!(
+        error.contains("colour") || error.contains("color"),
+        "{error}"
+    );
+    assert_eq!(
+        api::snapshot().accounts[0].color,
+        snapshot.accounts[0].color
+    );
+}
+
+#[tokio::test]
 async fn sync_does_not_notify_when_notifications_are_off() {
     use pige_core::settings::Settings;
     let _guard = TEST_LOCK.lock().await;
@@ -2117,6 +2166,7 @@ fn seeded_account(id: &str, label: &str) -> pige_core::Account {
         },
         auth: pige_core::AuthKind::Password,
         sort_order: 0,
+        color: None,
     }
 }
 

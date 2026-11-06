@@ -135,5 +135,6 @@ fn account_from_row(row: &Row<'_>) -> Result<Account, StoreError> {
         auth: AuthKind::from_db(&auth_kind)
             .ok_or_else(|| StoreError::corrupt("accounts.auth_kind", auth_kind))?,
         sort_order: row.get(12)?,
+        color: None,
     })
 }

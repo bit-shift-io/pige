@@ -200,6 +200,7 @@ mod tests {
             },
             auth: AuthKind::Password,
             sort_order: 0,
+            color: None,
         }
     }
 

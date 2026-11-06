@@ -6,13 +6,13 @@
 
 use std::collections::HashMap;
 
-use iced::widget::{column, container, row, scrollable, stack};
+use iced::widget::{button, column, container, row, scrollable, space, stack};
 use iced::{Alignment, Element, Fill};
 use pige_core::account::{
-    Account, AccountId, Security,
+    ACCOUNT_COLORS, Account, AccountId, Security,
     presets::{ProviderPreset, detect, preset},
 };
-use pige_core::api::{AccountInput, ModelSnapshot};
+use pige_core::api::{AccountInput, AccountSummary, ModelSnapshot};
 
 use crate::app::App;
 use crate::components::{self, ButtonVariant};
@@ -403,7 +403,7 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
         .width(Fill);
 
         list = list.push(
-            container(column![label_row, header].spacing(palette.space.sm))
+            container(column![label_row, header, color_picker(account)].spacing(palette.space.sm))
                 .width(Fill)
                 .padding(palette.space.lg)
                 .style(move |_| container::Style {
@@ -415,6 +415,56 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
         );
     }
     list.into()
+}
+
+/// A row of palette swatches. The check mark marks the account's current
+/// colour; picking another one persists through the API immediately.
+fn color_picker<'a>(account: &'a AccountSummary) -> Element<'a, Message> {
+    let palette = theme::active();
+    let mut swatches = row![].spacing(palette.space.sm).align_y(Alignment::Center);
+    for hex in ACCOUNT_COLORS {
+        let selected = account.color == *hex;
+        let color = theme::parse_hex_color(hex).unwrap_or(palette.primary);
+        let mark: Element<'a, Message> = if selected {
+            iced::widget::text(icons::glyph(icons::CHECK))
+                .font(icons::FONT)
+                .size(palette.metrics.small_icon_size)
+                .color(palette.on_color(color))
+                .into()
+        } else {
+            space().into()
+        };
+        let swatch = container(mark)
+            .width(palette.metrics.icon_size + palette.space.xs)
+            .height(palette.metrics.icon_size + palette.space.xs)
+            .center_x(palette.metrics.icon_size + palette.space.xs)
+            .center_y(palette.metrics.icon_size + palette.space.xs)
+            .style(move |_| container::Style {
+                background: Some(color.into()),
+                border: iced::border::rounded((palette.metrics.icon_size + palette.space.xs) / 2.0),
+                ..Default::default()
+            });
+        swatches = swatches.push(
+            button(swatch)
+                .padding(0)
+                .style(|_, _| button::Style {
+                    background: None,
+                    ..Default::default()
+                })
+                .on_press(Message::SetAccountColor(
+                    account.id.clone(),
+                    (*hex).to_string(),
+                )),
+        );
+    }
+
+    row![
+        styled("Colour", TextRole::LabelMedium, palette.on_surface_variant),
+        swatches,
+    ]
+    .spacing(palette.space.sm)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn form_view<'a>(form: &'a AccountForm) -> Element<'a, Message> {
@@ -649,6 +699,7 @@ mod tests {
             },
             auth: pige_core::account::AuthKind::Password,
             sort_order: 0,
+            color: None,
         };
 
         let form = AccountForm::from_account(&account);
@@ -701,6 +752,7 @@ mod tests {
                 label: "Personal".into(),
                 email: "ada@example.com".into(),
                 unread: 0,
+                color: "#00897b".into(),
             }],
             ..ModelSnapshot::default()
         };

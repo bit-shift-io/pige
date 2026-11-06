@@ -85,6 +85,25 @@ pub struct ServerConfig {
     pub security: Security,
 }
 
+/// Accent colours an account can be tagged with. The UI renders the chosen
+/// colour as a block behind the account's initials, which makes accounts easy
+/// to tell apart in the merged inbox.
+pub const ACCOUNT_COLORS: &[&str] = &[
+    "#00897b", "#3949ab", "#7b1fa2", "#c2185b", "#e64a19", "#f9a825", "#2e7d32", "#546e7a",
+];
+
+/// The colour a new account receives when the caller does not choose one.
+/// Cycling by sort order keeps consecutive accounts visually distinct.
+pub fn default_account_color(sort_order: i64) -> &'static str {
+    let index = sort_order.rem_euclid(ACCOUNT_COLORS.len() as i64) as usize;
+    ACCOUNT_COLORS[index]
+}
+
+/// Whether `color` is one of the supported accent colours.
+pub fn is_supported_account_color(color: &str) -> bool {
+    ACCOUNT_COLORS.contains(&color)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub id: AccountId,
@@ -99,4 +118,20 @@ pub struct Account {
     pub auth: AuthKind,
     /// User-controlled ordering in the navigation rail.
     pub sort_order: i64,
+    /// Accent colour as a `#rrggbb` string from [`ACCOUNT_COLORS`]. Older
+    /// configuration files omit this, so a missing value falls back to the
+    /// sort-order default.
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+impl Account {
+    /// The resolved accent colour, falling back to the sort-order default for
+    /// configuration written before colours existed.
+    pub fn resolved_color(&self) -> &str {
+        self.color
+            .as_deref()
+            .filter(|color| is_supported_account_color(color))
+            .unwrap_or_else(|| default_account_color(self.sort_order))
+    }
 }

@@ -340,6 +340,7 @@ fn account(id: &str) -> pige_core::Account {
         },
         auth: AuthKind::Password,
         sort_order: 0,
+        color: None,
     }
 }
 

@@ -698,6 +698,7 @@ mod tests {
             },
             auth: crate::account::AuthKind::Password,
             sort_order: 0,
+            color: None,
         };
         store.upsert_account(&account).unwrap();
         let id = save_draft(

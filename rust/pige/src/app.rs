@@ -79,11 +79,17 @@ pub struct App {
     /// Accounts whose folder groups are collapsed.
     pub collapsed: HashSet<AccountId>,
     pub(crate) search: String,
+    /// Whether the search field is showing. Hidden by default so the list gets
+    /// the vertical space; the app-bar search button opens it.
+    pub(crate) search_open: bool,
     /// The scope chip's current choice. Starts at All accounts and cycles
     /// through the selected account and folder when they exist.
     pub(crate) search_scope: SearchScope,
     /// The latest background search results.
     pub(crate) search_results: Vec<SearchHit>,
+    /// Android's system font-scale factor. The window scales by this and the
+    /// logical size is reduced to match, so breakpoints still see real points.
+    pub(crate) scale: f32,
     pub(crate) size: Size,
     /// Android safe-area insets; zero on desktop.
     pub(crate) insets: iced_android::Insets,
@@ -170,8 +176,10 @@ impl App {
                 selected_account,
                 collapsed: HashSet::new(),
                 search: String::new(),
+                search_open: false,
                 search_scope: SearchScope::AllAccounts,
                 search_results: Vec::new(),
+                scale: 1.0,
                 size: Size::new(900.0, 700.0),
                 insets: iced_android::Insets::default(),
                 dark,
@@ -207,8 +215,10 @@ impl App {
             selected_account: None,
             collapsed: HashSet::new(),
             search: String::new(),
+            search_open: false,
             search_scope: SearchScope::AllAccounts,
             search_results: Vec::new(),
+            scale: 1.0,
             size: Size::new(900.0, 700.0),
             insets: iced_android::Insets::default(),
             dark: true,
@@ -242,6 +252,18 @@ impl App {
             self.search_results = snapshot.search_results.clone();
         }
         self.snapshot = snapshot;
+    }
+
+    /// Follow the Android system font scale. The renderer scales the whole
+    /// window, so shrink the logical size by the same ratio; the layout then
+    /// sees points comparable to before and keeps the same breakpoint.
+    pub(crate) fn apply_system_scale(&mut self, scale: f32) {
+        if !scale.is_finite() || scale <= 0.0 || (scale - self.scale).abs() < f32::EPSILON {
+            return;
+        }
+        let ratio = self.scale / scale;
+        self.size = Size::new(self.size.width * ratio, self.size.height * ratio);
+        self.scale = scale;
     }
 }
 
@@ -456,8 +478,17 @@ fn folder_view(folder: &FolderSummary) -> FolderView {
     }
 }
 
+/// Resolve an account's accent colour from the snapshot.
+pub fn account_color(snapshot: &ModelSnapshot, account: &AccountId) -> Option<Color> {
+    snapshot
+        .accounts
+        .iter()
+        .find(|candidate| &candidate.id == account)
+        .and_then(|candidate| theme::parse_hex_color(&candidate.color))
+}
+
 /// Turn one cached conversation into the plain row the list component draws.
-pub fn row_view(conversation: &CoreConversationSummary) -> ListRow {
+pub fn row_view(conversation: &CoreConversationSummary, account_color: Option<Color>) -> ListRow {
     let sender = if conversation.sender.trim().is_empty() {
         "Unknown sender".to_string()
     } else {
@@ -479,13 +510,14 @@ pub fn row_view(conversation: &CoreConversationSummary) -> ListRow {
         unread: conversation.unread,
         has_attachment: conversation.has_attachments,
         count: conversation.message_count,
+        account_color,
     }
 }
 
 /// Turn one search hit into the same row shape as a conversation. Search hits
 /// carry only match metadata, so snippet aggregation and unread count are
 /// intentionally blank.
-pub fn search_row_view(hit: &SearchHit) -> ListRow {
+pub fn search_row_view(hit: &SearchHit, account_color: Option<Color>) -> ListRow {
     let sender = if hit.sender.trim().is_empty() {
         "Unknown sender".to_string()
     } else {
@@ -507,6 +539,7 @@ pub fn search_row_view(hit: &SearchHit) -> ListRow {
         unread: false,
         has_attachment: false,
         count: 0,
+        account_color,
     }
 }
 
@@ -651,7 +684,8 @@ mod tests {
             has_attachments: true,
         };
 
-        let row = row_view(&conversation);
+        let account = Color::from_rgb8(0x00, 0x89, 0x7b);
+        let row = row_view(&conversation, Some(account));
 
         assert_eq!(row.initials, "AL");
         assert_eq!(row.sender, "Ada Lovelace");
@@ -660,7 +694,23 @@ mod tests {
         assert!(row.unread);
         assert!(row.has_attachment);
         assert_eq!(row.count, 3);
+        assert_eq!(row.account_color, Some(account));
         assert!(!row.date.is_empty());
+    }
+
+    #[test]
+    fn system_scale_adjusts_the_layout_size_inversely() {
+        let mut app = App::for_test();
+        app.size = Size::new(900.0, 700.0);
+
+        app.apply_system_scale(1.5);
+        assert_eq!(app.scale, 1.5);
+        assert!((app.size.width - 600.0).abs() < 0.01, "{:?}", app.size);
+        assert!((app.size.height - 700.0 / 1.5).abs() < 0.01);
+
+        app.apply_system_scale(1.0);
+        assert_eq!(app.scale, 1.0);
+        assert!((app.size.width - 900.0).abs() < 0.01);
     }
 
     #[test]

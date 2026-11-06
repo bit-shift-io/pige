@@ -5,7 +5,9 @@ use iced::{Element, Fill, Length};
 use pige_core::api::SyncStatus;
 use pige_core::mail::FolderKind;
 
-use crate::app::{App, account_for_folder, avatar_color, format_list_date, initials, row_view};
+use crate::app::{
+    App, account_color, account_for_folder, avatar_color, format_list_date, initials, row_view,
+};
 use crate::components::elastic_scroll::{self, Policy};
 use crate::components::{self, ButtonVariant, ListRow, PaneTone};
 use crate::icons;
@@ -26,21 +28,24 @@ pub fn list_pane<'a>(
         .then(|| components::icon_button(icons::MENU, "Open navigation", Message::ToggleDrawer));
     let actions = vec![
         components::icon_button(icons::REFRESH, "Sync now", Message::SyncNow),
+        components::icon_button(icons::SEARCH, "Search", Message::OpenSearch),
         components::icon_button(icons::EDIT, "Compose", Message::Compose),
     ];
 
     let mut pane = column![].spacing(0).width(Fill).height(Fill);
     pane = pane.push(components::app_bar(folder_title(app), leading, actions));
-    pane = pane.push(
-        container(search::controls(app))
-            .padding(iced::Padding {
-                top: 0.0,
-                right: palette.space.lg,
-                bottom: palette.space.md,
-                left: palette.space.lg,
-            })
-            .width(Fill),
-    );
+    if app.search_open {
+        pane = pane.push(
+            container(search::controls(app))
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: palette.space.lg,
+                    bottom: palette.space.md,
+                    left: palette.space.lg,
+                })
+                .width(Fill),
+        );
+    }
 
     if search::is_active(app) {
         let scroller: Element<'a, Message> = scrollable(search::results(app))
@@ -69,7 +74,10 @@ pub fn list_pane<'a>(
     } else {
         let mut rows = column![].spacing(0).width(Fill);
         for conversation in &app.snapshot.conversations {
-            let row = row_view(conversation);
+            let row = row_view(
+                conversation,
+                account_color(&app.snapshot, &conversation.account_id),
+            );
             rows = rows.push(elastic_scroll::row(
                 components::list_row(
                     row,
@@ -187,6 +195,7 @@ fn draft_rows<'a>(drafts: &[&'a pige_core::send::OutboxEntry]) -> Element<'a, Me
                 unread: false,
                 has_attachment: false,
                 count: 0,
+                account_color: None,
             },
             Message::OpenDraft(draft.id.clone()),
         ));

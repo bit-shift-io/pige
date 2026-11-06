@@ -18,7 +18,10 @@ pub use attachment::{
     cache_attachment, check_attachment_size, extract_attachments, safe_attachment_filename,
 };
 pub use message::{Conversation, Flags, MessageHeader, StoredMessage};
-pub use parse::{ParseError, decode_rfc2047, normalized_subject, parse_flags, parse_header_block};
+pub use parse::{
+    ParseError, decode_rfc2047, normalized_subject, parse_flags, parse_header_block,
+    snippet_from_message,
+};
 pub use thread::ThreadAssigner;
 
 /// Typed wrapper so folder, message, and thread ids cannot be mixed up.

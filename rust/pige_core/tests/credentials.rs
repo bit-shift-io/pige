@@ -570,6 +570,7 @@ async fn gated_real_imap_connection() {
         },
         auth: AuthKind::Password,
         sort_order: 0,
+        color: None,
     };
 
     let mut transport = imap::connect(&account, &password)
