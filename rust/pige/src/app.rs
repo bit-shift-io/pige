@@ -154,10 +154,7 @@ impl App {
         // (so SyncStarted/Finished and errors behave as usual) once an account
         // exists. Window creation is never blocked on the network.
         if has_accounts {
-            startup.push(Task::perform(api::sync_all(), |result| match result {
-                Ok(snapshot) => Message::Snapshot(snapshot),
-                Err(error) => Message::Error(error),
-            }));
+            startup.push(crate::update::synced_with_prefetch(api::sync_all()));
         }
         // An initialization problem (for example an unreadable configuration)
         // is surfaced through the same toast channel as any other message.

@@ -70,6 +70,8 @@ pub enum Message {
     ToggleAccount(AccountId),
     LoadOlder,
     SyncNow,
+    /// A user-facing sync finished; successful syncs schedule quiet prefetch.
+    Synced(Result<ModelSnapshot, String>),
     /// Pull-to-refresh from the list.
     Refresh,
     /// The search field changed.

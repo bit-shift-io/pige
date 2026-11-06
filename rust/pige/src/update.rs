@@ -87,8 +87,15 @@ impl App {
                 }
             }
             Message::SyncNow | Message::Refresh => {
-                return snapshot_task(api::sync_all());
+                return synced_with_prefetch(api::sync_all());
             }
+            Message::Synced(result) => match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    return prefetch_task();
+                }
+                Err(error) => return self.show_toast(error),
+            },
             Message::SearchChanged(query) => {
                 self.search = query;
                 return self.run_search();
@@ -951,6 +958,17 @@ fn session_only_warning() -> String {
     "Secret Service is unavailable. The account password is kept for this session only and will not be saved after pige exits.".to_string()
 }
 
+/// Deliver sync results before starting downloads, so prefetch cannot delay UI.
+pub(crate) fn synced_with_prefetch(
+    future: impl Future<Output = Result<ModelSnapshot, String>> + Send + 'static,
+) -> Task<Message> {
+    Task::perform(future, Message::Synced)
+}
+
+fn prefetch_task() -> Task<Message> {
+    Task::perform(api::prefetch_bodies(), |_| Message::Noop)
+}
+
 fn snapshot_task(
     future: impl Future<Output = Result<ModelSnapshot, String>> + Send + 'static,
 ) -> Task<Message> {
@@ -999,6 +1017,16 @@ fn core_events() -> impl iced::futures::Stream<Item = Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_sync_applies_snapshot_and_schedules_separate_prefetch() {
+        let mut app = App::for_test();
+        let mut snapshot = ModelSnapshot::default();
+        snapshot.unified_inbox_unread = 7;
+        let task = app.update(Message::Synced(Ok(snapshot)));
+        assert_eq!(app.snapshot.unified_inbox_unread, 7);
+        assert!(task.units() > 0, "prefetch is scheduled after applying mail");
+    }
 
     #[test]
     fn spin_tick_advances_and_wraps() {
