@@ -6,6 +6,24 @@ use iced::widget::{column, container, row, scrollable, space};
 use iced::{Alignment, Element, Fill};
 use pige_core::account::AccountId;
 use pige_core::api::{self, ConversationDetail, MessageBody, MessageSummary};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderBody {
+    Document,
+    TooLarge,
+    Loading,
+    Missing,
+}
+
+pub fn reader_body_kind(message: &MessageSummary) -> ReaderBody {
+    match &message.body {
+        Some(MessageBody::Document(_)) => ReaderBody::Document,
+        Some(MessageBody::TooLarge) => ReaderBody::TooLarge,
+        Some(MessageBody::Loading) => ReaderBody::Loading,
+        None => ReaderBody::Missing,
+    }
+}
+
 use pige_core::mail::FolderKind;
 use pige_core::transport::Capabilities;
 
@@ -243,9 +261,18 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
 
     // Body, or a clear state when it is unavailable. Remote images remain
     // "[image blocked]" placeholders: v1 fetches no remote bytes.
-    match &latest.body {
-        Some(MessageBody::Loading) => {}
-        Some(MessageBody::Document(document)) => {
+    match reader_body_kind(latest) {
+        ReaderBody::Loading => {
+            content = content.push(
+                container(components::spinner(app.spin_phase as f32))
+                    .center_x(Fill)
+                    .padding(palette.space.lg),
+            );
+        }
+        ReaderBody::Document => {
+            let Some(MessageBody::Document(document)) = &latest.body else {
+                unreachable!()
+            };
             let rendered = html_view::render_document(document, Message::OpenUrl);
             let mut body = column![].spacing(palette.space.xs).width(Fill);
             for element in rendered {
@@ -257,7 +284,7 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
                     .padding([palette.space.xs, palette.space.lg]),
             );
         }
-        Some(MessageBody::TooLarge) => {
+        ReaderBody::TooLarge => {
             content = content.push(
                 container(components::styled_text(
                     "This message is too large to display.",
@@ -268,7 +295,7 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
                 .padding(palette.space.lg),
             );
         }
-        None => {
+        ReaderBody::Missing => {
             content = content.push(
                 container(components::styled_text(
                     "This message has no readable body, or it could not be loaded.",
@@ -476,4 +503,36 @@ fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_body(body: Option<MessageBody>) -> MessageSummary {
+        MessageSummary {
+            id: pige_core::MessageId("message".into()),
+            sender: "Ada".into(),
+            to: "me".into(),
+            date: 0,
+            snippet: String::new(),
+            flags: pige_core::mail::Flags::default(),
+            has_attachments: false,
+            attachments: Vec::new(),
+            body,
+        }
+    }
+
+    #[test]
+    fn body_kind_distinguishes_loading_from_missing() {
+        assert_eq!(
+            reader_body_kind(&with_body(Some(MessageBody::Loading))),
+            ReaderBody::Loading
+        );
+        assert_eq!(reader_body_kind(&with_body(None)), ReaderBody::Missing);
+        assert_eq!(
+            reader_body_kind(&with_body(Some(MessageBody::TooLarge))),
+            ReaderBody::TooLarge
+        );
+    }
 }

@@ -34,6 +34,8 @@ pub mod label;
 pub mod pull_refresh;
 pub mod rows;
 pub mod scroll_fade;
+pub mod spinner;
+pub use spinner::spinner;
 
 pub use avatar::avatar;
 pub use buttons::{ButtonVariant, button, floating_action_button, icon_button};

@@ -60,6 +60,7 @@ impl App {
                 }
             }
             Message::Insets(insets) => self.insets = insets,
+            Message::Spin => self.spin_phase = self.spin_phase.wrapping_add(1),
             Message::Tick => {
                 // Keep SQLite work off the UI thread; the executor produces a
                 // snapshot and delivers it as a normal message.
@@ -847,6 +848,20 @@ impl App {
             Subscription::none()
         };
         Subscription::batch([
+            if self
+                .snapshot
+                .selected_conversation
+                .as_ref()
+                .is_some_and(|d| {
+                    d.messages
+                        .iter()
+                        .any(|m| matches!(m.body, Some(api::MessageBody::Loading)))
+                })
+            {
+                iced::time::every(Duration::from_millis(80)).map(|_| Message::Spin)
+            } else {
+                Subscription::none()
+            },
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             system_theme,
             // Edge-to-edge is mandatory on Android 15+. The window covers the
@@ -986,6 +1001,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spin_tick_advances_and_wraps() {
+        let mut app = App::for_test();
+        app.spin_phase = u32::MAX;
+        let _ = app.update(Message::Spin);
+        assert_eq!(app.spin_phase, 0);
+        let _ = app.update(Message::Spin);
+        assert_eq!(app.spin_phase, 1);
+    }
+
+    #[test]
     fn prefetch_toggle_updates_settings() {
         let mut app = App::for_test();
         let _ = app.update(Message::SettingsPrefetchToggled(false));
@@ -1025,7 +1050,9 @@ mod tests {
     #[test]
     fn factory_reset_requires_confirmation() {
         let mut app = App::for_test();
-        let _ = app.update(Message::Advanced(crate::screens::advanced::Row::FactoryReset));
+        let _ = app.update(Message::Advanced(
+            crate::screens::advanced::Row::FactoryReset,
+        ));
         assert!(app.confirm_reset, "the reset must wait for confirmation");
     }
 

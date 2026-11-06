@@ -51,6 +51,7 @@ impl std::fmt::Debug for Password {
 // model, and boxing it would only move the allocation to every match arm.
 #[allow(clippy::large_enum_variant)]
 pub enum Message {
+    Spin,
     /// A fresh view of the cache.
     Snapshot(ModelSnapshot),
     Resized(Size),

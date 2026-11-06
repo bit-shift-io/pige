@@ -94,6 +94,7 @@ pub struct App {
     pub(crate) toast: Toast,
     /// Whether the reader's earlier-message section is expanded.
     pub(crate) reader_expanded: bool,
+    pub(crate) spin_phase: u32,
     /// Whether the reader's "Move to folder" picker is open.
     pub(crate) move_picker_open: bool,
     /// Whether the reader's permanent-delete confirmation is open.
@@ -180,6 +181,7 @@ impl App {
                 list_motion: Motion::new(),
                 toast: Toast::default(),
                 reader_expanded: false,
+                spin_phase: 0,
                 move_picker_open: false,
                 delete_confirm_open: false,
                 restore_picker: None,
@@ -216,6 +218,7 @@ impl App {
             list_motion: Motion::new(),
             toast: Toast::default(),
             reader_expanded: false,
+            spin_phase: 0,
             move_picker_open: false,
             delete_confirm_open: false,
             restore_picker: None,
