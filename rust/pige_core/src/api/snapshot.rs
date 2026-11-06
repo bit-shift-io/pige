@@ -69,6 +69,8 @@ pub struct ConversationDetail {
 /// The body of a message, or why it is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageBody {
+    /// A body fetch is in flight for this message.
+    Loading,
     /// The parsed document, ready to render.
     Document(MailDocument),
     /// The raw message exceeds the fetch cap and was not downloaded.

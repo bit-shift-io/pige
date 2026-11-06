@@ -1053,6 +1053,52 @@ async fn snapshot_reads_are_consistent_during_writes() {
 }
 
 #[tokio::test]
+async fn open_conversation_shows_loading_before_the_body_arrives() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .unwrap();
+    let account_id = added.accounts[0].id.clone();
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account_id, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    seed_conversation(&store, &inbox, 1, 1, "Loading", "thread-loading");
+    let started = Arc::new(Semaphore::new(0));
+    let pause = Arc::new(Semaphore::new(0));
+    harness.factory.add_transport(
+        account_id,
+        FakeTransport {
+            bodies: HashMap::from([(
+                "INBOX".into(),
+                HashMap::from([(
+                    Uid(1),
+                    b"Content-Type: text/plain\r\n\r\nhello body\r\n".to_vec(),
+                )]),
+            )]),
+            fetch_body_started: Some(started.clone()),
+            fetch_body_pause: Some(pause.clone()),
+            ..FakeTransport::default()
+        },
+    );
+    let open =
+        tokio::spawn(async { api::open_conversation(&ThreadId("thread-loading".into())).await });
+    let _ = started.acquire().await.unwrap();
+    let body = api::snapshot()
+        .selected_conversation
+        .and_then(|d| d.messages.into_iter().next())
+        .and_then(|m| m.body);
+    // Release before asserting so a failing test leaves no blocked transport.
+    pause.add_permits(1);
+    let resolved = open.await.unwrap().unwrap();
+    assert_eq!(body, Some(MessageBody::Loading));
+    assert!(matches!(
+        resolved.selected_conversation.unwrap().messages[0].body,
+        Some(MessageBody::Document(_))
+    ));
+}
+
+#[tokio::test]
 async fn open_conversation_fetches_and_caches_the_latest_body() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
@@ -1613,7 +1659,8 @@ async fn a_present_document_is_authoritative_over_sqlite() {
     let config_dir = dir.path().join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     let mut doc = pige_core::config::ConfigDocument::default();
-    doc.accounts.push(seeded_account("document", "From Document"));
+    doc.accounts
+        .push(seeded_account("document", "From Document"));
     pige_core::config::save(&pige_core::config::document_path(&config_dir), &doc).unwrap();
 
     api::reset_for_tests();
@@ -1785,8 +1832,7 @@ async fn backup_reports_when_downloads_is_unavailable() {
     let _guard = TEST_LOCK.lock().await;
     let dir = TempDir::new().unwrap();
     let mut config = test_config(&dir);
-    config.backups =
-        Arc::new(pige_core::platform::fake::FakeBackupStore::without_downloads());
+    config.backups = Arc::new(pige_core::platform::fake::FakeBackupStore::without_downloads());
     api::reset_for_tests();
     api::init(config).unwrap();
 
@@ -1861,7 +1907,9 @@ async fn restore_keeps_surviving_cache_and_drops_the_rest() {
     {
         let store = harness.open_store();
         store.upsert_folder(&keep_folder).unwrap();
-        store.upsert_message(&stored_message(&keep_folder, 1)).unwrap();
+        store
+            .upsert_message(&stored_message(&keep_folder, 1))
+            .unwrap();
         store.upsert_folder(&drop_folder).unwrap();
         store
             .upsert_message(&stored_message(&drop_folder, 2))
@@ -1997,12 +2045,28 @@ async fn an_unreadable_configuration_blocks_writes_and_is_preserved() {
 
     api::reset_for_tests();
     api::init(test_config(&dir)).unwrap();
-    assert!(api::snapshot().accounts.iter().any(|a| a.label == "Original"));
+    assert!(
+        api::snapshot()
+            .accounts
+            .iter()
+            .any(|a| a.label == "Original")
+    );
 
     let result = api::rename_account(&AccountId("acct".to_string()), "Changed").await;
-    assert!(result.is_err(), "a write over an unreadable file must be refused");
-    assert!(path.is_dir(), "the unreadable configuration must be preserved");
-    assert!(api::snapshot().accounts.iter().any(|a| a.label == "Original"));
+    assert!(
+        result.is_err(),
+        "a write over an unreadable file must be refused"
+    );
+    assert!(
+        path.is_dir(),
+        "the unreadable configuration must be preserved"
+    );
+    assert!(
+        api::snapshot()
+            .accounts
+            .iter()
+            .any(|a| a.label == "Original")
+    );
 }
 
 #[tokio::test]

@@ -244,6 +244,7 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
     // Body, or a clear state when it is unavailable. Remote images remain
     // "[image blocked]" placeholders: v1 fetches no remote bytes.
     match &latest.body {
+        Some(MessageBody::Loading) => {}
         Some(MessageBody::Document(document)) => {
             let rendered = html_view::render_document(document, Message::OpenUrl);
             let mut body = column![].spacing(palette.space.xs).width(Fill);
@@ -427,6 +428,7 @@ fn earlier_message<'a>(message: &'a MessageSummary) -> Element<'a, Message> {
     let mut card = column![].spacing(palette.space.xs).width(Fill);
     card = card.push(meta);
     match &message.body {
+        Some(MessageBody::Loading) => {}
         Some(MessageBody::Document(document)) => {
             let rendered = html_view::render_document(document, Message::OpenUrl);
             let mut body = column![].spacing(palette.space.xs).width(Fill);

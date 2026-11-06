@@ -55,6 +55,9 @@ pub struct FakeTransport {
     /// `pause` before returning.
     pub fetch_headers_started: Option<Arc<Semaphore>>,
     pub fetch_headers_pause: Option<Arc<Semaphore>>,
+    /// Signal and optionally pause an in-flight body fetch.
+    pub fetch_body_started: Option<Arc<Semaphore>>,
+    pub fetch_body_pause: Option<Arc<Semaphore>>,
 
     /// Internal: the folder most recently selected, if any.
     pub current: Option<String>,
@@ -161,6 +164,12 @@ impl MailTransport for FakeTransport {
     async fn fetch_body(&mut self, uid: Uid) -> Result<Vec<u8>, TransportError> {
         let folder = self.current_folder()?;
         self.fetch_body_calls.push((folder.clone(), uid));
+        if let Some(started) = &self.fetch_body_started {
+            started.add_permits(1);
+        }
+        if let Some(pause) = &self.fetch_body_pause {
+            let _ = pause.acquire().await;
+        }
         Ok(self
             .bodies
             .get(&folder)

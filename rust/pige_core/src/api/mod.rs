@@ -708,8 +708,8 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         .backups
         .read(&file_name)
         .map_err(|error| format!("read backup: {error}"))?;
-    let restored: ConfigDocument = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("read backup: {error}"))?;
+    let restored: ConfigDocument =
+        serde_json::from_slice(&bytes).map_err(|error| format!("read backup: {error}"))?;
 
     // Everything below is a committed change; a failure before the document is
     // durable leaves the running configuration exactly as it was.
@@ -969,9 +969,7 @@ async fn add_account_inner(
                 log::error!(
                     "rollback credential for {id} after account insert failure: {rollback}"
                 );
-                return Err(format!(
-                    "{error}; credential rollback failed: {rollback}"
-                ));
+                return Err(format!("{error}; credential rollback failed: {rollback}"));
             }
             return Err(error);
         }
@@ -1056,9 +1054,7 @@ async fn update_account_inner(
                     log::error!(
                         "rollback credential for {id} after account update failure: {rollback}"
                     );
-                    return Err(format!(
-                        "{error}; credential rollback failed: {rollback}"
-                    ));
+                    return Err(format!("{error}; credential rollback failed: {rollback}"));
                 }
             }
             return Err(error);
@@ -1149,9 +1145,7 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
                 log::error!(
                     "restore credential for {id} after account removal failure: {restore}; {session_restore}"
                 );
-                return Err(format!(
-                    "{error}; credential restore failed: {restore}"
-                ));
+                return Err(format!("{error}; credential restore failed: {restore}"));
             }
             return Err(error);
         }
@@ -1578,10 +1572,10 @@ pub async fn load_older_unified() -> Result<ModelSnapshot, String> {
 /// `body: None` so the reader always renders its chrome even offline.
 pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
     // Phase 1: read the conversation, its cached body, and the fetch decision.
-    let (messages, config, account, folder, cached, too_large, events) = {
-        let guard = lock_state();
+    let (messages, config, account, folder, cached, too_large, events, initial) = {
+        let mut guard = lock_state();
         let state = guard
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
         let messages = state
             .store
@@ -1609,6 +1603,21 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             .body(&messages[0].id)
             .map_err(|error| format!("read cached body: {error}"))?;
         let too_large = messages[0].header.size > MAX_BODY_BYTES;
+        let body = if too_large {
+            Some(MessageBody::TooLarge)
+        } else if let Some(cached) = &cached {
+            document_from_body(cached).map(MessageBody::Document)
+        } else {
+            Some(MessageBody::Loading)
+        };
+        state.selected_conversation = Some(conversation_detail_from_store(
+            &state.store,
+            thread_id,
+            &account.id,
+            &messages,
+            body,
+        ));
+        let initial = state.build_snapshot();
         (
             messages,
             state.config.clone(),
@@ -1617,8 +1626,13 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             cached,
             too_large,
             state.events.clone(),
+            initial,
         )
     };
+    let _ = events.send(CoreEvent::SnapshotChanged);
+    if cached.is_some() || too_large {
+        return Ok(initial);
+    }
 
     // Phase 2: fetch raw bytes only when uncached and under the size cap.
     let fetched = if cached.is_none() && !too_large {
@@ -1647,48 +1661,58 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             fetched.as_deref(),
             too_large,
         );
-        let attachments = match state.store.attachments(&messages[0].id) {
-            Ok(attachments) => attachments,
-            Err(error) => {
-                log::warn!("read attachments {}: {error}", messages[0].id);
-                Vec::new()
-            }
-        };
-        // Earlier messages carry their cached bodies so "Earlier messages" can
-        // show real content instead of names only. Reading cached SQLite rows is
-        // cheap; a missing body degrades to `None` and the reader shows the
-        // snippet plus a "Not downloaded" label.
-        let earlier_bodies: HashMap<MessageId, MessageBody> = messages
-            .iter()
-            .skip(1)
-            .filter_map(|message| {
-                if message.header.size > MAX_BODY_BYTES {
-                    return Some((message.id.clone(), MessageBody::TooLarge));
-                }
-                state
-                    .store
-                    .body(&message.id)
-                    .ok()
-                    .flatten()
-                    .and_then(|cached| {
-                        document_from_body(&cached)
-                            .map(|document| (message.id.clone(), MessageBody::Document(document)))
-                    })
-            })
-            .collect();
-        let detail = build_conversation_detail(
+        state.selected_conversation = Some(conversation_detail_from_store(
+            &state.store,
             thread_id,
             &account.id,
             &messages,
             body,
-            &earlier_bodies,
-            attachments,
-        );
-        state.selected_conversation = Some(detail);
+        ));
         state.build_snapshot()
     };
     let _ = events.send(CoreEvent::SnapshotChanged);
     Ok(snapshot)
+}
+
+fn conversation_detail_from_store(
+    store: &Store,
+    thread_id: &ThreadId,
+    account_id: &AccountId,
+    messages: &[StoredMessage],
+    body: Option<MessageBody>,
+) -> ConversationDetail {
+    let attachments = match store.attachments(&messages[0].id) {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            log::warn!("read attachments {}: {error}", messages[0].id);
+            Vec::new()
+        }
+    };
+    // Earlier messages carry their cached bodies so "Earlier messages" can
+    // show real content instead of names only. Reading cached SQLite rows is
+    // cheap; a missing body degrades to `None` and the reader shows the
+    // snippet plus a "Not downloaded" label.
+    let earlier_bodies: HashMap<MessageId, MessageBody> = messages
+        .iter()
+        .skip(1)
+        .filter_map(|message| {
+            if message.header.size > MAX_BODY_BYTES {
+                return Some((message.id.clone(), MessageBody::TooLarge));
+            }
+            store.body(&message.id).ok().flatten().and_then(|cached| {
+                document_from_body(&cached)
+                    .map(|document| (message.id.clone(), MessageBody::Document(document)))
+            })
+        })
+        .collect();
+    build_conversation_detail(
+        thread_id,
+        account_id,
+        messages,
+        body,
+        &earlier_bodies,
+        attachments,
+    )
 }
 
 /// Build a reply draft for the newest message in a conversation. Recipients,
@@ -2077,7 +2101,11 @@ fn resolve_body(
     if let Some(body) = cached {
         return document_from_body(&body).map(MessageBody::Document);
     }
-    let raw = fetched?;
+    cache_fetched_body(store, message_id, fetched?).map(MessageBody::Document)
+}
+
+/// Cache a fetched message through the same path for opens and prefetch.
+fn cache_fetched_body(store: &Store, message_id: &MessageId, raw: &[u8]) -> Option<MailDocument> {
     let parts = extract_attachments(raw);
     if let Err(error) = store.store_attachments(message_id, &parts) {
         log::warn!("cache attachments {message_id}: {error}");
@@ -2094,7 +2122,7 @@ fn resolve_body(
     {
         log::warn!("cache body {message_id}: {error}");
     }
-    document.map(MessageBody::Document)
+    document
 }
 
 /// Extract the HTML and plain-text bodies from a raw RFC 5322 message.
