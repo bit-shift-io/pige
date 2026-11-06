@@ -13,7 +13,42 @@ else
     echo "Install Gradle 9.8.1 or restore the Android Gradle wrapper." >&2
     exit 1
 fi
-export JAVA_HOME="${JAVA_HOME:-/opt/jbr-21}"
+# Gradle/AGP need a full JDK (one that ships javac); a JRE-only install fails
+# with "Toolchain installation ... does not provide the required capabilities:
+# [JAVA_COMPILER]". This build is launched from many contexts that never source
+# the shell rc files - notably grit, which runs it from a systemd user service -
+# so JAVA_HOME can be unset or point at a bare JRE, and Gradle then falls back to
+# the java on PATH (Fedora's /usr/lib/jvm/java-25-openjdk, headless/JRE-only).
+# Detect a real JDK here so the build is self-sufficient regardless of caller.
+is_jdk() { [[ -n "${1:-}" && -x "$1/bin/java" && -x "$1/bin/javac" ]]; }
+if ! is_jdk "${JAVA_HOME:-}"; then
+    unset JAVA_HOME
+    for candidate in \
+        "$HOME/Android/android-studio/jbr" \
+        "/opt/jbr-21" \
+        "/usr/lib/jvm/java-21-openjdk" \
+        "/usr/lib/jvm/java-17-openjdk" \
+        "/usr/lib/jvm/java-latest-openjdk" \
+        "/usr/lib/jvm/java-25-openjdk"; do
+        if is_jdk "$candidate"; then
+            export JAVA_HOME="$candidate"
+            break
+        fi
+    done
+fi
+if ! is_jdk "${JAVA_HOME:-}"; then
+    jdk_bin="$(command -v javac 2>/dev/null || true)"
+    if [[ -n "$jdk_bin" ]]; then
+        export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$jdk_bin")")")"
+    fi
+fi
+if ! is_jdk "${JAVA_HOME:-}"; then
+    echo "No JDK with javac found (JAVA_HOME=${JAVA_HOME:-unset}). Install one:" >&2
+    echo "  sudo dnf install java-latest-openjdk-devel   # Fedora" >&2
+    echo "  sudo apt install default-jdk                  # Debian/Ubuntu" >&2
+    exit 1
+fi
+
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/28.2.13676358}"
 TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
