@@ -2497,7 +2497,10 @@ async fn sync_one(
 
     // The in-app event always fires so the list refreshes; only the OS
     // notification is suppressed when the user has turned notifications off.
-    let notify_new_mail = crate::settings::load_settings(store).notifications;
+    let notify_new_mail = {
+        let guard = lock_state();
+        guard.as_ref().is_none_or(|state| state.config_doc.settings.notifications)
+    };
     for mail in &report.new_inbox {
         if notify_new_mail {
             config.notifier.notify(mail);

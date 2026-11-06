@@ -230,6 +230,22 @@ async fn add_account_appears_in_snapshot_with_no_folders() {
 }
 
 #[tokio::test]
+async fn sync_does_not_notify_when_notifications_are_off() {
+    use pige_core::settings::Settings;
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    api::save_settings(&Settings { notifications: false, ..Settings::default() }).unwrap();
+    let added = api::add_account(input("Personal", "ada@example.com")).await.unwrap();
+    let id = added.accounts[0].id.clone();
+    harness.factory.add_transport(id.clone(), inbox_transport(vec![remote_message(1, "one", "a@example.com")]));
+    let mut events = api::subscribe();
+    let synced = api::sync_account(&id).await.unwrap();
+    assert_eq!(synced.conversations.len(), 1);
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, CoreEvent::NewMail(_))));
+    assert!(harness.notifier.notifications().is_empty(), "notifications were off");
+}
+
+#[tokio::test]
 async fn sync_all_updates_snapshot_and_emits_new_mail() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
