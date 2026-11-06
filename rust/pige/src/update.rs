@@ -659,6 +659,7 @@ impl App {
             Message::SettingsSyncChanged(value) => self.settings_sync = value,
             Message::SettingsNotificationsToggled(on) => self.settings.notifications = on,
             Message::SettingsBackgroundSyncToggled(on) => self.settings.background_sync = on,
+            Message::SettingsPrefetchToggled(on) => self.settings.prefetch_bodies = on,
             Message::SettingsThemeChanged(mode) => {
                 self.settings.theme = mode;
                 match mode {
@@ -983,6 +984,13 @@ fn core_events() -> impl iced::futures::Stream<Item = Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefetch_toggle_updates_settings() {
+        let mut app = App::for_test();
+        let _ = app.update(Message::SettingsPrefetchToggled(false));
+        assert!(!app.settings.prefetch_bodies);
+    }
 
     #[test]
     fn system_theme_maps_to_dark_light_and_ignores_none() {

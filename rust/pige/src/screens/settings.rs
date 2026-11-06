@@ -32,6 +32,7 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
     let body = column![
         sync_section(app),
         background_sync_section(app),
+        prefetch_section(app),
         notifications_section(app),
         theme_section(app),
         accounts_section(app),
@@ -97,6 +98,27 @@ fn background_sync_section<'a>(app: &'a App) -> Element<'a, Message> {
     .spacing(palette.space.xs)
     .width(Fill);
     section("Background sync", body.into())
+}
+
+fn prefetch_section<'a>(app: &'a App) -> Element<'a, Message> {
+    let palette = theme::active();
+    let on = app.settings.prefetch_bodies;
+    let body = column![
+        row![
+            components::chip("On", on, Message::SettingsPrefetchToggled(true)),
+            components::chip("Off", !on, Message::SettingsPrefetchToggled(false)),
+        ]
+        .spacing(palette.space.sm)
+        .align_y(Alignment::Center),
+        styled(
+            "Prefetch Inbox message bodies so mail opens instantly. Turn off on metered or slow connections.".to_string(),
+            TextRole::LabelMedium,
+            palette.on_surface_variant,
+        ),
+    ]
+    .spacing(palette.space.xs)
+    .width(Fill);
+    section("Download in advance", body.into())
 }
 
 fn notifications_section<'a>(app: &'a App) -> Element<'a, Message> {

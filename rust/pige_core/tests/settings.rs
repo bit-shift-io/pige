@@ -34,6 +34,7 @@ fn settings_round_trip_in_the_configuration_document() {
         sync_minutes: 30,
         notifications: false,
         background_sync: false,
+        prefetch_bodies: false,
         theme: ThemeMode::Dark,
     };
     let doc = ConfigDocument {

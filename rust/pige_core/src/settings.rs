@@ -43,6 +43,8 @@ pub struct Settings {
     /// Whether the shell runs periodic background sync. Android schedules (or
     /// cancels) WorkManager from this flag; desktop only persists it.
     pub background_sync: bool,
+    /// Download message bodies ahead of time so Inbox mail opens instantly.
+    pub prefetch_bodies: bool,
     /// The preferred colour scheme.
     pub theme: ThemeMode,
 }
@@ -53,6 +55,7 @@ impl Default for Settings {
             sync_minutes: DEFAULT_SYNC_MINUTES,
             notifications: true,
             background_sync: true,
+            prefetch_bodies: true,
             theme: ThemeMode::System,
         }
     }
@@ -90,6 +93,14 @@ pub fn clear_settings(store: &Store) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefetch_defaults_on_and_an_old_document_still_loads() {
+        assert!(Settings::default().prefetch_bodies);
+        let old = r#"{"sync_minutes":15,"notifications":true,"background_sync":true,"theme":"system"}"#;
+        let parsed: Settings = serde_json::from_str(old).unwrap();
+        assert!(parsed.prefetch_bodies, "missing key must default to on");
+    }
 
     #[test]
     fn interval_clamping_resolves_zero_to_the_default() {

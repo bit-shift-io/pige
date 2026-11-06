@@ -171,6 +171,7 @@ pub enum Message {
     SettingsNotificationsToggled(bool),
     /// The background-sync toggle changed.
     SettingsBackgroundSyncToggled(bool),
+    SettingsPrefetchToggled(bool),
     /// The theme choice changed.
     SettingsThemeChanged(ThemeMode),
     /// Persist the edited settings and reschedule background sync.
