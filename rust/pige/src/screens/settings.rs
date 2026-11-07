@@ -5,7 +5,7 @@
 //! and rescheduling happen through `Task`/message handling in `update`; nothing
 //! here touches SQLite or the network.
 
-use iced::widget::{column, container, row, scrollable};
+use iced::widget::{column, container, row};
 use iced::{Alignment, Element, Fill};
 use pige_core::settings::ThemeMode;
 
@@ -44,15 +44,15 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
         ),
     ]
     .spacing(palette.space.lg)
-    .width(Fill)
-    .max_width(palette.metrics.dialog_width);
+    .width(Fill);
 
     column![
         components::app_bar("Settings", leading, actions),
-        scrollable(container(body).width(Fill).padding(palette.space.xl),)
-            .width(Fill)
-            .height(Fill)
-            .style(palette.scrollable()),
+        components::scroller(
+            container(body)
+                .width(Fill)
+                .padding([palette.space.lg, palette.space.lg]),
+        ),
     ]
     .spacing(0)
     .width(Fill)

@@ -67,6 +67,22 @@ impl App {
                 // snapshot and delivers it as a normal message.
                 return Task::perform(async { api::snapshot() }, Message::Snapshot);
             }
+            Message::Scrolled(offset) => {
+                // Layout-only notifications repeat the last offset; only a real
+                // change counts as scrolling and reveals the scrollbars.
+                if (offset - self.scroll_offset).abs() > f32::EPSILON {
+                    self.scroll_offset = offset;
+                    self.scroll_last = Some(std::time::Instant::now());
+                }
+            }
+            Message::ScrollTick => {
+                if self
+                    .scroll_last
+                    .is_some_and(|last| last.elapsed() >= crate::app::SCROLLBAR_IDLE)
+                {
+                    self.scroll_last = None;
+                }
+            }
             Message::ToggleDrawer => self.drawer_open = true,
             Message::CloseDrawer => self.drawer_open = false,
             Message::SelectAllInboxes => {
@@ -997,6 +1013,12 @@ impl App {
             iced_android::system_scale().map(Message::SystemScale),
             Subscription::run(core_events),
             iced::time::every(Duration::from_secs(30)).map(|_| Message::Tick),
+            // Only poll for the scrollbar fade while a scroll is still recent.
+            if self.scroll_last.is_some() {
+                iced::time::every(Duration::from_millis(100)).map(|_| Message::ScrollTick)
+            } else {
+                Subscription::none()
+            },
             // Android 13+ stops calling `onBackPressed` once
             // `enableOnBackInvokedCallback` is set; iced_android registers the
             // system callback and reports the gesture as a `BrowserBack` key
@@ -1343,6 +1365,31 @@ mod tests {
         assert!(app.restore_picker.is_none());
         assert!(!app.settings.notifications, "restored settings must apply");
         assert!(app.toast.current.is_some(), "restore reports via toast");
+    }
+
+    #[test]
+    fn scrolling_reveals_the_scrollbar_then_it_hides_after_the_idle_pause() {
+        let idle = || std::time::Instant::now() - crate::app::SCROLLBAR_IDLE;
+        let mut app = App::for_test();
+        assert!(!app.scrollbars_visible());
+
+        let _ = app.update(Message::Scrolled(120.0));
+        assert!(app.scrollbars_visible(), "a real scroll shows the bar");
+
+        // Repeating the same offset is a layout pass, not a scroll.
+        app.scroll_last = Some(idle());
+        let _ = app.update(Message::Scrolled(120.0));
+        assert!(
+            !app.scrollbars_visible(),
+            "an unchanged offset must not revive the bar"
+        );
+
+        // A new offset revives it, and the idle tick clears it again.
+        let _ = app.update(Message::Scrolled(240.0));
+        assert!(app.scrollbars_visible());
+        app.scroll_last = Some(idle());
+        let _ = app.update(Message::ScrollTick);
+        assert!(!app.scrollbars_visible(), "the idle tick hides the bar");
     }
 
     #[test]

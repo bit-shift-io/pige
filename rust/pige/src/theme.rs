@@ -439,6 +439,9 @@ thread_local! {
     /// The palette components draw with. The shell sets it once at the start of
     /// each view; tests and standalone builders get the dark default.
     static ACTIVE: Cell<Palette> = const { Cell::new(palette(true)) };
+    /// Whether scrollbars are currently shown. The shell sets it once per view
+    /// from the recent-scroll flag; idle content stays clean.
+    static SCROLLBARS: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The palette components currently draw with.
@@ -452,9 +455,54 @@ pub fn set_active(palette: Palette) {
     ACTIVE.with(|active| active.set(palette));
 }
 
+/// Whether scrollbars should be drawn this frame.
+pub fn scrollbars_visible() -> bool {
+    SCROLLBARS.with(Cell::get)
+}
+
+/// Sets the scrollbar visibility for the frame being built.
+pub fn set_scrollbars_visible(visible: bool) {
+    SCROLLBARS.with(|active| active.set(visible));
+}
+
+/// The vertical scrollbar config for a [`scrollable`]: a slim pill while the
+/// user is scrolling, and a zero-width bar (which draws nothing) when idle.
+/// Shared so every scroller in the app matches.
+pub fn vertical_scrollbar(visible: bool) -> iced::widget::scrollable::Direction {
+    use iced::widget::scrollable::{Direction, Scrollbar};
+    let width = active().metrics.scrollbar_width;
+    Direction::Vertical(if visible {
+        Scrollbar::new()
+            .width(width)
+            .scroller_width(width)
+            .margin(2.0)
+    } else {
+        Scrollbar::hidden()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scrollbar_is_slim_when_visible_and_hidden_when_idle() {
+        use iced::widget::scrollable::{Direction, Scrollbar};
+        let width = active().metrics.scrollbar_width;
+        assert_eq!(
+            vertical_scrollbar(false),
+            Direction::Vertical(Scrollbar::hidden())
+        );
+        assert_eq!(
+            vertical_scrollbar(true),
+            Direction::Vertical(
+                Scrollbar::new()
+                    .width(width)
+                    .scroller_width(width)
+                    .margin(2.0)
+            )
+        );
+    }
 
     #[test]
     fn light_and_dark_palettes_are_complete_and_distinct() {

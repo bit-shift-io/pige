@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use iced::widget::{button, column, container, row, scrollable, space, stack};
+use iced::widget::{button, column, container, row, space, stack};
 use iced::{Alignment, Element, Fill};
 use pige_core::account::{
     ACCOUNT_COLORS, Account, AccountId, Security,
@@ -301,12 +301,7 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
         list_view(app)
     };
 
-    page = page.push(
-        scrollable(body)
-            .width(Fill)
-            .height(Fill)
-            .style(palette.scrollable()),
-    );
+    page = page.push(components::scroller(body));
 
     let page: Element<'a, Message> = page.into();
 

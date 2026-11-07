@@ -176,16 +176,6 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
         );
     }
 
-    let mut trailing = column![]
-        .width(palette.space.lg)
-        .align_x(iced::Alignment::End);
-    if item.unread {
-        trailing = trailing.push(unread_dot(palette));
-    }
-    if item.count > 1 {
-        trailing = trailing.push(badge(item.count, palette));
-    }
-
     let lines = column![
         top.width(Fill),
         subject_row,
@@ -216,10 +206,24 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
         None => avatar,
     };
 
-    let content = row![avatar, lines, trailing,]
+    let mut content = row![avatar, lines]
         .spacing(palette.space.md)
         .align_y(iced::Alignment::Center)
         .width(Fill);
+    // Only reserve the trailing column when it carries a dot or badge, so the
+    // date can sit closer to the edge.
+    if item.unread || item.count > 1 {
+        let mut trailing = column![]
+            .width(palette.space.lg)
+            .align_x(iced::Alignment::End);
+        if item.unread {
+            trailing = trailing.push(unread_dot(palette));
+        }
+        if item.count > 1 {
+            trailing = trailing.push(badge(item.count, palette));
+        }
+        content = content.push(trailing);
+    }
 
     let background = if item.unread {
         palette.surface_container

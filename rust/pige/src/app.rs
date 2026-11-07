@@ -1,7 +1,7 @@
 //! Application state and the pure presentation helpers the shell builds on.
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iced::window;
 use iced::{Color, Size, Task};
@@ -19,6 +19,9 @@ use crate::message::Message;
 use crate::screens::accounts::AccountsState;
 use crate::screens::compose::ComposeState;
 use crate::theme;
+
+/// How long scrollbars stay visible after the last real scroll.
+pub(crate) const SCROLLBAR_IDLE: Duration = Duration::from_millis(800);
 
 /// One folder row in an account group, carrying the id navigation needs to
 /// select it without re-resolving the snapshot.
@@ -95,6 +98,12 @@ pub struct App {
     pub(crate) insets: iced_android::Insets,
     pub(crate) dark: bool,
     pub(crate) list_motion: Motion,
+    /// When a scrollable last reported a real vertical offset change. `None`
+    /// means idle, so scrollbars stay hidden; see [`App::scrollbars_visible`].
+    pub(crate) scroll_last: Option<std::time::Instant>,
+    /// The last vertical offset seen, so layout-only notifications do not count
+    /// as scrolling.
+    pub(crate) scroll_offset: f32,
     /// The single shared brief-message channel (a small dark card at the
     /// bottom). Errors and results both flow through it.
     pub(crate) toast: Toast,
@@ -186,6 +195,8 @@ impl App {
                 insets: iced_android::Insets::default(),
                 dark,
                 list_motion: Motion::new(),
+                scroll_last: None,
+                scroll_offset: 0.0,
                 toast: Toast::default(),
                 reader_expanded: false,
                 spin_phase: 0,
@@ -226,6 +237,8 @@ impl App {
             insets: iced_android::Insets::default(),
             dark: true,
             list_motion: Motion::new(),
+            scroll_last: None,
+            scroll_offset: 0.0,
             toast: Toast::default(),
             reader_expanded: false,
             spin_phase: 0,
@@ -263,6 +276,13 @@ impl App {
     /// moves it.
     pub(crate) fn syncing(&self) -> bool {
         self.snapshot.status == pige_core::api::SyncStatus::Syncing
+    }
+
+    /// Whether scrollbars should be shown: only within [`SCROLLBAR_IDLE`] of the
+    /// last real scroll. `components::scroller` reads this once per view.
+    pub(crate) fn scrollbars_visible(&self) -> bool {
+        self.scroll_last
+            .is_some_and(|last| last.elapsed() < SCROLLBAR_IDLE)
     }
 
     /// Follow the Android system font scale. The renderer scales the whole

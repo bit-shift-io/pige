@@ -2,7 +2,7 @@
 //! "Earlier messages" section. Remote images stay as blocked placeholders; v1
 //! never fetches remote bytes, so there is no "Load images" action.
 
-use iced::widget::{column, container, row, scrollable, space};
+use iced::widget::{column, container, row, space};
 use iced::{Alignment, Element, Fill};
 use pige_core::account::AccountId;
 use pige_core::api::{self, ConversationDetail, MessageBody, MessageSummary};
@@ -375,11 +375,7 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
     content = content.push(header(detail));
 
     let Some(latest) = detail.messages.first() else {
-        return scrollable(content)
-            .width(Fill)
-            .height(Fill)
-            .style(palette.scrollable())
-            .into();
+        return components::scroller(content);
     };
 
     // Body, or a clear state when it is unavailable. Remote images remain
@@ -442,11 +438,7 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
         content = content.push(earlier_messages(detail, app));
     }
 
-    scrollable(content)
-        .width(Fill)
-        .height(Fill)
-        .style(palette.scrollable())
-        .into()
+    components::scroller(content)
 }
 
 /// Subject line plus the newest message's sender summary.

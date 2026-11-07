@@ -4,7 +4,7 @@
 //! `update`. Modelled on qlaunch's `screens/advanced.rs` (bitshift, MIT), with
 //! only the rows pige has.
 
-use iced::widget::{column, container, scrollable};
+use iced::widget::{column, container};
 use iced::{Element, Fill};
 use pige_core::api::ConfigOutcome;
 
@@ -98,8 +98,7 @@ pub(crate) fn view(_app: &App) -> Element<'_, Message> {
 
     let mut body = column![]
         .spacing(palette.space.md)
-        .width(Fill)
-        .max_width(palette.metrics.dialog_width);
+        .width(Fill);
     for row in rows() {
         body = body.push(components::action_card(
             row.label(),
@@ -111,10 +110,11 @@ pub(crate) fn view(_app: &App) -> Element<'_, Message> {
 
     column![
         components::app_bar("Advanced", leading, vec![]),
-        scrollable(container(body).width(Fill).padding(palette.space.xl))
-            .width(Fill)
-            .height(Fill)
-            .style(palette.scrollable()),
+        components::scroller(
+            container(body)
+                .width(Fill)
+                .padding([palette.space.lg, palette.space.lg]),
+        ),
     ]
     .spacing(0)
     .width(Fill)

@@ -3,7 +3,7 @@
 //! The screen is pure state and layout; sending, saving, and discarding all run
 //! through `Task::perform` in `update`. v1 is deliberately plain text only.
 
-use iced::widget::{column, container, row, scrollable, text_editor};
+use iced::widget::{column, container, row, text_editor};
 use iced::{Alignment, Element, Fill, Length};
 use pige_core::account::AccountId;
 use pige_core::mail::Address;
@@ -240,13 +240,10 @@ pub fn screen<'a>(_app: &'a App, compose: &'a ComposeState) -> Element<'a, Messa
 
     let page = column![
         components::app_bar(compose.title(), leading, Vec::new()),
-        scrollable(form(
+        components::scroller(form(
             compose,
             Length::Fixed(palette.metrics.compose_body_height)
-        ))
-        .width(Fill)
-        .height(Fill)
-        .style(palette.scrollable()),
+        )),
         action_bar(compose),
     ]
     .spacing(0)

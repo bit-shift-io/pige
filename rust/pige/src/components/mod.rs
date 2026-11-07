@@ -167,6 +167,20 @@ pub fn confirm<'a>(
     )
 }
 
+/// A full-pane vertical scroller with the shared scrollbar: slim, and hidden
+/// until the user scrolls. Screens use this instead of `scrollable` so every
+/// list, form and settings page matches. It reports scroll offsets through
+/// [`Message::Scrolled`] so the shell can show the bar only while scrolling.
+pub fn scroller<'a>(content: impl Into<iced::Element<'a, Message>>) -> iced::Element<'a, Message> {
+    iced::widget::scrollable(content)
+        .width(iced::Fill)
+        .height(iced::Fill)
+        .direction(theme::vertical_scrollbar(theme::scrollbars_visible()))
+        .style(theme::active().scrollable())
+        .on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y))
+        .into()
+}
+
 /// A text widget that already carries the palette's type style and colour.
 pub(crate) fn styled_text<'a>(
     value: impl Into<String>,

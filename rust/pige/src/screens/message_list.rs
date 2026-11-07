@@ -1,6 +1,6 @@
 //! The conversation list, with pull-to-refresh and paging.
 
-use iced::widget::{column, container, scrollable};
+use iced::widget::{column, container};
 use iced::{Element, Fill, Length};
 use pige_core::mail::FolderKind;
 
@@ -64,12 +64,7 @@ pub fn list_pane<'a>(
     }
 
     if search::is_active(app) {
-        let scroller: Element<'a, Message> = scrollable(search::results(app))
-            .width(Fill)
-            .height(Fill)
-            .style(palette.scrollable())
-            .into();
-        pane = pane.push(scroller);
+        pane = pane.push(components::scroller(search::results(app)));
     } else if drafts_selected(app) {
         let drafts = selected_drafts(app);
         if drafts.is_empty() {
@@ -78,12 +73,7 @@ pub fn list_pane<'a>(
                 "Messages you save as drafts appear here.",
             ));
         } else {
-            let scroller: Element<'a, Message> = scrollable(draft_rows(&drafts))
-                .width(Fill)
-                .height(Fill)
-                .style(palette.scrollable())
-                .into();
-            pane = pane.push(scroller);
+            pane = pane.push(components::scroller(draft_rows(&drafts)));
         }
     } else if app.snapshot.conversations.is_empty() {
         pane = pane.push(components::empty_state(empty_title(app), empty_body(app)));
@@ -114,12 +104,7 @@ pub fn list_pane<'a>(
             );
         }
 
-        let scroller: Element<'a, Message> =
-            scrollable(elastic_scroll::content(rows.into(), &app.list_motion))
-                .width(Fill)
-                .height(Fill)
-                .style(palette.scrollable())
-                .into();
+        let scroller = components::scroller(elastic_scroll::content(rows.into(), &app.list_motion));
         let scroller = components::pull_refresh::wrap(scroller, Message::Refresh);
         pane = pane.push(elastic_scroll::wrap(
             scroller,

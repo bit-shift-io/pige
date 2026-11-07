@@ -1,6 +1,6 @@
 //! The navigation rail and compact/medium drawer.
 
-use iced::widget::{column, container, scrollable, space};
+use iced::widget::{column, container, space};
 use iced::{Element, Fill};
 
 use crate::app::{App, sections};
@@ -44,10 +44,7 @@ pub fn navigation<'a>(app: &'a App) -> Element<'a, Message> {
         }
     }
 
-    let body = scrollable(body)
-        .width(Fill)
-        .height(Fill)
-        .style(palette.scrollable());
+    let body = components::scroller(body);
 
     let nav = column![
         components::app_bar("pige", None, Vec::new()),

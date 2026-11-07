@@ -13,6 +13,7 @@ use crate::theme;
 impl App {
     pub(crate) fn view(&self, _window: window::Id) -> Element<'_, Message> {
         theme::set_active(theme::palette(self.dark));
+        theme::set_scrollbars_visible(self.scrollbars_visible());
 
         let breakpoint = Breakpoint::from_width(self.size.width);
         let reading = self.snapshot.selected_conversation.is_some();

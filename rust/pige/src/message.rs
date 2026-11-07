@@ -62,6 +62,11 @@ pub enum Message {
     Insets(iced_android::Insets),
     /// The periodic UI tick that keeps relative dates fresh.
     Tick,
+    /// A scrollable reported its new vertical offset. The shell shows
+    /// scrollbars briefly after a real offset change.
+    Scrolled(f32),
+    /// The scrollbar idle timer fired; hide the bars once the pause is long.
+    ScrollTick,
     ToggleDrawer,
     CloseDrawer,
     /// The pinned unified-inbox shortcut.
