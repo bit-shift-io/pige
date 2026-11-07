@@ -2177,18 +2177,21 @@ fn seeded_account(id: &str, label: &str) -> pige_core::Account {
         label: label.to_string(),
         email: format!("{id}@example.com"),
         display_name: label.to_string(),
-        username: format!("{id}@example.com"),
-        imap: ServerConfig {
-            host: "imap.example.com".to_string(),
-            port: 993,
-            security: Security::Tls,
+        backend: pige_core::account::MailBackend::ImapSmtp {
+            username: format!("{id}@example.com"),
+            imap: ServerConfig {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                security: Security::Tls,
+            },
+            smtp: ServerConfig {
+                host: "smtp.example.com".to_string(),
+                port: 465,
+                security: Security::Tls,
+            },
+            auth: pige_core::AuthKind::Password,
         },
-        smtp: ServerConfig {
-            host: "smtp.example.com".to_string(),
-            port: 465,
-            security: Security::Tls,
-        },
-        auth: pige_core::AuthKind::Password,
+        contact_sources: Vec::new(),
         sort_order: 0,
         color: None,
     }

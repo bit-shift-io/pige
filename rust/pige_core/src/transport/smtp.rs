@@ -35,24 +35,32 @@ impl std::fmt::Debug for SmtpClient {
 /// The connection test distinguishes an offline server (the outbox stays
 /// queued) from a rejected message (the outbox row fails).
 pub async fn connect(account: &Account, password: &str) -> Result<SmtpClient, SendError> {
-    let host = account.smtp.host.trim();
+    // Only an IMAP/SMTP backend has an SMTP endpoint. A native account returns
+    // an explicit error rather than submitting to an invented server.
+    let Some((username, _imap, smtp, _auth)) = account.imap_smtp() else {
+        return Err(SendError(format!(
+            "{} is not an IMAP/SMTP account",
+            account.label
+        )));
+    };
+    let host = smtp.host.trim();
     if host.is_empty() {
         return Err(SendError("SMTP host is empty".to_string()));
     }
 
-    let builder = match account.smtp.security {
+    let builder = match smtp.security {
         Security::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(host),
         Security::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host),
     }
     .map_err(|error| SendError(format!("SMTP TLS setup for {host}: {error}")))?;
 
-    let username = if account.username.trim().is_empty() {
+    let username = if username.trim().is_empty() {
         account.email.clone()
     } else {
-        account.username.clone()
+        username.to_string()
     };
     let transport = builder
-        .port(account.smtp.port)
+        .port(smtp.port)
         .credentials(Credentials::new(username, password.to_string()))
         .timeout(Some(Duration::from_secs(30)))
         .build();
@@ -65,13 +73,13 @@ pub async fn connect(account: &Account, password: &str) -> Result<SmtpClient, Se
         Ok(false) => {
             return Err(SendError(format!(
                 "SMTP server {} did not answer the connection test",
-                account.smtp.host
+                smtp.host
             )));
         }
         Err(error) => {
             return Err(SendError(format!(
                 "connect to {}:{}: {error}",
-                account.smtp.host, account.smtp.port
+                smtp.host, smtp.port
             )));
         }
     }
@@ -121,18 +129,21 @@ mod tests {
             label: "Personal".to_string(),
             email: "ada@example.com".to_string(),
             display_name: "Ada".to_string(),
-            username: "ada@example.com".to_string(),
-            imap: ServerConfig {
-                host: "imap.example.com".to_string(),
-                port: 993,
-                security,
+            backend: crate::account::MailBackend::ImapSmtp {
+                username: "ada@example.com".to_string(),
+                imap: ServerConfig {
+                    host: "imap.example.com".to_string(),
+                    port: 993,
+                    security,
+                },
+                smtp: ServerConfig {
+                    host: "smtp.example.com".to_string(),
+                    port: 587,
+                    security,
+                },
+                auth: AuthKind::Password,
             },
-            smtp: ServerConfig {
-                host: "smtp.example.com".to_string(),
-                port: 587,
-                security,
-            },
-            auth: AuthKind::Password,
+            contact_sources: Vec::new(),
             sort_order: 0,
             color: None,
         }
@@ -141,7 +152,11 @@ mod tests {
     #[tokio::test]
     async fn empty_hosts_are_rejected_before_any_network_io() {
         let mut account = account(Security::Tls);
-        account.smtp.host.clear();
+        if let crate::account::MailBackend::ImapSmtp { smtp, .. } = &mut account.backend {
+            smtp.host.clear();
+        } else {
+            panic!("expected an IMAP/SMTP backend");
+        }
         let error = connect(&account, "secret").await.expect_err("empty host");
         assert!(error.to_string().contains("SMTP host"));
     }

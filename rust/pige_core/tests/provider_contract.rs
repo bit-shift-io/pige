@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pige_core::account::{Account, AccountId, AuthKind, Security, ServerConfig};
+use pige_core::account::{Account, AccountId, AuthKind, MailBackend, Security, ServerConfig};
 use pige_core::providers::{
     ErrorKind, OperationContext, ProviderCursor, ProviderError, ProviderFactory, ProviderId,
     ProviderRegistry, SentCopyPolicy, SyncRequest, fake::FakeProviderFactory,
@@ -27,10 +27,13 @@ fn account() -> Account {
         label: "Example".to_string(),
         email: "me@example.com".to_string(),
         display_name: "Me".to_string(),
-        username: "me".to_string(),
-        imap: server.clone(),
-        smtp: server,
-        auth: AuthKind::Password,
+        backend: MailBackend::ImapSmtp {
+            username: "me".to_string(),
+            imap: server.clone(),
+            smtp: server,
+            auth: AuthKind::Password,
+        },
+        contact_sources: Vec::new(),
         sort_order: 0,
         color: None,
     }

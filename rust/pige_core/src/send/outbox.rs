@@ -685,18 +685,21 @@ mod tests {
             label: "A".to_string(),
             email: "a@example.com".to_string(),
             display_name: "A".to_string(),
-            username: "a@example.com".to_string(),
-            imap: crate::account::ServerConfig {
-                host: "imap.example.com".to_string(),
-                port: 993,
-                security: crate::account::Security::Tls,
+            backend: crate::account::MailBackend::ImapSmtp {
+                username: "a@example.com".to_string(),
+                imap: crate::account::ServerConfig {
+                    host: "imap.example.com".to_string(),
+                    port: 993,
+                    security: crate::account::Security::Tls,
+                },
+                smtp: crate::account::ServerConfig {
+                    host: "smtp.example.com".to_string(),
+                    port: 465,
+                    security: crate::account::Security::Tls,
+                },
+                auth: crate::account::AuthKind::Password,
             },
-            smtp: crate::account::ServerConfig {
-                host: "smtp.example.com".to_string(),
-                port: 465,
-                security: crate::account::Security::Tls,
-            },
-            auth: crate::account::AuthKind::Password,
+            contact_sources: Vec::new(),
             sort_order: 0,
             color: None,
         };

@@ -18,18 +18,21 @@ fn account() -> Account {
         label: "Personal".to_string(),
         email: "ada@example.com".to_string(),
         display_name: "Ada Lovelace".to_string(),
-        username: "ada@example.com".to_string(),
-        imap: ServerConfig {
-            host: "imap.example.com".to_string(),
-            port: 993,
-            security: Security::Tls,
+        backend: pige_core::account::MailBackend::ImapSmtp {
+            username: "ada@example.com".to_string(),
+            imap: ServerConfig {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                security: Security::Tls,
+            },
+            smtp: ServerConfig {
+                host: "smtp.example.com".to_string(),
+                port: 465,
+                security: Security::Tls,
+            },
+            auth: AuthKind::Password,
         },
-        smtp: ServerConfig {
-            host: "smtp.example.com".to_string(),
-            port: 465,
-            security: Security::Tls,
-        },
-        auth: AuthKind::Password,
+        contact_sources: Vec::new(),
         sort_order: 0,
         color: None,
     }

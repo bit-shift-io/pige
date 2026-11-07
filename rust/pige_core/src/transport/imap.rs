@@ -44,16 +44,24 @@ impl ImapTransport {
 /// Connect to `account`'s IMAP server using password authentication and the
 /// account's configured security mode.
 pub async fn connect(account: &Account, password: &str) -> Result<ImapTransport, TransportError> {
-    let client = tls::open(&account.imap.host, account.imap.port, account.imap.security).await?;
-    let username = if account.username.is_empty() {
-        &account.email
+    // Only an IMAP/SMTP backend has an endpoint. A native account returns an
+    // explicit error instead of connecting to an invented server.
+    let Some((username, imap, _smtp, _auth)) = account.imap_smtp() else {
+        return Err(TransportError(format!(
+            "{} is not an IMAP/SMTP account",
+            account.label
+        )));
+    };
+    let client = tls::open(&imap.host, imap.port, imap.security).await?;
+    let username = if username.is_empty() {
+        account.email.as_str()
     } else {
-        &account.username
+        username
     };
     let session = client
         .login(username, password)
         .await
-        .map_err(|(e, _)| TransportError(format!("login {}: {e}", account.imap.host)))?;
+        .map_err(|(e, _)| TransportError(format!("login {}: {e}", imap.host)))?;
     Ok(ImapTransport {
         session,
         capabilities: None,

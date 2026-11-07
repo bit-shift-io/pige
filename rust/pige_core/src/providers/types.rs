@@ -16,10 +16,18 @@ use crate::mail::{AttachmentDisposition, Flags, FolderKind, MessageHeader};
 
 use super::error::ProviderError;
 
-/// The backend id of the legacy IMAP/SMTP account shape. It is the only
-/// provider the current account configuration can describe; F2 introduces typed
-/// backends and keeps returning this value for existing accounts.
+/// The backend id of the legacy IMAP/SMTP account shape. Every account written
+/// before typed backends existed maps to this value, and it stays the dispatch
+/// key for the IMAP/SMTP adapter.
 pub const IMAP_SMTP_PROVIDER: &str = "imap-smtp";
+
+/// The backend id of a native Gmail account. Only the account *shape* exists in
+/// F2; the Gmail adapter arrives with the Google subplan.
+pub const GMAIL_PROVIDER: &str = "gmail";
+
+/// The backend id of a native Proton account. Only the account *shape* exists in
+/// F2; the Proton adapter arrives with the Proton subplan.
+pub const PROTON_PROVIDER: &str = "proton";
 
 /// Define a provider-neutral string identifier. Remote identifiers are opaque
 /// to the application and never compared against local ids.

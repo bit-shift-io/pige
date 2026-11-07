@@ -47,18 +47,21 @@ async fn lists_folders_against_a_real_server() {
         label: "Live".to_string(),
         email: user.clone(),
         display_name: String::new(),
-        username: user.clone(),
-        imap: ServerConfig {
-            host,
-            port: 993,
-            security: Security::Tls,
+        backend: pige_core::account::MailBackend::ImapSmtp {
+            username: user.clone(),
+            imap: ServerConfig {
+                host,
+                port: 993,
+                security: Security::Tls,
+            },
+            smtp: ServerConfig {
+                host: String::new(),
+                port: 465,
+                security: Security::Tls,
+            },
+            auth: AuthKind::Password,
         },
-        smtp: ServerConfig {
-            host: String::new(),
-            port: 465,
-            security: Security::Tls,
-        },
-        auth: AuthKind::Password,
+        contact_sources: Vec::new(),
         sort_order: 0,
         color: None,
     };

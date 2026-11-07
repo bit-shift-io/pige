@@ -557,18 +557,21 @@ async fn gated_real_imap_connection() {
         label: "Live".to_string(),
         email: user.clone(),
         display_name: "Live".to_string(),
-        username: user,
-        imap: ServerConfig {
-            host,
-            port,
-            security: Security::Tls,
+        backend: pige_core::account::MailBackend::ImapSmtp {
+            username: user,
+            imap: ServerConfig {
+                host,
+                port,
+                security: Security::Tls,
+            },
+            smtp: ServerConfig {
+                host: "smtp.invalid".to_string(),
+                port: 465,
+                security: Security::Tls,
+            },
+            auth: AuthKind::Password,
         },
-        smtp: ServerConfig {
-            host: "smtp.invalid".to_string(),
-            port: 465,
-            security: Security::Tls,
-        },
-        auth: AuthKind::Password,
+        contact_sources: Vec::new(),
         sort_order: 0,
         color: None,
     };

@@ -7,7 +7,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::providers::{IMAP_SMTP_PROVIDER, ProviderId};
+use crate::providers::{
+    ContactSourceId, GMAIL_PROVIDER, IMAP_SMTP_PROVIDER, PROTON_PROVIDER, ProviderId,
+};
 
 /// Stable identifier for an account; never derived from the email address so
 /// an account can be relabelled or re-authenticated without losing its cache.
@@ -106,18 +108,86 @@ pub fn is_supported_account_color(color: &str) -> bool {
     ACCOUNT_COLORS.contains(&color)
 }
 
+/// The typed backend that owns an account's mailboxes, mail, and submission.
+///
+/// Accounts are versioned by backend: an IMAP/SMTP account keeps its servers,
+/// while a native account carries only the provider-side user id. Provider SDK
+/// types and protocol identifiers never appear here — only the neutral
+/// [`ProviderId`] the registry dispatches on. A native backend deliberately has
+/// no IMAP endpoint, so no fake servers are ever invented for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum MailBackend {
+    /// A legacy or manually configured IMAP (read) plus SMTP (submit) account.
+    ImapSmtp {
+        /// IMAP login name; often the full address but kept separate because
+        /// some servers use a bare username.
+        username: String,
+        imap: ServerConfig,
+        smtp: ServerConfig,
+        auth: AuthKind,
+    },
+    /// A native Gmail account authenticated against Google's APIs.
+    Gmail { user_id: String },
+    /// A native Proton account. `user_id` is optional because some Proton
+    /// sessions are keyed by username rather than a numeric user id.
+    Proton { user_id: Option<String> },
+}
+
+impl MailBackend {
+    /// Build the legacy IMAP/SMTP backend with password authentication.
+    pub fn imap_smtp(
+        username: impl Into<String>,
+        imap: ServerConfig,
+        smtp: ServerConfig,
+    ) -> Self {
+        Self::ImapSmtp {
+            username: username.into(),
+            imap,
+            smtp,
+            auth: AuthKind::Password,
+        }
+    }
+
+    /// Build a native Gmail backend.
+    pub fn gmail(user_id: impl Into<String>) -> Self {
+        Self::Gmail {
+            user_id: user_id.into(),
+        }
+    }
+
+    /// Build a native Proton backend.
+    pub fn proton(user_id: Option<String>) -> Self {
+        Self::Proton { user_id }
+    }
+}
+
+/// One contact source attached to an account. Accounts keep the sources they
+/// enabled; the provider id says which adapter reads it and `kind` is an
+/// adapter-defined source category (never a protocol token). A migrated v1
+/// account has no sources and therefore no contacts or tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactSourceConfig {
+    pub id: ContactSourceId,
+    pub provider: ProviderId,
+    pub kind: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub id: AccountId,
     pub label: String,
     pub email: String,
     pub display_name: String,
-    /// IMAP login name; often the full address but kept separate because some
-    /// servers use a bare username.
-    pub username: String,
-    pub imap: ServerConfig,
-    pub smtp: ServerConfig,
-    pub auth: AuthKind,
+    /// Which backend serves this account. Versioned: the configuration document
+    /// stores the backend shape directly, so a native account needs no IMAP
+    /// endpoint and a Gmail-over-IMAP account is never silently converted.
+    pub backend: MailBackend,
+    /// Contact sources the user enabled for this account. Empty for accounts
+    /// written before contacts existed and for IMAP-only accounts.
+    #[serde(default)]
+    pub contact_sources: Vec<ContactSourceConfig>,
     /// User-controlled ordering in the navigation rail.
     pub sort_order: i64,
     /// Accent colour as a `#rrggbb` string from [`ACCOUNT_COLORS`]. Older
@@ -128,11 +198,28 @@ pub struct Account {
 }
 
 impl Account {
-    /// The backend that serves this account. The current account shape is
-    /// always IMAP/SMTP; F2 replaces the protocol fields with typed backends
-    /// while keeping this helper as the registry's dispatch key.
+    /// The backend that serves this account, as the registry's dispatch key.
     pub fn provider_id(&self) -> ProviderId {
-        ProviderId::from(IMAP_SMTP_PROVIDER)
+        match &self.backend {
+            MailBackend::ImapSmtp { .. } => ProviderId::from(IMAP_SMTP_PROVIDER),
+            MailBackend::Gmail { .. } => ProviderId::from(GMAIL_PROVIDER),
+            MailBackend::Proton { .. } => ProviderId::from(PROTON_PROVIDER),
+        }
+    }
+
+    /// The IMAP/SMTP connection details, or `None` for a native backend. This
+    /// is the only way protocol code reads the legacy fields, so a native
+    /// account can never be mistaken for an IMAP account with empty servers.
+    pub fn imap_smtp(&self) -> Option<(&str, &ServerConfig, &ServerConfig, AuthKind)> {
+        match &self.backend {
+            MailBackend::ImapSmtp {
+                username,
+                imap,
+                smtp,
+                auth,
+            } => Some((username.as_str(), imap, smtp, *auth)),
+            MailBackend::Gmail { .. } | MailBackend::Proton { .. } => None,
+        }
     }
 
     /// The resolved accent colour, falling back to the sort-order default for

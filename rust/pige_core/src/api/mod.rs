@@ -21,7 +21,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 
 use crate::account::{
-    Account, AccountId, AuthKind, ServerConfig, default_account_color, is_supported_account_color,
+    Account, AccountId, AuthKind, MailBackend, ServerConfig, default_account_color,
+    is_supported_account_color,
 };
 use crate::config::{self, ConfigDocument};
 use crate::html::{MailDocument, parse_html, plain_text_document};
@@ -186,20 +187,25 @@ impl AccountInput {
         Ok(())
     }
 
+    /// Build an IMAP/SMTP account. The legacy input is an IMAP-only onboarding
+    /// wrapper; native backends are never produced from it.
     fn into_account(self, id: AccountId, sort_order: i64) -> Account {
         Account {
             id,
             label: self.label.trim().to_string(),
             email: self.email.trim().to_string(),
             display_name: self.display_name.trim().to_string(),
-            username: if self.username.trim().is_empty() {
-                self.email.trim().to_string()
-            } else {
-                self.username.trim().to_string()
+            backend: MailBackend::ImapSmtp {
+                username: if self.username.trim().is_empty() {
+                    self.email.trim().to_string()
+                } else {
+                    self.username.trim().to_string()
+                },
+                imap: self.imap,
+                smtp: self.smtp,
+                auth: AuthKind::Password,
             },
-            imap: self.imap,
-            smtp: self.smtp,
-            auth: AuthKind::Password,
+            contact_sources: Vec::new(),
             sort_order,
             color: Some(default_account_color(sort_order).to_string()),
         }
@@ -603,6 +609,19 @@ fn load_or_migrate_document(store: &Store, path: &Path) -> (ConfigDocument, Opti
                 }
             }
         }
+        Err(config::ConfigError::TooNew { found, supported }) => {
+            // The file was written by a newer build. Leave it exactly as it is
+            // (never quarantine or overwrite it) and refuse every later write.
+            log::warn!("configuration format {found} is newer than supported {supported}");
+            let doc = document_from_store(store);
+            (
+                doc,
+                Some(format!(
+                    "The configuration file was written by a newer version of pige (format {found}; this build supports {supported}); changes will not be saved."
+                )),
+                true,
+            )
+        }
         Err(config::ConfigError::Io(error)) => {
             // The file exists but could not be read. Leave it untouched and
             // refuse to overwrite it on any later write.
@@ -746,7 +765,7 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         .read(&file_name)
         .map_err(|error| format!("read backup: {error}"))?;
     let restored: ConfigDocument =
-        serde_json::from_slice(&bytes).map_err(|error| format!("read backup: {error}"))?;
+        config::parse_document(&bytes).map_err(|error| format!("read backup: {error}"))?;
 
     // Everything below is a committed change; a failure before the document is
     // durable leaves the running configuration exactly as it was.
@@ -1061,6 +1080,15 @@ async fn update_account_inner(
             .find(|account| &account.id == id)
             .cloned()
             .ok_or_else(|| format!("unknown account {id}"))?;
+
+        // The legacy form is IMAP-only. Never rewrite a native backend into an
+        // IMAP/SMTP account with invented endpoints.
+        if existing.imap_smtp().is_none() {
+            return Err(
+                "this account uses a native backend and cannot be edited as an IMAP/SMTP account"
+                    .to_string(),
+            );
+        }
 
         let wrote_secret = !input.password.is_empty();
         let target = if session_only {

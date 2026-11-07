@@ -115,21 +115,52 @@ impl AccountForm {
 
     /// Edit an existing account. The password is never read back from the
     /// keychain; the user re-enters it to test and save.
+    ///
+    /// The form edits IMAP/SMTP accounts only. A native account (Gmail or
+    /// Proton) has no endpoints, so the form is left with empty, manual fields
+    /// rather than inventing a server for it; the API also refuses to convert a
+    /// native backend through this form.
     pub fn from_account(account: &Account) -> Self {
+        let imap_smtp = account.imap_smtp();
+        let (username, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security) =
+            match imap_smtp {
+                Some((username, imap, smtp, _auth)) => (
+                    username.to_string(),
+                    imap.host.clone(),
+                    imap.port.to_string(),
+                    imap.security,
+                    smtp.host.clone(),
+                    smtp.port.to_string(),
+                    smtp.security,
+                ),
+                None => (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    Security::Tls,
+                    String::new(),
+                    String::new(),
+                    Security::Tls,
+                ),
+            };
+        let preset = match imap_smtp {
+            Some(_) => detect(&imap_host, &smtp_host),
+            None => ProviderPreset::Manual,
+        };
         Self {
             editing: Some(account.id.clone()),
             label: account.label.clone(),
             email: account.email.clone(),
             display_name: account.display_name.clone(),
-            username: account.username.clone(),
+            username,
             password: String::new(),
-            preset: detect(&account.imap.host, &account.smtp.host),
-            imap_host: account.imap.host.clone(),
-            imap_port: account.imap.port.to_string(),
-            imap_security: account.imap.security,
-            smtp_host: account.smtp.host.clone(),
-            smtp_port: account.smtp.port.to_string(),
-            smtp_security: account.smtp.security,
+            preset,
+            imap_host,
+            imap_port,
+            imap_security,
+            smtp_host,
+            smtp_port,
+            smtp_security,
             test: TestState::Idle,
             busy: false,
         }
@@ -681,18 +712,21 @@ mod tests {
             label: "Work".into(),
             email: "grace@example.com".into(),
             display_name: "Grace".into(),
-            username: "grace@example.com".into(),
-            imap: pige_core::account::ServerConfig {
-                host: "imap.fastmail.com".into(),
-                port: 993,
-                security: Security::Tls,
+            backend: pige_core::account::MailBackend::ImapSmtp {
+                username: "grace@example.com".into(),
+                imap: pige_core::account::ServerConfig {
+                    host: "imap.fastmail.com".into(),
+                    port: 993,
+                    security: Security::Tls,
+                },
+                smtp: pige_core::account::ServerConfig {
+                    host: "smtp.fastmail.com".into(),
+                    port: 465,
+                    security: Security::Tls,
+                },
+                auth: pige_core::account::AuthKind::Password,
             },
-            smtp: pige_core::account::ServerConfig {
-                host: "smtp.fastmail.com".into(),
-                port: 465,
-                security: Security::Tls,
-            },
-            auth: pige_core::account::AuthKind::Password,
+            contact_sources: Vec::new(),
             sort_order: 0,
             color: None,
         };

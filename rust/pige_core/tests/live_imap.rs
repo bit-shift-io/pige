@@ -60,18 +60,21 @@ fn live_account(user: &str, imap_host: &str, smtp_host: &str) -> Account {
         label: "Live smoke".to_string(),
         email: user.to_string(),
         display_name: String::new(),
-        username: user.to_string(),
-        imap: ServerConfig {
-            host: imap_host.to_string(),
-            port: 993,
-            security: Security::Tls,
+        backend: pige_core::account::MailBackend::ImapSmtp {
+            username: user.to_string(),
+            imap: ServerConfig {
+                host: imap_host.to_string(),
+                port: 993,
+                security: Security::Tls,
+            },
+            smtp: ServerConfig {
+                host: smtp_host.to_string(),
+                port: 465,
+                security: Security::Tls,
+            },
+            auth: AuthKind::Password,
         },
-        smtp: ServerConfig {
-            host: smtp_host.to_string(),
-            port: 465,
-            security: Security::Tls,
-        },
-        auth: AuthKind::Password,
+        contact_sources: Vec::new(),
         sort_order: 0,
         color: None,
     }

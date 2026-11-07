@@ -12,26 +12,41 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::account::Account;
+use crate::account::{Account, AccountId, AuthKind, MailBackend, ServerConfig};
 use crate::settings::Settings;
 
 /// Format version written into the document. Bumped only for an incompatible
 /// change to the document shape.
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// - v1: an account carried `username`/`imap`/`smtp`/`auth` inline.
+/// - v2: an account carries a typed `backend` and `contact_sources`. A native
+///   backend needs no IMAP endpoint, so no fake servers are invented for it.
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Everything pige keeps in `pige.json`: the accounts and the settings. The
 /// mail cache is deliberately absent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConfigDocument {
     pub version: u32,
-    #[serde(default)]
     pub accounts: Vec<Account>,
-    #[serde(default)]
     pub settings: Settings,
     /// Bare sender addresses the user has blocked. Informational for now: no
     /// inbox filtering reads this yet, it only records the choice.
-    #[serde(default)]
     pub blocked_senders: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ConfigDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Single choke point: every deserialization goes through the version
+        // reader, so a v1 document can never be read back as a v2 document and
+        // a newer format is rejected here too.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let bytes = serde_json::to_vec(&value).map_err(serde::de::Error::custom)?;
+        parse_document(&bytes).map_err(|error| serde::de::Error::custom(error.to_string()))
+    }
 }
 
 impl Default for ConfigDocument {
@@ -54,6 +69,122 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
     #[error("no configuration directory is available")]
     NoRoot,
+    /// The file was written by a newer build (format `found`, this build
+    /// supports `supported`). It must never be overwritten, and callers treat
+    /// it like an unreadable file: keep it, start from the cache, block saves.
+    #[error("configuration format {found} is newer than supported format {supported}")]
+    TooNew { found: u32, supported: u32 },
+}
+
+/// The v1 wire shape of one account: protocol fields inline, no backend.
+#[derive(Debug, Deserialize)]
+struct AccountV1 {
+    id: AccountId,
+    label: String,
+    email: String,
+    display_name: String,
+    username: String,
+    imap: ServerConfig,
+    smtp: ServerConfig,
+    auth: AuthKind,
+    sort_order: i64,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+impl AccountV1 {
+    /// Migrate a v1 account into the v2 shape. The IMAP/SMTP backend is kept
+    /// exactly, so a Gmail-over-IMAP account stays an IMAP account and no
+    /// contacts or tokens are invented.
+    fn into_account(self) -> Account {
+        Account {
+            id: self.id,
+            label: self.label,
+            email: self.email,
+            display_name: self.display_name,
+            backend: MailBackend::ImapSmtp {
+                username: self.username,
+                imap: self.imap,
+                smtp: self.smtp,
+                auth: self.auth,
+            },
+            contact_sources: Vec::new(),
+            sort_order: self.sort_order,
+            color: self.color,
+        }
+    }
+}
+
+fn default_version_one() -> u32 {
+    1
+}
+
+/// The v1 document wire shape, read explicitly rather than being coerced into
+/// the v2 shape. The `version` field is validated by [`VersionProbe`] before
+/// this reader runs, so it is deliberately not part of the struct.
+#[derive(Debug, Deserialize)]
+struct DocumentV1 {
+    #[serde(default)]
+    accounts: Vec<AccountV1>,
+    #[serde(default)]
+    settings: Settings,
+    #[serde(default)]
+    blocked_senders: Vec<String>,
+}
+
+/// The v2 document wire shape. `Account` deserializes its typed `backend`
+/// directly; there is no "missing endpoint" fallback here.
+#[derive(Debug, Deserialize)]
+struct DocumentV2 {
+    #[serde(default)]
+    accounts: Vec<Account>,
+    #[serde(default)]
+    settings: Settings,
+    #[serde(default)]
+    blocked_senders: Vec<String>,
+}
+
+/// Only the version field, read first so an unknown newer format is rejected
+/// before the rest of the document is interpreted.
+#[derive(Debug, Deserialize)]
+struct VersionProbe {
+    #[serde(default = "default_version_one")]
+    version: u32,
+}
+
+/// Parse a document of any supported version into the current shape, migrating
+/// v1 accounts to typed backends. A format newer than [`CURRENT_VERSION`] is
+/// rejected with [`ConfigError::TooNew`] so callers never overwrite it.
+pub fn parse_document(bytes: &[u8]) -> Result<ConfigDocument, ConfigError> {
+    let probe: VersionProbe = serde_json::from_slice(bytes)?;
+    if probe.version > CURRENT_VERSION {
+        return Err(ConfigError::TooNew {
+            found: probe.version,
+            supported: CURRENT_VERSION,
+        });
+    }
+
+    if probe.version >= 2 {
+        let wire: DocumentV2 = serde_json::from_slice(bytes)?;
+        Ok(ConfigDocument {
+            version: CURRENT_VERSION,
+            accounts: wire.accounts,
+            settings: wire.settings,
+            blocked_senders: wire.blocked_senders,
+        })
+    } else {
+        let wire: DocumentV1 = serde_json::from_slice(bytes)?;
+        Ok(ConfigDocument {
+            version: CURRENT_VERSION,
+            accounts: wire
+                .accounts
+                .into_iter()
+                .map(AccountV1::into_account)
+                .collect(),
+            settings: wire.settings,
+            blocked_senders: wire.blocked_senders,
+        })
+    }
 }
 
 /// The configuration root for the environment values that decide it: the XDG
@@ -91,15 +222,23 @@ pub fn document_path(root: &Path) -> PathBuf {
 /// or report it instead of silently replacing the user's configuration.
 pub fn load(path: &Path) -> Result<Option<ConfigDocument>, ConfigError> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        // Any supported older version is read through its own wire reader and
+        // migrated in memory; a newer format is rejected, not reinterpreted.
+        Ok(bytes) => Ok(Some(parse_document(&bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ConfigError::Io(error)),
     }
 }
 
-/// Write the document atomically and durably.
+/// Write the document atomically and durably. The recorded version is always
+/// [`CURRENT_VERSION`], so a document constructed with a stale version field
+/// cannot be written back out as an older format.
 pub fn save(path: &Path, doc: &ConfigDocument) -> Result<(), ConfigError> {
-    let bytes = serde_json::to_vec_pretty(doc)?;
+    let normalized = ConfigDocument {
+        version: CURRENT_VERSION,
+        ..doc.clone()
+    };
+    let bytes = serde_json::to_vec_pretty(&normalized)?;
     write_atomic(path, &bytes)?;
     Ok(())
 }
@@ -184,7 +323,7 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{AccountId, AuthKind, Security, ServerConfig};
+    use crate::account::{AccountId, AuthKind, MailBackend, Security, ServerConfig};
 
     fn account(label: &str) -> Account {
         Account {
@@ -192,18 +331,21 @@ mod tests {
             label: label.to_string(),
             email: "ada@example.com".to_string(),
             display_name: "Ada".to_string(),
-            username: "ada@example.com".to_string(),
-            imap: ServerConfig {
-                host: "imap.example.com".to_string(),
-                port: 993,
-                security: Security::Tls,
+            backend: MailBackend::ImapSmtp {
+                username: "ada@example.com".to_string(),
+                imap: ServerConfig {
+                    host: "imap.example.com".to_string(),
+                    port: 993,
+                    security: Security::Tls,
+                },
+                smtp: ServerConfig {
+                    host: "smtp.example.com".to_string(),
+                    port: 465,
+                    security: Security::Tls,
+                },
+                auth: AuthKind::Password,
             },
-            smtp: ServerConfig {
-                host: "smtp.example.com".to_string(),
-                port: 465,
-                security: Security::Tls,
-            },
-            auth: AuthKind::Password,
+            contact_sources: Vec::new(),
             sort_order: 0,
             color: None,
         }

@@ -4,16 +4,26 @@
 //! truth for accounts; this table is a derived mirror kept so `ON DELETE
 //! CASCADE` and account-scoped joins keep working. Every account change in the
 //! API persists the document first and then calls [`Store::sync_accounts`].
+//!
+//! The typed backend is stored as JSON in the `backend` column (see migration
+//! v5) and contact sources as JSON in `contact_sources`. Rows written before
+//! v5 have no `backend`: they are read back as the legacy IMAP/SMTP shape from
+//! the inline `username`/`imap_*`/`smtp_*`/`auth_kind` columns. A native
+//! account stores only the backend JSON, and its unused legacy columns hold
+//! inert defaults, so `accounts()` never invents an endpoint for it.
 
 use rusqlite::{Connection, Row, params};
 
-use crate::account::{Account, AccountId, AuthKind, Security, ServerConfig};
+use crate::account::{
+    Account, AccountId, AuthKind, ContactSourceConfig, MailBackend, Security, ServerConfig,
+};
 
 use super::{Store, StoreError};
 
 const COLUMNS: &str = "id, label, email, display_name, username, \
      imap_host, imap_port, imap_security, \
-     smtp_host, smtp_port, smtp_security, auth_kind, sort_order";
+     smtp_host, smtp_port, smtp_security, auth_kind, sort_order, \
+     backend, contact_sources";
 
 impl Store {
     pub fn upsert_account(&self, account: &Account) -> Result<(), StoreError> {
@@ -59,12 +69,49 @@ impl Store {
 }
 
 pub(crate) fn upsert_account_on(conn: &Connection, account: &Account) -> Result<(), StoreError> {
+    // The legacy columns stay populated for IMAP/SMTP accounts so an older
+    // binary that reads only those columns still sees the servers. A native
+    // account has no endpoint: its legacy columns are inert defaults and the
+    // JSON `backend` column is authoritative on read.
+    let (username, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, auth) =
+        match &account.backend {
+            MailBackend::ImapSmtp {
+                username,
+                imap,
+                smtp,
+                auth,
+            } => (
+                username.clone(),
+                imap.host.clone(),
+                i64::from(imap.port),
+                imap.security.as_str().to_string(),
+                smtp.host.clone(),
+                i64::from(smtp.port),
+                smtp.security.as_str().to_string(),
+                auth.as_str().to_string(),
+            ),
+            MailBackend::Gmail { .. } | MailBackend::Proton { .. } => (
+                String::new(),
+                String::new(),
+                0i64,
+                Security::Tls.as_str().to_string(),
+                String::new(),
+                0i64,
+                Security::Tls.as_str().to_string(),
+                AuthKind::Password.as_str().to_string(),
+            ),
+        };
+
+    let backend = serde_json::to_string(&account.backend)?;
+    let contact_sources = serde_json::to_string(&account.contact_sources)?;
+
     conn.execute(
         "INSERT INTO accounts (
              id, label, email, display_name, username,
              imap_host, imap_port, imap_security,
-             smtp_host, smtp_port, smtp_security, auth_kind, sort_order
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             smtp_host, smtp_port, smtp_security, auth_kind, sort_order,
+             backend, contact_sources
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
              label = excluded.label,
              email = excluded.email,
@@ -77,21 +124,25 @@ pub(crate) fn upsert_account_on(conn: &Connection, account: &Account) -> Result<
              smtp_port = excluded.smtp_port,
              smtp_security = excluded.smtp_security,
              auth_kind = excluded.auth_kind,
-             sort_order = excluded.sort_order",
+             sort_order = excluded.sort_order,
+             backend = excluded.backend,
+             contact_sources = excluded.contact_sources",
         params![
             account.id.0,
             account.label,
             account.email,
             account.display_name,
-            account.username,
-            account.imap.host,
-            account.imap.port,
-            account.imap.security.as_str(),
-            account.smtp.host,
-            account.smtp.port,
-            account.smtp.security.as_str(),
-            account.auth.as_str(),
+            username,
+            imap_host,
+            imap_port,
+            imap_security,
+            smtp_host,
+            smtp_port,
+            smtp_security,
+            auth,
             account.sort_order,
+            backend,
+            contact_sources,
         ],
     )?;
     Ok(())
@@ -110,16 +161,37 @@ pub(crate) fn accounts_on(conn: &Connection) -> Result<Vec<Account>, StoreError>
 }
 
 fn account_from_row(row: &Row<'_>) -> Result<Account, StoreError> {
-    let imap_security: String = row.get(7)?;
-    let smtp_security: String = row.get(10)?;
-    let auth_kind: String = row.get(11)?;
+    let backend_json: Option<String> = row.get(13)?;
+    let backend = match backend_json {
+        Some(json) => serde_json::from_str::<MailBackend>(&json)?,
+        None => legacy_backend_from_row(row)?,
+    };
+
+    let raw_sources: String = row.get(14)?;
+    let contact_sources: Vec<ContactSourceConfig> = serde_json::from_str(&raw_sources)?;
 
     Ok(Account {
         id: AccountId(row.get(0)?),
         label: row.get(1)?,
         email: row.get(2)?,
         display_name: row.get(3)?,
-        username: row.get(4)?,
+        backend,
+        contact_sources,
+        sort_order: row.get(12)?,
+        // The mirror deliberately does not store presentation colour; the
+        // configuration document remains the source of truth for it.
+        color: None,
+    })
+}
+
+fn legacy_backend_from_row(row: &Row<'_>) -> Result<MailBackend, StoreError> {
+    let imap_security: String = row.get(7)?;
+    let smtp_security: String = row.get(10)?;
+    let auth_kind: String = row.get(11)?;
+    let username: String = row.get(4)?;
+
+    Ok(MailBackend::ImapSmtp {
+        username,
         imap: ServerConfig {
             host: row.get(5)?,
             port: row.get(6)?,
@@ -134,7 +206,5 @@ fn account_from_row(row: &Row<'_>) -> Result<Account, StoreError> {
         },
         auth: AuthKind::from_db(&auth_kind)
             .ok_or_else(|| StoreError::corrupt("accounts.auth_kind", auth_kind))?,
-        sort_order: row.get(12)?,
-        color: None,
     })
 }

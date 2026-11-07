@@ -24,18 +24,21 @@ fn account(id: &str, email: &str, order: i64) -> Account {
         label: id.to_string(),
         email: email.to_string(),
         display_name: id.to_string(),
-        username: email.to_string(),
-        imap: ServerConfig {
-            host: "imap.example.com".to_string(),
-            port: 993,
-            security: Security::Tls,
+        backend: pige_core::account::MailBackend::ImapSmtp {
+            username: email.to_string(),
+            imap: ServerConfig {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                security: Security::Tls,
+            },
+            smtp: ServerConfig {
+                host: "smtp.example.com".to_string(),
+                port: 465,
+                security: Security::Tls,
+            },
+            auth: AuthKind::Password,
         },
-        smtp: ServerConfig {
-            host: "smtp.example.com".to_string(),
-            port: 465,
-            security: Security::Tls,
-        },
-        auth: AuthKind::Password,
+        contact_sources: Vec::new(),
         sort_order: order,
         color: None,
     }
