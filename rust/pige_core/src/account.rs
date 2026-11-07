@@ -7,6 +7,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::providers::{IMAP_SMTP_PROVIDER, ProviderId};
+
 /// Stable identifier for an account; never derived from the email address so
 /// an account can be relabelled or re-authenticated without losing its cache.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -126,6 +128,13 @@ pub struct Account {
 }
 
 impl Account {
+    /// The backend that serves this account. The current account shape is
+    /// always IMAP/SMTP; F2 replaces the protocol fields with typed backends
+    /// while keeping this helper as the registry's dispatch key.
+    pub fn provider_id(&self) -> ProviderId {
+        ProviderId::from(IMAP_SMTP_PROVIDER)
+    }
+
     /// The resolved accent colour, falling back to the sort-order default for
     /// configuration written before colours existed.
     pub fn resolved_color(&self) -> &str {

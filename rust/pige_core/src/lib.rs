@@ -10,6 +10,7 @@ pub mod config;
 pub mod html;
 pub mod mail;
 pub mod platform;
+pub mod providers;
 pub mod search;
 pub mod send;
 pub mod settings;
