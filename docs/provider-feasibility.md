@@ -4,6 +4,7 @@ Date: 2026-11-07
 Branch: `feat/mail-providers`
 Task: S1 — Toolchain, dependency and licensing evidence
 Task: S2 — Supported Google authorization and API probes (appended in §9)
+Task: S3 — Native Proton interoperability and security gate (appended in §10)
 
 This document freezes the toolchain/dependency/licensing evidence that later
 provider tasks build on. It records what was measured on this branch before any
@@ -709,3 +710,441 @@ Until this decision is recorded, live Android authorization work stays parked.
 | `api_other_contacts` | BLOCKED | §9.7, §9.8 |
 | `gmail_modify_permanent_delete_false` | BLOCKED | §9.7, §9.8 |
 | `play_services_absent_or_disabled` | BLOCKED | §9.7, §9.8 |
+
+## 10. Proton dependency decision (Task S3)
+
+Date: 2026-11-08
+Branch: `feat/mail-providers`
+Task: S3 — Native Proton interoperability and security gate
+
+S3 freezes a `ProtonDependencyDecision`: the accepted source/version/features,
+honest application identification and API-access expectations, the key-policy
+and format matrix, the protected session fields, the fork/upstream patch
+procedure and upkeep budget, and the live/device test evidence. It writes no
+product code and adds no dependency to `rust/Cargo.toml`/`Cargo.lock`.
+
+**Outcome: the non-live deliverables are complete and a real extraction build
+of the candidate library against the approved Rust crypto backend was
+reproduced for `aarch64-linux-android`; every live, device, CAPTCHA and
+send case is honestly BLOCKED on a disposable Proton account, a device
+interaction and explicit send authorization. One candidate behaviour — silent
+cleartext downgrade for keyless external recipients — is rejected as a blocker
+for downstream P4.**
+
+### 10.1 Decision summary
+
+| Decision | Frozen value |
+| --- | --- |
+| Accepted crypto | `proton-crypto 0.14.1` (`default-features = false, features = ["rustpgp"]`), `proton-rpgp 0.9.0`, `proton-srp 0.8.4`; MIT (`license-file`); repo commit `853e98fc18c202ed41d3c1abb9dcc56b68494f5e` (S1 §4.2) |
+| High-level library | Extract `proton-core 0.1.2` (`filippofinke/protonmail-rs`, MIT, commit `67044505aa2931f387b262f37e3c8ad64a6a126c`) into a small maintained MIT fork. Do **not** consume unchanged. |
+| Crypto backend | Go (`gopgp`/`gopenpgp-sys`) stays disabled; the S1 gate enforces this. |
+| Local persistence | Pige owns SQLite/secrets/sync. The fork deletes `cache.rs` and `mail/sync.rs` and drops `rusqlite`/`directories`. |
+| Secret/session ownership | Pige owns the versioned secret envelope. The fork drops the in-library `keyring` store and on-disk session persistence; the host injects a token/secret boundary. |
+| App identification | Honest external header only. The candidate default `x-pm-appversion: Other` is acceptable; **no masquerading `User-Agent`**. Live API acceptance is UNVERIFIED. |
+| Recipient encryption policy | FAIL CLOSED. The candidate's silent `Type 4` cleartext fallback is rejected; P4 must resolve recipient policy before any delivery and block on missing policy. |
+| Key Transparency | Not implemented by the candidate or by `proton-crypto 0.14.1`; disclosed limitation, never equated with a valid signature. |
+| FIDO2/WebAuthn | Unsupported → typed, actionable error; never bypassed or downgraded. |
+| Status | DONE_WITH_CONCERNS — non-live work complete; live/device/send cases BLOCKED (§10.8, §10.9). |
+
+### 10.2 Accepted sources, versions and features (exact)
+
+The accepted dependency set is the S1-approved MIT crypto family, plus an
+**extracted** high-level layer:
+
+| Component | Version | Features | License | Provenance |
+| --- | --- | --- | --- | --- |
+| `proton-crypto` | `0.14.1` | `default-features = false, features = ["rustpgp"]` | MIT (`license-file`) | `proton-crypto-rs` `853e98fc…` |
+| `proton-rpgp` | `0.9.0` | transitive of `rustpgp` | MIT (`license-file`) | same repo/commit |
+| `proton-srp` | `0.8.4` | transitive | MIT (`license-file`) | same repo/commit |
+| `proton-core` (forked) | upstream `0.1.2` + patch series | cache/keyring/session removed; `proton-crypto` bumped to `0.14.1` | MIT | `filippofinke/protonmail-rs` `67044505…` |
+
+Rejected outright (unchanged from the spec/S1):
+
+- Official `ProtonMail/clients` `mail-api` — AGPL-3.0-only (license-direction conflict).
+- `proton-api-rs` — AGPL-3.0-only plus a Go SRP/FFI build dependency.
+- Any Bridge, Go service, hosted proxy, or Bridge/MCP wrapper.
+
+The upstream `proton-core 0.1.2` already disables the Go backend
+(`proton-crypto = { default-features = false, features = ["rustpgp"] }`), so the
+extraction is about **cache/keyring/session/SQLite ownership and the crypto
+version bump**, not about selecting a crypto backend.
+
+### 10.3 Honest application identification and API-access expectations
+
+Facts established by source inspection of `proton-core 0.1.2`:
+
+- `src/mail/mod.rs`: `DEFAULT_APP_VERSION = "Other"`.
+- `src/transport/mod.rs`: `AuthState { app_version, user_agent: Option<String> }`
+  and a setter whose doc-comment reads "Optional `User-Agent` (to present as a
+  real client)".
+- The candidate ships `--client web|ios|android` presets and a configurable
+  `--app-version` (README "Client masquerade"). That is a deliberate
+  impersonation affordance for third-party compatibility.
+
+S3 decision: Pige sends an honest `x-pm-appversion` that identifies Pige (or the
+neutral `Other`) and never sets a masquerading `User-Agent`. The exact header
+string is a small open question that must be checked live, because the Proton
+API is unofficial/undocumented for third parties and may gate on `appversion`.
+
+**Stop condition (brief):** "Stop if only official-client impersonation works."
+Whether Proton accepts an honest external `appversion`/`User-Agent` **cannot be
+determined without a live account**; it is recorded BLOCKED (§10.9), and no
+maintainer clarification from Proton AG has been obtained. Pige must not ship a
+masquerading identity as a workaround.
+
+### 10.4 Extraction: fork / upstream patch procedure and upkeep budget
+
+**Fork identity.** A small MIT-preserving patch series over the pinned upstream
+revision of `proton-core` (`0.1.2`, commit
+`67044505aa2931f387b262f37e3c8ad64a6a126c`). Plan 04 locates it at
+`rust/vendor/proton-mail-api/` with license/provenance and update instructions;
+it is added to the workspace only when P1 needs it. No CLI/cache/keyring crate
+is vendored.
+
+**Exact patch inventory** (verified against the published source; the file set
+is reproduced in `s3-extraction-diff.txt`):
+
+| File | Upstream role | Patch action | Reason |
+| --- | --- | --- | --- |
+| `src/cache.rs` (264 lines) | SQLite cache + FTS | **delete** | owns `rusqlite 0.32` (bundled) → second `links = "sqlite3"`; Pige owns persistence |
+| `src/mail/sync.rs` (190 lines) | event stream → SQLite | **delete** (remove `pub mod sync;`) | Pige owns sync/cursors (P2) |
+| `src/lib.rs` | module root + tracing init | drop `pub mod cache;`, drop `init_tracing`, drop `SyncReport` re-export | removes `tracing-subscriber` |
+| `src/session/secret_store.rs` | OS keychain store | drop `KeyringStore` (keep the `SecretStore` trait + in-memory impl) | removes `keyring`; Pige injects its own store |
+| `src/session/mod.rs` | on-disk session metadata | drop `directories`-based `Paths::system`; host supplies the base dir | removes `directories` |
+| `src/mail/mod.rs` | `Client::login/resume/logout` persistence | replace `KeyringStore`/`Paths::system` with the injected store; drop `pub mod sync;` | no in-library credential/persistence ownership |
+| `Cargo.toml` | manifests | remove `directories`, `keyring`, `rusqlite`, `tracing-subscriber`; bump `proton-crypto 0.12 → 0.14.1`, `proton-srp 0.8 → 0.8.4`; drop upstream `[[test]]` live/wiremock targets | aligns with the accepted set |
+
+Everything else is kept and reused by P1–P4: SRP login / TOTP / human
+verification (`auth/`), key-hierarchy unlock and the crypto format matrix
+(`crypto/`), the typed API wrappers (`api/`), read/send/drafts/attachments/
+organize/filters/contacts (`mail/`), the HTTP transport with 401-refresh /
+429-retry / 9001-human-verification handling (`transport/`), and the wire models
+(`model/`).
+
+**Reproduced this task (not inherited from a README).** The probe applied
+exactly the 7-file patch above and built it with the S1-approved
+`proton-crypto 0.14.1` for the real Android target:
+
+- Host build + unit tests: `48 passed; 0 failed` (`s3-fork-host-tests.log`).
+- `aarch64-linux-android` release build: PASS (`s3-fork-arm64-build.log`);
+  `libproton_core.rlib` extracts to ELF64 `AArch64` objects.
+- Cdylib link into a real Android shared object: `libproton_fork_probe.so`
+  (460,712 bytes), `ELF64 AArch64 DYN`, `LOAD` align `0x4000`, `NEEDED libdl.so
+  libc.so` (`s3-fork-cdylib-build.log`).
+- Boundary gate on the extracted graph: PASS, `326`/`331` resolved packages,
+  `rustpgp` only (`s3-fork-0141-metadata.json`/`-tree.txt`).
+- Confirmed absent from the extracted tree: `gopenpgp-sys`, `rusqlite`,
+  `sqlite3`, `keyring`.
+
+**Upkeep budget (frozen).** On each upstream release: (1) re-apply the ~450
+deleted lines / 7-file removal patch above; (2) keep the `proton-crypto` pin on
+the S1-approved version until a checked bump; (3) re-run the extraction
+`aarch64` build, the boundary gate, and the synthetic crypto fixtures before
+accepting; (4) keep a rollback to the last green pinned revision. Any upstream
+change that expands the patch surface substantially (e.g. re-introducing
+persistence ownership or a second native `links`) is a stop-and-return-to-user
+trigger per the spec.
+
+### 10.5 Protected session fields
+
+The candidate splits non-secret metadata (0600 JSON file) from secrets (OS
+keychain). S3 freezes what Pige must protect and where it lives:
+
+| Field | Candidate location | Sensitivity | Pige (S3) decision |
+| --- | --- | --- | --- |
+| `uid` | session JSON | non-secret identifier | envelope metadata |
+| `app_version`, `base_url`, `password_mode`, `user_agent` | session JSON | non-secret | typed account config |
+| `access_token` | OS keychain | **secret** | Pige secret envelope |
+| `refresh_token` | OS keychain | **secret** (rotated) | Pige secret envelope; serialize rotation, atomic save |
+| `skp` (primary user-key passphrase) | OS keychain | **secret** — unlocks every address key | protected unlock material; envelope-held |
+| unlocked keys (armored key + passphrase) | in-memory `KeyStore`/`StoredKey` only | **secret** | memory only; wipe on lock/logout |
+| login password | **not persisted** | — | never retained |
+
+The candidate derives `skp` with bcrypt (`crypto/kdf.rs`) and re-imports keys
+per operation, so it does not persist the account password — this satisfies the
+"no retained login password" part of Review Focus #4. Token refresh uses
+`POST /auth/v4/refresh` with a rotating `RefreshToken` and a `save_tokens`
+callback. Residual concern: the in-memory `StoredKey` passphrase is a
+`secrecy::SecretString` but there is no explicit wipe-on-lock in the candidate;
+P1 must add `UnlockedKeyStore::lock()` wiping/releasing material.
+
+### 10.6 Key-policy and format matrix
+
+Reading (`mail/read.rs` + `crypto/message.rs`):
+
+| Input form | Candidate handling | Verdict / result |
+| --- | --- | --- |
+| Proton internal E2E (armored body) | `decrypt_body` | `Verified` / `Unsigned` / `Unverified` / `Invalid` |
+| MIME `multipart/*` body | `mail-parser` extraction | displayable text/html |
+| HTML body | `html::sanitize` | active content stripped |
+| Attachments | key packet → session key → data packet (`decrypt_attachment`) | plaintext bytes |
+| External PGP-signed mail | only **verified internal** sender keys are fetched (`keys/all` `Address`) | external/WKD keys ignored → `Unverified`, never `Verified` |
+| `PGP_MIME (16)` / `CLEAR_MIME (32)` | constants defined but not produced/parsed distinctly | unsupported/indistinct |
+| Unknown/unsupported encrypted form | decrypt returns `Err` | surfaced as error, not a fake `Verified` |
+
+Sending (`mail/send.rs`), per recipient after `keys/all` lookup:
+
+| Recipient | Candidate package | S3 verdict |
+| --- | --- | --- |
+| Proton internal (verified key) | `Type 1` E2E | acceptable |
+| External with WKD/unverified key | `Type 8` PGP-inline | PGP-inline is **plaintext** to the transport; policy must confirm this is the contact's expressed preference |
+| External keyless + EO password | `Type 2` encrypted-outside | not required in v1; acceptable but out of scope |
+| External keyless, no EO password | **`Type 4` cleartext, `tracing::warn!` only** | **BLOCKER — silent downgrade** |
+
+**Sender alias and recipient packaging.** `SendOptions.from` selects an alias by
+case-insensitive email (`address_for_email`); with no `from`, the primary
+address (lowest API `Order`) is used. An explicit `from` that matches no unlocked
+address yields `NotFound { kind: "sender address" }`, so a wrong alias is
+rejected rather than silently sent from the primary. Recipients are packaged as
+separate `Addresses` entries per recipient (deduped case-insensitively), so a
+Bcc-only recipient is not folded into a visible To/Cc entry in the client
+payload; final Bcc privacy still depends on Proton server packaging (unverified,
+BLOCKED).
+
+Signature policy (synthetic evidence): `Unverified` is distinct from `Verified`;
+a body signed by an unknown key surfaces as `Unverified` (not `Verified`); the
+provider rejects a bad detached signature. `Invalid` is reachable only for a
+same-key-id tampered signature, which the public integrated API did not let us
+synthesize.
+
+### 10.7 Security and limitation findings
+
+1. **Silent cleartext downgrade — BLOCKER (Review Focus #3).**
+   `mail/send.rs` (`finish_send`) classifies each recipient as internal (Type 1),
+   external-with-key (Type 8), EO (Type 2), or **else `Type 4` cleartext with
+   only a log warning**. It never consults the contact's encryption/signing
+   preference, and it sends anyway. This violates the spec ("Never silently
+   downgrade to plaintext") and the brief ("missing policy visibility is a
+   blocker, not permission to send cleartext"). P4 must resolve policy *before*
+   delivery and fail closed; the candidate's `send.rs` is **not frozen as-is**.
+2. **Encrypted contact policy is not readable.** `api/contacts.rs::Contact`
+   exposes only `ID`, `Name` and `ContactEmails` (plaintext). Proton's encrypted
+   contact `Cards` — which carry the per-contact `x-pm-encrypt`/`x-pm-sign`
+   preferences — are neither fetched nor decoded. A "require encryption" contact
+   therefore cannot be honored through the candidate; this is a prerequisite for
+   safe P4 submission.
+3. **Silent address-key fallback (Review Focus #1).** `mail/read.rs::decrypt_message`
+   resolves the address as `keys().address(msg.address_id).or_else(primary_address)`.
+   On a multi-address / two-password account this can silently use the primary
+   key when the correct address key is missing instead of surfacing a key
+   problem. Decryption will usually error rather than leak plaintext, but the
+   fallback is a correctness/policy hazard that P1/P3 must remove.
+4. **Unknown signer is `Unverified`, not `Invalid`** (synthetic finding). This is
+   fail-safe (never `Verified`), but it means external/non-Proton signatures can
+   never reach `Verified` through this read path, and `Invalid` is only reachable
+   for same-key-id tampering. The UI must present `Unverified` honestly.
+5. **Key Transparency absent.** `proton-crypto 0.14.1` `keytransparency.rs`
+   defines only `KTFailure`/`VerificationError` types; `proton-core` never calls
+   KT. This is a disclosed limitation, never a substitute for signature validity.
+6. **FIDO2/WebAuthn unsupported.** `auth/mod.rs` returns a typed, actionable
+   error (`Error::Other`) when the 2FA bitmask indicates a security key and no
+   TOTP. Correct behaviour: explicit unsupported, not bypassed or downgraded.
+7. **Human verification is a host callback, not a CLI scrape.**
+   `transport::HvResolver` lets the host satisfy the `9001` challenge (the
+   candidate's own synthetic test proves the retry path). This means the design
+   *can* satisfy the brief's "CAPTCHA solvable through an actual Android-host
+   interaction" — but that on-device interaction is unverified (BLOCKED).
+8. **API instability / anti-abuse.** The Proton API is unofficial; the candidate
+   handles `429` (Retry-After, one retry) and `9001` (HV) but this remains an
+   operational risk. Honest app identification is the mitigation (10.3).
+9. **App-identification affordance** (10.3) — the default is honest (`Other`)
+   but the library invites impersonation; Pige must constrain it.
+10. **Bcc handling.** Packaging is per-recipient and `dedupe` is case-insensitive
+    (`mail/send.rs`), so Bcc is not folded into a visible recipient entry in the
+    client payload; final Bcc privacy still depends on Proton server packaging
+    (unverified, BLOCKED).
+
+### 10.8 Case checklist (brief line 31)
+
+Status is per-case. "synthetic" means exercised off-line on this host with no
+account (reproduced here); "static" means source inspection only, explicitly
+**not** a reproduced test; "live" cases were not run.
+
+| # | Case | Status | Evidence |
+| --- | --- | --- | --- |
+| 1 | one/two-password accounts | **BLOCKED** (synthetic partial) | `password_mode == 2` requires `mailbox_password` (static, `mail/mod.rs`); real 1-pw and 2-pw accounts needed. |
+| 2 | TOTP | **BLOCKED** | Candidate implements TOTP bit 0 (static, `auth/mod.rs`); no synthetic TOTP test run; live code required. |
+| 3 | human verification / CAPTCHA | **PASS (synthetic) / BLOCKED (Android)** | `resolves_human_verification_then_retries_with_headers` (host, from the fork's upstream tests) proves the `9001` callback + retry; on-device CAPTCHA is BLOCKED. |
+| 4 | invalid SRP proof/modulus | **BLOCKED** | `proton-srp` verifies the signed modulus and the server proof (static, `auth/mod.rs`); a tampered modulus/proof run needs a live account. |
+| 5 | resumed rotating session | **PASS (synthetic) / BLOCKED (process death)** | `session::save_load_clear_roundtrip` and `transport::refreshes_then_retries_on_401` (host) show persistence + rotation logic; killed-process resume on device is BLOCKED. |
+| 6 | multiple address keys | **PASS (synthetic partial) / BLOCKED (live)** | `primary_address_is_first`, `addresses_by_order_sorts_ascending_stably` (host); real multi-key decrypt of old mail is BLOCKED. |
+| 7 | internal/external read | **BLOCKED** | Needs a disposable account with internal and external mail. |
+| 8 | MIME/attachments | **PASS (synthetic) / BLOCKED (live)** | `attachment_roundtrip`, `transport_body_wraps_and_decrypts`, `eml_has_headers_and_body`, `html` sanitizer tests (host); live fetch BLOCKED. |
+| 9 | mixed-recipient send | **FAIL (static) / BLOCKED (live)** | `mail/send.rs` silently emits `Type 4` cleartext for keyless external recipients (§10.7 #1). No authorized send was performed. |
+| 10 | encrypted contact policy | **BLOCKED / not representable** | `Contact` has no encrypted `Cards`; policy cannot be read (§10.7 #2). |
+| 11 | unsupported FIDO2-only login | **PASS (static, typed) / BLOCKED (live)** | `auth/mod.rs` returns a typed actionable error for a FIDO2-only 2FA bitmask; a real FIDO2-only account was not available. |
+| 12 | event expiry/reset | **BLOCKED** | Candidate `mail/sync.rs` handles the event `Refresh` flag by clearing and re-syncing (static); real event reset/pagination needs a live account. |
+| 13 | contact metadata | **BLOCKED** | Candidate reads only name + emails (static); live contact list needed; encrypted fields/editing are out of v1 scope. |
+| 14 | signed/unsigned/invalid signature | **PASS (synthetic, partial)** | `self_draft_roundtrip_verifies` (Verified), `unverified_when_no_sender_key` (Unverified), `unknown_signer_is_unverified_not_verified`, `unsigned_body_is_unsigned_not_verified`, `provider_rejects_bad_detached_signature` (host). Integrated `Invalid` path not reproducible. |
+
+No case is marked PASS without having been run; no output is fabricated.
+"static" findings are labelled as inspection, not as reproduced tests.
+
+### 10.9 Exact blocked prerequisites and the commands that would run them
+
+Missing for every live/device/send case:
+
+1. A **disposable Proton account** (placeholder `proton-disposable@proton.me`)
+   with a known one-password mode; a **second disposable two-password account**;
+   TOTP enabled on both.
+2. A **human-verification/CAPTCHA interaction** performed on the device.
+3. The **Android device** already attached in S2 (iPlay60 mini Turbo, API 34,
+   `arm64-v8a`); a **plaintext external recipient** mailbox to observe the
+   external delivery class; an **external PGP/WKD contact** and a
+   **keyless contact marked require-encryption** for the policy cases.
+4. **Explicit user authorization for test sends** — which S3 does not have, so no
+   message was sent.
+
+Build the extracted library + probe APK (disposable, `/tmp`):
+
+```bash
+# extracted fork at /tmp/opencode/pige-provider-probes/proton-core-fork
+export ANDROID_NDK_HOME="$HOME/Android/Sdk/ndk/28.2.13676358"
+TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-android34-clang"
+export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+export AR_aarch64_linux_android="$TOOLCHAIN/llvm-ar"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+cd /tmp/opencode/pige-provider-probes/proton-fork-cdylib
+cargo build --release --target aarch64-linux-android   # -> libproton_fork_probe.so
+# package into a disposable arm64-v8a probe app (same Gradle/JDK as scripts/build.sh)
+JAVA_HOME=/opt/jbr-21 ANDROID_HOME="$HOME/Android/Sdk" \
+  bash android/gradlew -p <probe-app-dir> --no-daemon assembleDebug
+adb install -r <probe-app-dir>/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Login / TOTP / two-password / delayed logout / cold resume (candidate live tests,
+once credentials + send authorization exist):
+
+```bash
+PROTON_TEST_USER=<disposable> PROTON_TEST_PASSWORD='<pw>' \
+PROTON_TEST_TOTP=<6-digit> \
+PROTON_TEST_MAILBOX_PASSWORD='<mailbox-pw>' \
+cargo test -p proton-core --test live -- --nocapture --test-threads=1
+# process-death resume: kill and relaunch the probe, expect no user interaction
+adb shell am force-stop bitshift.pige.protonprobe
+adb shell am start -n bitshift.pige.protonprobe/.ResumeProbeActivity
+```
+
+Human verification through an Android-host interaction (not console scraping):
+
+```bash
+# Probe surfaces the 9001 challenge (WebUrl + token) in the Activity, the user
+# solves the CAPTCHA in the in-app WebView/browser, the token is returned to the
+# HvResolver; assert the bound attempt resumes. Expect a WebView/CAPTCHA
+# Activity, never `--captcha-token` shell scraping.
+adb shell am start -n bitshift.pige.protonprobe/.HvChallengeActivity
+```
+
+Honest-identification and API-access probe (no secrets committed):
+
+```bash
+# create an unauthenticated session with an honest external identity only:
+curl -s -X POST https://mail.proton.me/api/auth/v4/sessions \
+  -H 'x-pm-appversion: Other' -d '{}'
+# fetch the SRP modulus and verify the server proof in the client (proton-srp);
+# expected failure modes: rejected appversion, or 9001 human verification.
+curl -s -X POST https://mail.proton.me/api/core/v4/auth/info \
+  -H 'x-pm-appversion: Other' -d '{"Username":"<disposable>"}'
+```
+
+Mixed-recipient / policy send (requires explicit authorization; not run):
+
+```bash
+# Probe composes one message to: an internal address, an external plain
+# address, an external PGP/WKD contact, and a keyless contact flagged
+# require-encryption. Expected (required) behaviour:
+#   - internal + external-PGP get their E2E/PGP package;
+#   - the keyless *require-encryption* recipient BLOCKS the whole send with an
+#     actionable unsupported-policy error (never Type 4 cleartext);
+#   - a plain external recipient is explicitly classified and shown as
+#     "ordinary external (unencrypted to recipient)".
+# Current candidate behaviour FAILS this (Type 4 clear + warning); see §10.7 #1.
+adb shell am start -n bitshift.pige.protonprobe/.SendPolicyProbeActivity
+```
+
+Event expiry/reset (live): list, mutate remotely, force an event `Refresh`, and
+assert the client re-snapshots rather than inventing deltas (candidate
+`mail/sync.rs` behaviour; needs a live account).
+
+The historical probe scaffold and raw output live under
+`/tmp/opencode/pige-provider-probes/` (disposable, never committed).
+
+### 10.10 Dependency and extraction decision
+
+**Accepted:** extract `proton-core 0.1.2` into a small MIT-preserving fork and
+build it against the S1-approved `proton-crypto 0.14.1` Rust (`rustpgp`)
+backend. This decision is grounded in a **reproduced** build (host tests + real
+`aarch64-linux-android` `.so` + boundary gate, §10.4), not an upstream README
+claim.
+
+**Explicitly not done here (owned by later tasks):**
+
+- No `rust/vendor/proton-mail-api/` fork repository is created, and no
+  dependency is added to the committed workspace (S3 is a gate, not an
+  integration; plan 04 owns the vendored fork).
+- Live interop, CAPTCHA-on-device, cold resume, event reset, and any send remain
+  BLOCKED (§10.8, §10.9).
+- The cleartext-downgrade fix and the encrypted-contact-policy read are
+  **required** before P4 and are not present in the candidate; the fork's
+  `mail/send.rs`/`api/contacts.rs` are therefore not frozen as-is.
+- Key Transparency and FIDO2 remain unsupported and documented.
+
+### 10.11 S3 PASS / FAIL / BLOCKED matrix
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| `ProtonDependencyDecision` section | PASS | §10.1–§10.10 |
+| Accepted source/version/features frozen | PASS | §10.2 |
+| Honest app identification / access expectations | PASS (static) / BLOCKED (live acceptance) | §10.3, §10.9 |
+| Fork / extraction patch inventory + upkeep budget | PASS | §10.4 |
+| Extracted fork host build + tests | PASS | §10.4, `s3-fork-host-tests.log` (48/0) |
+| Extracted fork `aarch64-linux-android` build/link | PASS | §10.4, `s3-fork-arm64-build.log`, `s3-fork-cdylib-build.log` |
+| Boundary gate on extracted graph | PASS | §10.4, `s3-fork-0141-metadata.json`/`-tree.txt` |
+| Protected session fields frozen | PASS | §10.5 |
+| Key-policy / format matrix | PASS | §10.6 |
+| Security/limitation findings recorded | PASS | §10.7 |
+| Mixed-recipient cleartext downgrade | **FAIL (static)** | §10.7 #1 |
+| Encrypted contact policy readable | **FAIL (static, missing)** | §10.7 #2 |
+| Case checklist present (14 cases) | PASS | §10.8 |
+| Live one/two-password, TOTP, read, events, contacts | BLOCKED | §10.8, §10.9 |
+| Human verification on Android host | BLOCKED | §10.8, §10.9 |
+| Cold-resume after process death | BLOCKED | §10.8, §10.9 |
+| Any authorized test send | BLOCKED (no authorization) | §10.9 |
+| Key Transparency | Not implemented (documented) | §10.7 #5 |
+| FIDO2/WebAuthn | Unsupported (typed error) | §10.7 #6 |
+| Baseline `cargo test --workspace` at the S3 prior commit `64db57c` | PASS | 19 suites, 354 passed, 0 failed, 22 ignored (`s3-baseline-64db57c-test.log`) |
+| `cargo test --workspace` at the branch HEAD when S3 committed (`b75c977`, includes a concurrent F1 commit) | PASS | 20 suites, 360 passed, 0 failed, 22 ignored (`s3-head-test.log`) |
+| Boundary gate on committed workspace | PASS | `OK (619 resolved packages)` |
+
+### 10.12 Review-focus answers
+
+- **#1 multi-address / wrong key.** Not satisfied as-is: `mail/read.rs` silently
+  falls back to the primary address key (§10.7 #3). Must be removed in P1/P3.
+- **#2 invalid/unsupported/untrusted must not look verified.** Satisfied in the
+  read path: `Unverified`/`Unsigned`/errors are distinct from `Verified`, and
+  external signatures cannot reach `Verified` (§10.6, §10.7 #4–#5).
+- **#3 mixed recipients must not lose encryption policy.** **Not satisfied** —
+  the candidate silently downgrades keyless external recipients to cleartext
+  (§10.7 #1). Blocker for P4.
+- **#4 refreshed session after process death without a retained password.**
+  Partly satisfied: the password is not persisted (`skp` is stored instead) and
+  rotation logic is tested synthetically; process-death resume is BLOCKED.
+- **#5 CLI CAPTCHA helper unusable on Android.** Satisfied by design: the
+  candidate exposes a `HvResolver` host callback, so an Android-host CAPTCHA
+  interaction is possible without console-token scraping; the on-device run is
+  BLOCKED (§10.9).
+
+### 10.13 Evidence index (disposable, under `/tmp/opencode/pige-provider-probes/`)
+
+- `proton-core-fork/` — the extracted fork built this task (not committed).
+- `proton-fork-cdylib/` — wrapper that links the fork into an Android `.so`.
+- `evidence/s3-fork-host-tests.log` — host unit tests (48 passed).
+- `evidence/s3-fork-arm64-build.log` — `aarch64-linux-android` release build.
+- `evidence/s3-fork-cdylib-build.log` — Android `.so` link.
+- `evidence/s3-fork-metadata.json` / `s3-fork-tree.txt` (0.12.1) and
+  `s3-fork-0141-metadata.json` / `s3-fork-0141-tree.txt` (0.14.1).
+- `evidence/s3-extraction-diff.txt` / `s3-extraction-cargo.diff` — patch surface.
+- `evidence/s3-baseline-64db57c-test.log` — pristine baseline at the prior commit.
+
+No secret, token, key, address or message plaintext is committed.
