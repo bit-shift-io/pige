@@ -5,6 +5,7 @@ mod accounts;
 mod attachments;
 mod bodies;
 mod folders;
+mod jobs;
 mod messages;
 mod migrations;
 mod schema;
@@ -25,6 +26,7 @@ use messages::{conversations_on, message_count_on, unified_conversations_on};
 
 pub use attachments::StoredAttachment;
 pub use bodies::Body;
+pub use jobs::{AccountLease, INITIAL_GENERATION, PendingAuthRecord};
 pub use messages::PrefetchCandidate;
 
 /// A consistent read of the cache used to build one UI snapshot.
@@ -62,6 +64,21 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("database schema version {found} is newer than supported version {supported}")]
     SchemaTooNew { found: u32, supported: u32 },
+    /// A durable write carried an account generation older than the one the
+    /// store now holds: the account was invalidated (removed or re-authenticated)
+    /// while the write was in flight. The write must not be applied.
+    #[error("account generation {expected} is stale (current generation is {actual})")]
+    StaleGeneration { expected: u64, actual: u64 },
+    /// A checkpoint was produced by a stale generation and must not advance the
+    /// job it belongs to.
+    #[error("job checkpoint from generation {generation} is stale")]
+    StaleCheckpoint { generation: u64 },
+    /// Another process holds the account's cross-process lease.
+    #[error("account is busy with another operation")]
+    LeaseHeld,
+    /// The caller's lease was taken over by another process before it wrote.
+    #[error("account lease was lost before the write")]
+    LeaseLost,
 }
 
 impl StoreError {

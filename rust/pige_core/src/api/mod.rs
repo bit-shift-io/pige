@@ -214,7 +214,10 @@ impl AccountInput {
 
 struct AppState {
     config: Config,
-    store: Store,
+    store: Arc<Store>,
+    /// Cancels live account work and durably increments generations. Shared
+    /// through the same `Store` handle as `store`.
+    sessions: Arc<crate::auth::AccountSessionManager>,
     /// The authoritative accounts and settings document. The SQLite accounts
     /// table is a derived mirror kept only so cascade deletes and joins work.
     config_doc: ConfigDocument,
@@ -506,11 +509,14 @@ pub fn init(config: Config) -> Result<(), String> {
     std::fs::create_dir_all(&config.cache_dir)
         .map_err(|error| format!("create cache dir: {error}"))?;
 
-    let store = Store::open(database_path(&config.data_dir))
-        .map_err(|error| format!("open store: {error}"))?;
+    let store = Arc::new(
+        Store::open(database_path(&config.data_dir))
+            .map_err(|error| format!("open store: {error}"))?,
+    );
     store
         .migrate()
         .map_err(|error| format!("migrate store: {error}"))?;
+    let sessions = Arc::new(crate::auth::AccountSessionManager::new(store.clone()));
 
     let config_path = config::document_path(&config.config_dir);
     let (config_doc, startup_warning, writes_blocked) =
@@ -520,6 +526,7 @@ pub fn init(config: Config) -> Result<(), String> {
     let mut state = AppState {
         config,
         store,
+        sessions,
         config_doc,
         config_path,
         startup_warning,
@@ -812,6 +819,9 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password for restored-away account {id}: {error}");
         }
+        if let Err(error) = state.sessions.invalidate(id) {
+            log::warn!("invalidate session for restored-away account {id}: {error}");
+        }
     }
 
     state.selected_folder = None;
@@ -868,6 +878,9 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
         }
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password during factory reset for {id}: {error}");
+        }
+        if let Err(error) = state.sessions.invalidate(id) {
+            log::warn!("invalidate session during factory reset for {id}: {error}");
         }
     }
 
@@ -1279,6 +1292,13 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
                 return Err(format!("{error}; credential restore failed: {restore}"));
             }
             return Err(error);
+        }
+
+        // Cancel any live work for the removed account and durably advance its
+        // generation, so a refresh that is still in flight can never persist a
+        // rotated credential for an account the user can no longer see.
+        if let Err(error) = state.sessions.invalidate(id) {
+            log::warn!("invalidate session for removed account {id}: {error}");
         }
 
         // Clear any selection that pointed at the removed account, then pick

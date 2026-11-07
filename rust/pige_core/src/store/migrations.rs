@@ -6,6 +6,7 @@ mod v2;
 mod v3;
 mod v4;
 mod v5;
+mod v6;
 
 use rusqlite::OptionalExtension;
 
@@ -23,7 +24,9 @@ impl Store {
     /// the FTS5 index and backfills every message already cached; v3 records
     /// attachment disposition for the reader's attachment chips; v4 repairs
     /// list previews cached before the transfer-encoding decoder landed; v5
-    /// versions the account mirror by typed backend.
+    /// versions the account mirror by typed backend; v6 adds durable account
+    /// generations, cross-process leases, pending-auth references, and
+    /// generation-fenced checkpoints.
     pub fn migrate(&self) -> Result<(), StoreError> {
         let mut version = self.existing_schema_version()?.unwrap_or(0);
         if version == SCHEMA_VERSION {
@@ -58,6 +61,10 @@ impl Store {
         if version < 5 {
             v5::apply(&tx)?;
             version = 5;
+        }
+        if version < 6 {
+            v6::apply(&tx)?;
+            version = 6;
         }
 
         debug_assert_eq!(version, SCHEMA_VERSION);

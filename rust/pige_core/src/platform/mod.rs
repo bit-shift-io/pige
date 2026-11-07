@@ -49,6 +49,25 @@ pub fn credentials_unavailable(error: &str) -> bool {
     error.contains(CREDENTIALS_UNAVAILABLE)
 }
 
+/// The shape every secure-store key must have. It mirrors the Android
+/// `CredentialStore` whitelist so a key accepted on one platform is accepted on
+/// all of them. Account ids and staged `pending_<uuid>` keys both match it.
+pub const CREDENTIAL_KEY_PATTERN: &str = "[A-Za-z0-9_-]{1,128}";
+
+/// The maximum length of a secure-store key, derived from
+/// [`CREDENTIAL_KEY_PATTERN`].
+pub const MAX_CREDENTIAL_KEY_LEN: usize = 128;
+
+/// Whether `key` is a safe secure-store key name. Staged pending credentials use
+/// `pending_<attempt uuid>`; an account uses its id.
+pub fn is_valid_credential_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_CREDENTIAL_KEY_LEN
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 /// Password storage. Secrets live in the OS keychain (or an in-memory fake in
 /// tests) and are deliberately kept out of the SQLite cache.
 ///
