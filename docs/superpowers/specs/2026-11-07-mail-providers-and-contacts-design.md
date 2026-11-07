@@ -1,7 +1,7 @@
 # Native mail providers, contacts, and recipient learning
 
 Date: 2026-11-07
-Status: Proposed; awaiting user approval. No implementation authorized by this document yet.
+Status: Approved by the user in conversation; detailed implementation planning requested.
 
 ## Intent and agreed scope
 
@@ -497,8 +497,8 @@ release requirement. Do not silently substitute Bridge or drop Android support.
 - [x] Present alternatives and record the user's adapter approach selection.
 - [x] Write the full proposed design and phased rollout.
 - [x] Fresh builder review; resolve significant planning gaps.
-- [ ] User approval of this written design and recommended defaults.
-- [ ] Write detailed implementation plan after approval.
+- [x] User approval of this written design and recommended defaults.
+- [x] Write detailed implementation plan after approval: `../plans/2026-11-07-mail-providers.md` and linked subplans.
 
 Builder review identified two gaps, now resolved as proposed conservative defaults:
 fail closed on unsupported Proton recipient encryption policy, and block backend
