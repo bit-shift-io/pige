@@ -391,12 +391,12 @@ disposable account; one required user distribution decision is recorded in
 | --- | --- |
 | Desktop client | Google Cloud **Desktop app** OAuth client; public client; authorization code + PKCE (S256) + `state`; system browser; loopback redirect `http://127.0.0.1:<random port>` |
 | Android client | Google Cloud **Android** OAuth client; package `bitshift.pige`; signing SHA-1 in §9.2; **no redirect URI** |
-| Android authorization | Google Identity Services `AuthorizationClient` (`com.google.android.gms:play-services-auth`); consent returns through a `PendingIntent`/`IntentSender`; no WebView/OOB/loopback/service account |
-| Refresh ownership | Pige secret envelope owns credentials. Desktop: owns the refresh token. Android: on-demand access tokens while the grant is intact (grant state in the envelope); refresh token only via a server (`requestOfflineAccess`) — see §9.6 |
+| Android authorization **(pending §9.9 decision)** | Google Identity Services `AuthorizationClient` (`com.google.android.gms:play-services-auth`); consent returns through a `PendingIntent`/`IntentSender`; no WebView/OOB/loopback/service account. Live confirmation is parked until the §9.9 distribution decision. |
+| Refresh ownership **(Android path pending §9.9 decision)** | Pige secret envelope owns credentials. Desktop: owns the refresh token. Android: on-demand access tokens while the grant is intact (grant state in the envelope); refresh token only via a server (`requestOfflineAccess`) — see §9.6; the Android choice is parked until the §9.9 decision. |
 | Mail scope | `https://www.googleapis.com/auth/gmail.modify` (+ `openid email profile` for identity) |
 | Contacts scopes | `https://www.googleapis.com/auth/contacts.readonly` + `https://www.googleapis.com/auth/contacts.other.readonly`, granted separately/later |
 | Permanent delete | `false` under `gmail.modify`; delete maps to trash (§9.5) |
-| Non-Play-services | No supported native flow without Play services → STOP (§9.9) |
+| Non-Play-services **(pending §9.9 decision)** | No supported native flow without Play services → STOP (§9.9) |
 | Mail SDK | `google-gmail1` (MIT, S1 §4.1) behind `MailBackend`; Pige injects tokens |
 | Contacts SDK | `google-people1` (MIT, S1 §4.1) behind the contacts capability |
 
@@ -417,7 +417,7 @@ OAuth clients:
 
 | Client | Type | Identity | Redirect |
 | --- | --- | --- | --- |
-| Pige desktop | Desktop app | generated id/secret | loopback `http://127.0.0.1:<port>` (by client type) |
+| Pige desktop | Desktop app | generated id (a `client_secret` may be issued, but Desktop apps are **public clients**: PKCE is used and **no secret is sent** — see §9.3) | loopback `http://127.0.0.1:<port>` (by client type) |
 | Pige Android | Android | package `bitshift.pige`, SHA-1 `7E:4B:01:BC:E7:61:75:E3:89:38:88:5D:91:A6:26:FE:D3:07:21:AD` | none |
 | Pige Android (debug) | Android | package `bitshift.pige`, SHA-1 `A0:4B:69:80:86:C4:44:A4:B3:6A:43:6D:98:11:CA:EE:64:40:B7:67` | none |
 | Pige server client | Web application | generated id | only if the offline/`serverAuthCode` path is chosen |
@@ -496,11 +496,22 @@ confirmation is BLOCKED with the rest of the live cases.
 | Case | Status | Why / evidence |
 | --- | --- | --- |
 | `desktop_pkce_cancel_and_state` | **BLOCKED** | Needs a registered Desktop app client + disposable account. Offline mechanics self-test PASSes (`s2-desktop-pkce-selftest.log`), but that is not Google proof. |
-| `android_consent_return_and_recreation` | **BLOCKED** | Needs the Android client (package+SHA-1) registered, a Web `serverClientId`, a disposable account, and the probe APK. Device is present. |
+| `android_consent_return_and_recreation` | **BLOCKED** | Needs the Android client (package+SHA-1) registered, a disposable account, and the probe APK. Device is present. A Web `serverClientId` is **only** needed for the offline/`serverAuthCode` path, not for the device-only on-demand `authorize()` flow. |
 | `mail_without_contacts_scope` | **BLOCKED** | Needs a live `gmail.modify` token from the disposable account. |
 | `resume_after_process_restart` | **BLOCKED** | Needs a live Android grant + probe APK. |
 | `contacts_later_grant` | **BLOCKED** | Needs a live grant + `contacts.readonly`/`contacts.other.readonly` consent. |
 | `revoked_grant_requires_login` | **BLOCKED** | Needs a live Android grant, then revocation (account permissions page / `revokeAccess`). |
+| `api_profile_and_message_read` | **BLOCKED** | Brief line 33: needs a live `gmail.modify` token for `users.getProfile`, `users.messages.list`, `users.messages.get`, `users.history.list`. |
+| `api_authorized_test_send` | **BLOCKED** | Brief line 33: needs a live `gmail.modify` token and explicit user authorization for one `users.messages.send` (to the disposable account itself). |
+| `api_saved_contacts` | **BLOCKED** | Brief line 33: needs a live `contacts.readonly` token for `people.connections.list` (saved contacts). |
+| `api_other_contacts` | **BLOCKED** | Brief line 33: needs a live `contacts.other.readonly` token for `otherContacts.list`/`search` (Other contacts). |
+| `gmail_modify_permanent_delete_false` | **BLOCKED** | Brief line 33: needs a live `gmail.modify` token; `users.messages.delete` must be rejected and delete must map to `users.messages.trash` (§9.5), i.e. `permanent_delete = false`. |
+| `play_services_absent_or_disabled` | **BLOCKED** | Brief line 34: needs a device/emulator with Play services disabled or absent; expectation is the §9.9 STOP (no supported native auth flow). |
+
+Brief line 34's "cancellation and lost activity" are covered by
+`desktop_pkce_cancel_and_state` (unknown/denied cancel) and
+`android_consent_return_and_recreation` (Activity recreation / lost Activity)
+respectively; these two new groups complete the recordable checklist.
 
 No case is marked PASS without having been run; no output is fabricated.
 
@@ -526,14 +537,114 @@ evidence) are complete. Missing for the live runs:
    in §9.2.
 3. A **Web application** client id (`GOOGLE_WEB_SERVER_CLIENT_ID`) if the
    offline/`serverAuthCode` path is chosen.
-4. A **disposable Google account** (the attached device is signed into the real
-   account `bronson.mathews@gmail.com`, which must not be used for these tests)
-   and explicit authorization for one test send.
+4. A **disposable Google account** (placeholder `disposable-account@example.com`;
+   the attached device is signed into a personal account that must **not** be
+   used for these tests) and explicit authorization for one test send.
 
-Commands live in the disposable probe plan
-`/tmp/opencode/pige-provider-probes/google-auth-probe/README.md` (desktop PKCE,
-Android probe build/run, and API probes). Probe artefacts under
-`/tmp/opencode/pige-provider-probes/` are disposable and never committed.
+#### 9.8.1 Reproducible commands (in-repo; no secrets)
+
+These are the exact commands that turn each BLOCKED case into a live run once the
+prerequisites above exist. They are self-contained: no disposable probe
+directory is required. Substitute an unregistered value only for the
+placeholders in angle brackets (client ids, port, codes, tokens); never commit a
+real client id, secret, token, or account.
+
+Desktop PKCE / cancellation / state (`desktop_pkce_cancel_and_state`):
+
+```bash
+# 1. Build the PKCE (S256) request and open it in the system browser:
+#    https://accounts.google.com/o/oauth2/v2/auth
+#      ?client_id=<desktop-client-id>
+#      &redirect_uri=http://127.0.0.1:<random-port>
+#      &response_type=code
+#      &scope=https://www.googleapis.com/auth/gmail.modify
+#      &code_challenge=<S256-of-verifier>&code_challenge_method=S256
+#      &state=<random-state>&access_type=offline
+# 2. A loopback listener on 127.0.0.1:<random-port> captures ?code= (or ?error=).
+#    Validate state exactly; on cancel expect error=access_denied.
+# 3. Exchange the code at the token endpoint (public client; no secret, PKCE):
+curl -s https://oauth2.googleapis.com/token \
+  -d client_id=<desktop-client-id> \
+  -d code=<authorization-code> \
+  -d code_verifier=<verifier> \
+  -d grant_type=authorization_code \
+  -d redirect_uri=http://127.0.0.1:<random-port>
+#    PASS: token JSON. Cancellation -> {"error":"access_denied"} (exit 1).
+#    Forged/mismatched state -> rejected before exchange.
+```
+
+Android consent return / Activity recreation / resume / revoke
+(`android_consent_return_and_recreation`, `resume_after_process_restart`,
+`contacts_later_grant`, `revoked_grant_requires_login`):
+
+```bash
+# Probe app (its own disposable project) uses
+# com.google.android.gms:play-services-auth and calls
+# Identity.getAuthorizationClient(activity).authorize(request); it launches
+# result.pendingIntent via StartIntentSenderForResult and reads the result back
+# with getAuthorizationResultFromIntent. Build with the repo Gradle/JDK:
+JAVA_HOME=/opt/jbr-21 ANDROID_HOME=$HOME/Android/Sdk \
+  bash android/gradlew -p <probe-app-dir> --no-daemon assembleDebug
+adb install -r <probe-app-dir>/app/build/outputs/apk/debug/app-debug.apk
+# consent return + Activity recreation (rotate the device on the consent screen):
+adb shell am start -n bitshift.pige.probe/.AuthProbeActivity \
+  --es scope https://www.googleapis.com/auth/gmail.modify
+# resume after process restart (kill, relaunch, no user interaction expected):
+adb shell am force-stop bitshift.pige.probe
+adb shell am start -n bitshift.pige.probe/.AuthProbeActivity \
+  --es scope https://www.googleapis.com/auth/gmail.modify
+# contacts_later_grant (add the contacts scopes; a new consent is required):
+adb shell am start -n bitshift.pige.probe/.AuthProbeActivity \
+  --es scope "https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
+# revoked_grant_requires_login (revoke, then expect hasResolution() again):
+adb shell am start -n bitshift.pige.probe/.RevokeActivity
+#   or revoke at https://myaccount.google.com/permissions
+```
+
+API contract probes (`api_profile_and_message_read`, `api_authorized_test_send`,
+`api_saved_contacts`, `api_other_contacts`,
+`gmail_modify_permanent_delete_false`), once any flow yields a token:
+
+```bash
+TOKEN=<access-token>
+# profile / list / detail / history:
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://gmail.googleapis.com/gmail/v1/users/me/profile
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5'
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://gmail.googleapis.com/gmail/v1/users/me/messages/<id>?format=full'
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://gmail.googleapis.com/gmail/v1/users/me/history?startHistoryId=<id>'
+# one authorized test send (to the disposable account itself):
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  https://gmail.googleapis.com/gmail/v1/users/me/messages/send \
+  -d '{"raw":"<base64url RFC822 message>"}'
+# saved contacts + Other contacts:
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://people.googleapis.com/v1/people/me/connections?personFields=names,emailAddresses'
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://people.googleapis.com/v1/otherContacts?readMask=names,emailAddresses'
+# permanent-delete truth: must be rejected under gmail.modify; trash succeeds:
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE -H "Authorization: Bearer $TOKEN" \
+  https://gmail.googleapis.com/gmail/v1/users/me/messages/<id>
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  https://gmail.googleapis.com/gmail/v1/users/me/messages/<id>/trash
+```
+
+Play-services availability (`play_services_absent_or_disabled`):
+
+```bash
+# On a device/emulator with Play services disabled or absent, run the Android
+# probe above; expectation is the §9.9 STOP (no supported native auth flow),
+# not a silent fallback.
+adb shell pm disable-user --user 0 com.google.android.gms   # test device only
+```
+
+The historical probe scaffold and raw output live under
+`/tmp/opencode/pige-provider-probes/` (disposable, never committed); the
+commands above do not depend on it.
 
 ### 9.9 Required user distribution decision (STOP)
 
@@ -592,3 +703,9 @@ Until this decision is recorded, live Android authorization work stays parked.
 | `resume_after_process_restart` | BLOCKED | §9.7, §9.8 |
 | `contacts_later_grant` | BLOCKED | §9.7, §9.8 |
 | `revoked_grant_requires_login` | BLOCKED | §9.7, §9.8 |
+| `api_profile_and_message_read` | BLOCKED | §9.7, §9.8 |
+| `api_authorized_test_send` | BLOCKED | §9.7, §9.8 |
+| `api_saved_contacts` | BLOCKED | §9.7, §9.8 |
+| `api_other_contacts` | BLOCKED | §9.7, §9.8 |
+| `gmail_modify_permanent_delete_false` | BLOCKED | §9.7, §9.8 |
+| `play_services_absent_or_disabled` | BLOCKED | §9.7, §9.8 |
