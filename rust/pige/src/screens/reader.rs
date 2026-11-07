@@ -2,7 +2,7 @@
 //! "Earlier messages" section. Remote images stay as blocked placeholders; v1
 //! never fetches remote bytes, so there is no "Load images" action.
 
-use iced::widget::{MouseArea, column, container, row, scrollable, space, stack};
+use iced::widget::{column, container, row, scrollable, space};
 use iced::{Alignment, Element, Fill};
 use pige_core::account::AccountId;
 use pige_core::api::{self, ConversationDetail, MessageBody, MessageSummary};
@@ -47,8 +47,8 @@ impl ReaderAction {
         components::icon_button(self.icon, self.label, self.message)
     }
 
-    fn menu_row(self) -> Element<'static, Message> {
-        components::menu_row(self.icon, self.label, self.message)
+    fn menu_item(self) -> components::MenuItem {
+        components::MenuItem::action(self.icon, self.label, self.message)
     }
 }
 
@@ -220,73 +220,28 @@ fn move_targets(app: &App, account_id: &AccountId) -> bool {
         .any(|folder| current != Some(&folder.id))
 }
 
-/// The reader's overflow dropdown: a scrim that closes it plus a card anchored
-/// under the app bar. Recomputes the split so it matches the visible bar.
+/// The reader's overflow dropdown. Recomputes the split so the entries match
+/// the visible bar, then hands them to the shared menu component.
 pub fn reader_menu<'a>(app: &'a App, width: f32) -> Element<'a, Message> {
-    let palette = theme::active();
     let primary = primary_actions(app);
     let fit = fit_action_count(primary.len(), width);
 
-    let mut rows: Vec<Element<'static, Message>> = primary
+    let mut items: Vec<components::MenuItem> = primary
         .into_iter()
         .skip(fit)
-        .map(ReaderAction::menu_row)
+        .map(ReaderAction::menu_item)
         .collect();
     let extras = menu_extras(app);
-    if !rows.is_empty() && !extras.is_empty() {
-        rows.push(menu_divider());
+    if !items.is_empty() && !extras.is_empty() {
+        items.push(components::MenuItem::Divider);
     }
-    rows.extend(extras.into_iter().map(ReaderAction::menu_row));
+    items.extend(extras.into_iter().map(ReaderAction::menu_item));
 
-    let card = container(column(rows).spacing(0).width(Fill))
-        .width(palette.metrics.menu_width)
-        .padding(palette.space.xs)
-        .style(move |_| container::Style {
-            background: Some(palette.surface_container_high.into()),
-            text_color: Some(palette.on_surface),
-            border: iced::border::rounded(palette.radius.md),
-            shadow: iced::Shadow {
-                color: palette.shadow,
-                offset: iced::Vector::new(0.0, palette.metrics.dialog_shadow_y),
-                blur_radius: palette.metrics.dialog_shadow_blur,
-            },
-            ..Default::default()
-        });
-
-    let positioned = container(card)
-        .width(Fill)
-        .height(Fill)
-        .align_x(Alignment::End)
-        .align_y(Alignment::Start)
-        .padding(iced::Padding {
-            top: palette.metrics.app_bar_height + palette.space.xs,
-            right: palette.space.md,
-            bottom: 0.0,
-            left: 0.0,
-        });
-
-    let scrim = MouseArea::new(
-        container(space())
-            .width(Fill)
-            .height(Fill)
-            .style(components::scrim_style()),
+    components::menu_overlay(
+        items,
+        components::MenuAnchor::TopRight,
+        Message::CloseReaderMenu,
     )
-    .on_press(Message::CloseReaderMenu);
-
-    stack![scrim, positioned].into()
-}
-
-/// A 1-point full-width menu separator.
-fn menu_divider<'a>() -> Element<'a, Message> {
-    let palette = theme::active();
-    container(space())
-        .width(Fill)
-        .height(palette.metrics.border_width)
-        .style(move |_| container::Style {
-            background: Some(palette.outline_variant.into()),
-            ..Default::default()
-        })
-        .into()
 }
 
 /// How many icon actions fit in a bar `width` points wide, reserving room for

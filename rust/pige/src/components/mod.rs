@@ -9,6 +9,7 @@
 //! - [`avatar`] deterministic initial avatars
 //! - [`rows`] message-list and folder rows
 //! - [`chrome`] app bars, section headers, empty states and toasts
+//! - [`menu`] dropdown/overflow menus
 //! - [`chips`] choice and attachment chips
 //! - [`dialog`] modal cards
 //!
@@ -31,6 +32,7 @@ pub mod dialog;
 pub mod elastic_scroll;
 pub mod fields;
 pub mod label;
+pub mod menu;
 pub mod pull_refresh;
 pub mod rows;
 pub mod scroll_fade;
@@ -40,9 +42,10 @@ pub use spinner::{spinner, toolbar_spinner};
 pub use avatar::avatar;
 pub use buttons::{ButtonVariant, button, floating_action_button, icon_button};
 pub use chips::{attachment_chip, chip, format_size};
-pub use chrome::{app_bar, app_bar_actions, empty_state, menu_row, toast};
+pub use chrome::{app_bar, app_bar_actions, empty_state, toast};
 pub use dialog::{dialog, dialog_sized};
 pub use fields::{password_field, search_field, text_area, text_field};
+pub use menu::{MenuAnchor, MenuItem, menu, menu_overlay};
 pub use rows::{FolderKind, FolderView, ListRow, folder_row, list_row, section_header};
 
 /// A collapsible account header: the label, unread roll-up and the account's

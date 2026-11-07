@@ -1,6 +1,6 @@
 //! Screen chrome: app bars, section headers, empty states and snackbars.
 
-use iced::widget::{button, column, container, row, space, text};
+use iced::widget::{column, container, row, space, text};
 use iced::{Alignment, Element, Fill};
 
 use crate::Message;
@@ -83,47 +83,6 @@ fn bar_surface<'a>(bar: impl Into<Element<'a, Message>>) -> Element<'a, Message>
             ..Default::default()
         })
         .into()
-}
-
-/// One row inside a dropdown/overflow menu: a leading icon and a label, full
-/// width and tappable.
-pub fn menu_row<'a>(icon: char, label: &str, on_press: Message) -> Element<'a, Message> {
-    let palette = theme::active();
-    let label_style = palette.role(TextRole::BodyMedium);
-
-    let content = row![
-        text(icons::glyph(icon))
-            .font(icons::FONT)
-            .size(palette.metrics.nav_icon_size)
-            .color(palette.on_surface_variant),
-        styled_text(label.to_string(), label_style, palette.on_surface).width(Fill),
-    ]
-    .spacing(palette.space.md)
-    .align_y(Alignment::Center)
-    .width(Fill);
-
-    button(
-        container(content)
-            .width(Fill)
-            .padding([0.0, palette.space.md])
-            .center_y(Fill),
-    )
-    .width(Fill)
-    .padding(0)
-    .style(move |_, status| {
-        let background = match status {
-            button::Status::Hovered | button::Status::Pressed => palette.surface_container_high,
-            _ => iced::Color::TRANSPARENT,
-        };
-        button::Style {
-            background: Some(background.into()),
-            text_color: palette.on_surface,
-            border: iced::border::rounded(palette.radius.xs),
-            ..Default::default()
-        }
-    })
-    .on_press(on_press)
-    .into()
 }
 
 /// A centred empty state with a mail glyph, title and supporting body.

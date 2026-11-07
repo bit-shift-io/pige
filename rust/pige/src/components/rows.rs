@@ -141,19 +141,13 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
     let sender_color = if item.unread { primary } else { secondary };
     let subject_color = if item.unread { primary } else { secondary };
 
-    // Date sits at the top right, with the paperclip directly beneath it, so
-    // attachments are readable without stealing room from the sender line.
-    let mut date_column = column![styled_text(item.date.clone(), date_style, secondary)]
+    // Date sits at the top right. The paperclip shares the subject line (its
+    // right edge, directly under the date) instead of stacking under the date:
+    // stacking made the sender row two lines tall and opened a gap above the
+    // subject. The subject label fills the remaining width and trims around it.
+    let date_column = column![styled_text(item.date.clone(), date_style, secondary)]
         .align_x(iced::Alignment::End)
         .spacing(0.0);
-    if item.has_attachment {
-        date_column = date_column.push(
-            iced::widget::text(icons::glyph(icons::ATTACH_FILE))
-                .font(icons::FONT)
-                .size(palette.metrics.small_icon_size)
-                .color(secondary),
-        );
-    }
 
     let top = row![
         label::fitted(item.sender.clone(), sender_style, sender_color, false, None),
@@ -162,6 +156,25 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
     .align_y(iced::Alignment::Start)
     .spacing(palette.space.xs)
     .width(Fill);
+
+    let mut subject_row = row![label::fitted(
+        item.subject.clone(),
+        subject_style,
+        subject_color,
+        false,
+        None
+    )]
+    .align_y(iced::Alignment::Center)
+    .spacing(palette.space.xs)
+    .width(Fill);
+    if item.has_attachment {
+        subject_row = subject_row.push(
+            iced::widget::text(icons::glyph(icons::ATTACH_FILE))
+                .font(icons::FONT)
+                .size(palette.metrics.small_icon_size)
+                .color(secondary),
+        );
+    }
 
     let mut trailing = column![]
         .width(palette.space.lg)
@@ -175,13 +188,7 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
 
     let lines = column![
         top.width(Fill),
-        label::fitted(
-            item.subject.clone(),
-            subject_style,
-            subject_color,
-            false,
-            None
-        ),
+        subject_row,
         label::fitted(item.snippet.clone(), snippet_style, secondary, false, None),
     ]
     .spacing(0)
@@ -380,5 +387,76 @@ mod tests {
         };
         assert_eq!(row.count, 3);
         assert!(row.unread);
+    }
+
+    /// The paperclip shares the subject line. If it stacked under the date, the
+    /// sender row would be two lines tall and the subject would sit lower than
+    /// in a row without an attachment.
+    #[test]
+    #[ignore = "requires a headless wgpu adapter; run explicitly with --ignored"]
+    fn a_paperclip_does_not_push_the_subject_down() {
+        use iced::advanced::widget::Operation;
+        use iced::advanced::{Layout, layout, renderer::Headless, widget::Tree};
+        use iced::{Font, Rectangle, Size};
+
+        #[derive(Default)]
+        struct Texts(Vec<(String, Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<()>)) {
+                operate(self);
+            }
+            fn text(&mut self, _id: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
+                self.0.push((text.to_string(), bounds));
+            }
+        }
+
+        let renderer = futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Font::DEFAULT,
+            16.0.into(),
+            None,
+        ))
+        .expect("headless wgpu adapter");
+
+        let subject_y = |has_attachment: bool| {
+            let mut element = list_row(
+                ListRow {
+                    initials: "AL".into(),
+                    avatar_color: Color::from_rgb8(0x67, 0x50, 0xa4),
+                    sender: "Ada Lovelace".into(),
+                    date: "09:41".into(),
+                    subject: "Analytical engines".into(),
+                    snippet: "A short preview.".into(),
+                    unread: false,
+                    has_attachment,
+                    count: 0,
+                    account_color: None,
+                },
+                Message::Noop,
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(500.0, 500.0)),
+            );
+            let mut texts = Texts::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            texts
+                .0
+                .iter()
+                .find(|(value, _)| value == "Analytical engines")
+                .expect("the subject text is laid out")
+                .1
+                .y
+        };
+
+        let without = subject_y(false);
+        let with = subject_y(true);
+        assert!(
+            (with - without).abs() < 0.5,
+            "paperclip shifted the subject: without={without}, with={with}"
+        );
     }
 }

@@ -39,14 +39,13 @@ fn triggers(pull: f32, threshold: f32) -> bool {
 }
 
 /// Wrap a configured vertical scroller so dragging from the top refreshes.
-pub fn wrap<'a>(
-    content: Element<'a, Message>,
-    refreshing: bool,
-    on_refresh: Message,
-) -> Element<'a, Message> {
+///
+/// The pull only follows the finger while it is down; on release the list
+/// springs back to its resting position. The in-flight refresh is shown by the
+/// shell's app-bar spinner, so the list is never held displaced.
+pub fn wrap<'a>(content: Element<'a, Message>, on_refresh: Message) -> Element<'a, Message> {
     Element::new(Pull {
         content,
-        refreshing,
         on_refresh,
         palette: theme::active(),
     })
@@ -54,7 +53,6 @@ pub fn wrap<'a>(
 
 struct Pull<'a> {
     content: Element<'a, Message>,
-    refreshing: bool,
     on_refresh: Message,
     palette: Palette,
 }
@@ -109,17 +107,6 @@ impl Pull<'_> {
         query.at_top.unwrap_or(true)
     }
 
-    /// The displacement the content is drawn with this frame. `draw` and
-    /// `update` must agree on it: the draw translates the content, so the
-    /// update has to translate pointer hit-testing by the same amount.
-    fn display_pull(&self, state: &State) -> f32 {
-        if self.refreshing {
-            self.palette.metrics.pull_threshold
-        } else {
-            state.pull
-        }
-    }
-
     fn begin(&self, state: &mut State, finger: Option<touch::Finger>, position: Point) {
         state.drag = Some(Drag {
             finger,
@@ -171,11 +158,7 @@ impl Pull<'_> {
     fn draw_indicator(&self, renderer: &mut iced::Renderer, bounds: Rectangle, pull: f32) {
         let palette = self.palette;
         let metrics = palette.metrics;
-        let progress = if self.refreshing {
-            1.0
-        } else {
-            progress(pull, metrics.pull_threshold)
-        };
+        let progress = progress(pull, metrics.pull_threshold);
         let height = metrics.pull_indicator_height;
         let full = metrics.pull_indicator_width;
         let width = (full * 0.25 + full * 0.75 * progress).max(height);
@@ -304,17 +287,6 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Pull<'_> {
             _ => {}
         }
 
-        // The content is drawn translated down by the pull, so hit-testing must
-        // see the finger at the same offset. Otherwise a tap during a refresh
-        // lands on the row above the one under the finger. While a pull is
-        // actively changing the offset the finger is dragging, not tapping, and
-        // this offset is constant (the refresh threshold).
-        let cursor = if self.refreshing {
-            cursor - Vector::new(0.0, self.palette.metrics.pull_threshold)
-        } else {
-            cursor
-        };
-
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -338,7 +310,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Pull<'_> {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State>();
-        let pull = self.display_pull(state);
+        let pull = state.pull;
         let bounds = layout.bounds();
 
         if pull <= 0.0 {
@@ -393,12 +365,6 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Pull<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        // Keep hover feedback on the same offset as the drawn content.
-        let cursor = if self.refreshing {
-            cursor - Vector::new(0.0, self.palette.metrics.pull_threshold)
-        } else {
-            cursor
-        };
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
             layout,
@@ -503,51 +469,52 @@ mod tests {
                 .into()
         }
 
-        /// While refreshing, the pull wrapper draws the list shifted down by the
-        /// indicator offset. A tap must still open the row under the finger, so
-        /// hit-testing has to follow the same offset.
-        #[test]
-        #[ignore = "requires a headless wgpu adapter; run explicitly with --ignored"]
-        fn a_tap_while_refreshing_hits_the_row_under_the_finger() {
-            let mut rows = column!().width(Fill).spacing(0);
-            for (index, label) in ["A", "B", "C", "D"].iter().enumerate() {
-                rows = rows.push(row(label, Message::Toast(format!("r{index}"))));
+        struct Harness {
+            element: Element<'static, Message>,
+            tree: Tree,
+            node: layout::Node,
+            messages: Vec<Message>,
+        }
+
+        impl Harness {
+            fn new() -> Self {
+                let mut rows = column!().width(Fill).spacing(0);
+                for (index, label) in ["A", "B", "C", "D"].iter().enumerate() {
+                    rows = rows.push(row(label, Message::Toast(format!("r{index}"))));
+                }
+                let scroller: Element<'static, Message> =
+                    scrollable(rows).width(Fill).height(Fill).into();
+                let mut element = wrap(scroller, Message::Refresh);
+                let mut tree = Tree::new(&element);
+                let node = with_renderer(|renderer| {
+                    element.as_widget_mut().layout(
+                        &mut tree,
+                        renderer,
+                        &layout::Limits::new(Size::ZERO, Size::new(300.0, 200.0)),
+                    )
+                });
+                Self {
+                    element,
+                    tree,
+                    node,
+                    messages: Vec::new(),
+                }
             }
-            let scroller: Element<'static, Message> =
-                scrollable(rows).width(Fill).height(Fill).into();
-            let mut element = wrap(scroller, true, Message::Refresh);
-            let mut tree = Tree::new(&element);
-            let node = with_renderer(|renderer| {
-                element.as_widget_mut().layout(
-                    &mut tree,
-                    renderer,
-                    &layout::Limits::new(Size::ZERO, Size::new(300.0, 200.0)),
-                )
-            });
 
-            let metrics = theme::palette(true).metrics;
-            // Visual centre of the second row: its layout bounds are [48, 96),
-            // drawn shifted down by the refresh offset.
-            let position = Point::new(150.0, 72.0 + metrics.pull_threshold);
-            let cursor = mouse::Cursor::Available(position);
-
-            let mut messages = Vec::new();
-            for event in [
-                Event::Touch(touch::Event::FingerPressed {
-                    id: touch::Finger(1),
-                    position,
-                }),
-                Event::Touch(touch::Event::FingerLifted {
-                    id: touch::Finger(1),
-                    position,
-                }),
-            ] {
-                let mut shell = Shell::new(&mut messages);
+            fn send(&mut self, event: Event, position: Point) {
+                let cursor = mouse::Cursor::Available(position);
+                let mut shell = Shell::new(&mut self.messages);
+                let Self {
+                    element,
+                    tree,
+                    node,
+                    ..
+                } = self;
                 with_renderer(|renderer| {
                     element.as_widget_mut().update(
-                        &mut tree,
+                        tree,
                         &event,
-                        Layout::new(&node),
+                        Layout::new(node),
                         cursor,
                         renderer,
                         &mut iced::advanced::clipboard::Null,
@@ -557,11 +524,50 @@ mod tests {
                 });
             }
 
-            let chosen = messages.iter().find_map(|message| match message {
-                Message::Toast(text) => Some(text.clone()),
-                _ => None,
-            });
-            assert_eq!(chosen.as_deref(), Some("r1"), "{messages:?}");
+            fn touch(&mut self, event: fn(touch::Finger, Point) -> Event, position: Point) {
+                self.send(event(touch::Finger(1), position), position);
+            }
+
+            /// The current pull displacement the wrapper would draw with.
+            fn pull(&self) -> f32 {
+                self.tree.state.downcast_ref::<State>().pull
+            }
+        }
+
+        fn pressed(id: touch::Finger, position: Point) -> Event {
+            Event::Touch(touch::Event::FingerPressed { id, position })
+        }
+        fn moved(id: touch::Finger, position: Point) -> Event {
+            Event::Touch(touch::Event::FingerMoved { id, position })
+        }
+        fn lifted(id: touch::Finger, position: Point) -> Event {
+            Event::Touch(touch::Event::FingerLifted { id, position })
+        }
+
+        /// The list follows the finger while pulling, then springs back to rest
+        /// on release: the offset is never held for the duration of the refresh.
+        #[test]
+        #[ignore = "requires a headless wgpu adapter; run explicitly with --ignored"]
+        fn the_list_snaps_back_after_a_refresh_pull() {
+            let mut harness = Harness::new();
+            harness.touch(pressed, Point::new(150.0, 40.0));
+            for y in [60.0, 90.0, 120.0, 160.0] {
+                harness.touch(moved, Point::new(150.0, y));
+            }
+            assert!(
+                harness.pull() > 0.0,
+                "the list follows the finger while dragging"
+            );
+
+            harness.touch(lifted, Point::new(150.0, 160.0));
+            assert!(
+                harness
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Refresh)),
+                "the pull past the threshold must trigger a refresh"
+            );
+            assert_eq!(harness.pull(), 0.0, "the list must spring back on release");
         }
     }
 }

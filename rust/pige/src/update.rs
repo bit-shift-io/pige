@@ -87,25 +87,16 @@ impl App {
                     return snapshot_task(async move { api::load_older(&folder).await });
                 }
             }
-            Message::SyncNow => {
+            Message::SyncNow | Message::Refresh => {
                 return synced_with_prefetch(api::sync_all());
             }
-            Message::Refresh => {
-                // Only a user pull shows the list's refresh indicator; a
-                // background or app-bar sync must not shift the list.
-                self.refreshing = true;
-                return synced_with_prefetch(api::sync_all());
-            }
-            Message::Synced(result) => {
-                self.refreshing = false;
-                match result {
-                    Ok(snapshot) => {
-                        self.apply_snapshot(snapshot);
-                        return prefetch_task();
-                    }
-                    Err(error) => return self.show_toast(error),
+            Message::Synced(result) => match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    return prefetch_task();
                 }
-            }
+                Err(error) => return self.show_toast(error),
+            },
             Message::OpenSearch => self.search_open = true,
             Message::CloseSearch => {
                 self.search_open = false;
@@ -1352,25 +1343,6 @@ mod tests {
         assert!(app.restore_picker.is_none());
         assert!(!app.settings.notifications, "restored settings must apply");
         assert!(app.toast.current.is_some(), "restore reports via toast");
-    }
-
-    #[test]
-    fn only_a_pull_sets_the_refresh_indicator_and_it_clears_on_sync() {
-        let mut app = App::for_test();
-
-        let _ = app.update(Message::SyncNow);
-        assert!(!app.refreshing, "an app-bar sync must not shift the list");
-
-        let _ = app.update(Message::Refresh);
-        assert!(app.refreshing, "a pull shows the indicator");
-
-        let _ = app.update(Message::Synced(Ok(ModelSnapshot::default())));
-        assert!(!app.refreshing, "the indicator clears when the sync ends");
-
-        let _ = app.update(Message::Refresh);
-        assert!(app.refreshing);
-        let _ = app.update(Message::Synced(Err("boom".to_string())));
-        assert!(!app.refreshing, "a failed sync still clears the indicator");
     }
 
     #[test]

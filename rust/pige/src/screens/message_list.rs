@@ -120,7 +120,7 @@ pub fn list_pane<'a>(
                 .height(Fill)
                 .style(palette.scrollable())
                 .into();
-        let scroller = components::pull_refresh::wrap(scroller, app.refreshing, Message::Refresh);
+        let scroller = components::pull_refresh::wrap(scroller, Message::Refresh);
         pane = pane.push(elastic_scroll::wrap(
             scroller,
             app.list_motion.clone(),

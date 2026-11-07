@@ -105,9 +105,6 @@ pub struct App {
     pub(crate) move_picker_open: bool,
     /// Whether the reader app-bar overflow menu is open.
     pub(crate) reader_menu_open: bool,
-    /// True from a pull-to-refresh until that sync finishes. Drives only the
-    /// pull indicator, so background and app-bar syncs never shift the list.
-    pub(crate) refreshing: bool,
     /// Whether the reader's permanent-delete confirmation is open.
     pub(crate) delete_confirm_open: bool,
     /// Candidate backup names shown in the Advanced restore picker.
@@ -194,7 +191,6 @@ impl App {
                 spin_phase: 0,
                 move_picker_open: false,
                 reader_menu_open: false,
-                refreshing: false,
                 delete_confirm_open: false,
                 restore_picker: None,
                 restore_confirm: None,
@@ -235,7 +231,6 @@ impl App {
             spin_phase: 0,
             move_picker_open: false,
             reader_menu_open: false,
-            refreshing: false,
             delete_confirm_open: false,
             restore_picker: None,
             restore_confirm: None,
@@ -263,8 +258,9 @@ impl App {
         self.snapshot = snapshot;
     }
 
-    /// Whether any sync is running. Drives the app bar's progress spinner; it
-    /// never moves the list (only a pull does that via [`App::refreshing`]).
+    /// Whether any sync is running. Drives the app bar's progress spinner; a
+    /// pull only displaces the list while the finger is down, so a sync never
+    /// moves it.
     pub(crate) fn syncing(&self) -> bool {
         self.snapshot.status == pige_core::api::SyncStatus::Syncing
     }
