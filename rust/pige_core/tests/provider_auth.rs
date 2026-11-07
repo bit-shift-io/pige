@@ -217,6 +217,118 @@ async fn removed_account_rejects_rotated_secret() {
 }
 
 #[tokio::test]
+async fn stale_refresh_is_rejected_when_invalidate_lands_before_the_write() {
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let ctx = harness
+        .sessions
+        .context(&account, Duration::from_secs(30))
+        .expect("context");
+    harness
+        .secrets
+        .save(&ctx, &SecretEnvelope::password("original"))
+        .expect("seed active secret");
+
+    // Reproduce the critical race: a durable invalidation lands after the
+    // caller's context was minted (so a naive fence would already have passed)
+    // but before the credential write. The generation check and the write are
+    // now atomic under the account gate, so the write must observe the bump.
+    let store = harness.store.clone();
+    let invalidated = account.clone();
+    harness.secrets.set_pre_write_hook(Arc::new(move || {
+        store
+            .invalidate_account(&invalidated)
+            .expect("invalidate during save");
+    }));
+
+    let error = harness
+        .secrets
+        .save(&ctx, &SecretEnvelope::password("rotated"))
+        .expect_err("a refresh fenced after invalidation must not persist");
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(harness.store.generation(&account).expect("generation"), 2);
+
+    let durable = harness.secrets.load(&account).expect("load").expect("present");
+    assert_eq!(
+        password_of(&durable),
+        "original",
+        "a rotated credential must be impossible after invalidation"
+    );
+}
+
+#[tokio::test]
+async fn token_cache_is_scoped_to_generation() {
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let refresher = Arc::new(FakeTokenRefresher::new("gen-token"));
+    let source = CachedTokenSource::new(refresher.clone(), Duration::from_secs(3600));
+
+    let first = harness
+        .sessions
+        .context(&account, Duration::from_secs(30))
+        .expect("first context");
+    assert_eq!(
+        source
+            .access_token(&first)
+            .await
+            .expect("token")
+            .expose_secret(),
+        "gen-token"
+    );
+    assert_eq!(refresher.calls(), 1);
+
+    harness.sessions.invalidate(&account).expect("invalidate");
+    assert!(first.cancellation.is_cancelled());
+    // A cancelled context must not be served the cached token.
+    assert!(source.access_token(&first).await.is_err());
+
+    let second = harness
+        .sessions
+        .context(&account, Duration::from_secs(30))
+        .expect("second context");
+    assert_eq!(second.generation, 2);
+    // The cache was minted under generation 1; generation 2 must refresh rather
+    // than be served the previous generation's token.
+    assert_eq!(
+        source
+            .access_token(&second)
+            .await
+            .expect("token")
+            .expose_secret(),
+        "gen-token"
+    );
+    assert_eq!(refresher.calls(), 2);
+}
+
+#[tokio::test]
+async fn context_advances_to_a_durable_generation_and_cancels_older_contexts() {
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let first = harness
+        .sessions
+        .context(&account, Duration::from_secs(30))
+        .expect("first context");
+    assert_eq!(first.generation, 1);
+
+    // Another process (or a restart) advances the durable generation.
+    harness.store.bump_generation(&account).expect("bump");
+
+    let second = harness
+        .sessions
+        .context(&account, Duration::from_secs(30))
+        .expect("second context");
+    assert_eq!(second.generation, 2);
+    assert!(
+        first.cancellation.is_cancelled(),
+        "a context older than the durable generation is cancelled"
+    );
+    assert!(
+        !second.cancellation.is_cancelled(),
+        "a context at the current generation survives"
+    );
+}
+
+#[tokio::test]
 async fn session_only_never_writes_sqlite() {
     let harness = Harness::new();
     let account = AccountId::new();
@@ -395,6 +507,101 @@ async fn late_attempt_answer_is_rejected() {
             .expect("load staged")
             .is_none(),
         "an expired attempt must clean up its staged secret"
+    );
+}
+
+#[tokio::test]
+async fn terminal_attempts_sweep_their_staged_secret() {
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let mut auth = FakeAuthService::new(
+        harness.secrets.clone(),
+        harness.sessions.clone(),
+        harness.store.clone(),
+    )
+    .script(FakeAuthScript::password("pw"));
+
+    let AuthProgress::Challenge { attempt, .. } = auth
+        .begin(harness.request(Some(account.clone())))
+        .await
+        .expect("begin")
+    else {
+        panic!("expected a challenge");
+    };
+    let AuthProgress::Complete(authenticated) = auth
+        .respond(&attempt, AuthAnswer::Password(SecretString::from("pw")))
+        .await
+        .expect("respond")
+    else {
+        panic!("expected completion");
+    };
+    // F10 owns commit; until then the staged secret is still present.
+    assert!(
+        harness
+            .secrets
+            .load_staged(&authenticated.credential_ref)
+            .expect("load staged")
+            .is_some()
+    );
+
+    // A completed-but-uncommitted attempt must still be swept, or its staged
+    // secret leaks forever.
+    let reaped = auth.reap_expired().expect("reap");
+    assert!(reaped.contains(&attempt));
+    assert!(
+        harness
+            .secrets
+            .load_staged(&authenticated.credential_ref)
+            .expect("load staged")
+            .is_none(),
+        "a terminal attempt's staged secret is discarded"
+    );
+    assert!(harness.store.pending_auth(&attempt).expect("pending").is_none());
+}
+
+#[tokio::test]
+async fn begin_sweeps_orphaned_pending_auth_rows_and_their_staged_secrets() {
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let attempt = AuthAttemptId::new("22222222-2222-2222-2222-222222222222");
+    let staged = pige_core::auth::StagedSecretRef::for_attempt(&attempt).expect("staged ref");
+
+    // A pending row and staged secret left behind by a previous run.
+    harness
+        .store
+        .insert_pending_auth(&pige_core::store::PendingAuthRecord {
+            attempt: attempt.clone(),
+            account: Some(account.clone()),
+            provider: ProviderId::from(IMAP_SMTP_PROVIDER),
+            credential_ref: staged.as_str().to_string(),
+            generation: 1,
+            created_at_ms: 0,
+            expires_at_ms: 0,
+        })
+        .expect("seed orphan row");
+    harness
+        .credentials
+        .set_session(&AccountId(staged.as_str().to_string()), "orphan-secret")
+        .expect("seed orphan staged secret");
+
+    let mut auth = FakeAuthService::new(
+        harness.secrets.clone(),
+        harness.sessions.clone(),
+        harness.store.clone(),
+    )
+    .script(FakeAuthScript::password("pw"));
+    auth.begin(harness.request(Some(account)))
+        .await
+        .expect("begin");
+
+    assert!(harness.store.pending_auth(&attempt).expect("pending").is_none());
+    assert!(
+        harness
+            .secrets
+            .load_staged(&staged)
+            .expect("load staged")
+            .is_none(),
+        "begin sweeps an orphaned staged secret"
     );
 }
 

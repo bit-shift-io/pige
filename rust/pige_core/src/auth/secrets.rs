@@ -8,7 +8,8 @@
 //! the mail cache; only the credential store holds it.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,10 @@ use crate::account::AccountId;
 use crate::platform::{CredentialStore, credentials_unavailable, is_valid_credential_key};
 use crate::providers::{AuthAttemptId, ErrorKind, OperationContext, ProviderError};
 use crate::store::{Store, StoreError};
+
+/// How long a credential-write holds the durable account lease. It is released
+/// as soon as the write completes; the TTL only bounds a crashed writer.
+const CREDENTIAL_WRITE_LEASE_TTL: Duration = Duration::from_secs(30);
 
 /// On-disk (well, in-credential-store) envelope format version.
 pub const SECRET_ENVELOPE_VERSION: u32 = 1;
@@ -109,9 +114,23 @@ impl SecretEnvelope {
         Ok(json)
     }
 
-    /// Parse a stored string. A value that is not a current envelope is treated
-    /// as a legacy bare password, so an upgrade never loses an existing secret.
+    /// Parse a stored string.
+    ///
+    /// A value that is not an envelope *shape* is read back as a legacy bare
+    /// password, so an upgrade never loses an existing secret. A value that
+    /// looks like an envelope (a JSON object) but cannot be parsed, or is
+    /// newer than this build, is a hard error: reinterpreting a corrupt or
+    /// unknown-newer envelope as a password would let the next `save` re-persist
+    /// the mangled value.
     pub fn from_stored_string(stored: &str) -> Result<Self, ProviderError> {
+        let looks_like_envelope =
+            stored.trim_start().starts_with('{') && stored.trim_end().ends_with('}');
+        if !looks_like_envelope {
+            return Ok(Self {
+                version: SECRET_ENVELOPE_VERSION,
+                credentials: StoredCredentials::Password(SecretString::from(stored)),
+            });
+        }
         match serde_json::from_str::<WireEnvelope>(stored) {
             Ok(wire) if wire.version <= SECRET_ENVELOPE_VERSION => Ok(Self {
                 version: wire.version,
@@ -121,10 +140,10 @@ impl SecretEnvelope {
                 "protected secret format {} is newer than supported format {}",
                 wire.version, SECRET_ENVELOPE_VERSION
             ))),
-            Err(_) => Ok(Self {
-                version: SECRET_ENVELOPE_VERSION,
-                credentials: StoredCredentials::Password(SecretString::from(stored)),
-            }),
+            Err(error) => Err(ProviderError::transient(
+                "the protected secret could not be read",
+            )
+            .with_source_detail(error.to_string())),
         }
     }
 }
@@ -240,9 +259,22 @@ impl StagedSecretRef {
     }
 
     /// A reference to an account's own (active) entry, used when resuming a
-    /// stored session.
-    pub fn for_account(account: &AccountId) -> Self {
-        Self(account.0.clone())
+    /// stored session. Validated against the platform key whitelist like
+    /// [`Self::for_attempt`].
+    pub fn for_account(account: &AccountId) -> Result<Self, ProviderError> {
+        Self::from_stored_key(&account.0)
+    }
+
+    /// Rebuild a reference from a persisted `credential_ref` (for example a
+    /// pending-auth row written by another process), validating it against the
+    /// platform key whitelist so an unvalidated key can never reach the store.
+    pub fn from_stored_key(key: &str) -> Result<Self, ProviderError> {
+        if !is_valid_credential_key(key) {
+            return Err(ProviderError::unsupported(
+                "the credential reference is not a valid credential key",
+            ));
+        }
+        Ok(Self(key.to_string()))
     }
 }
 
@@ -282,6 +314,12 @@ pub trait SecretRepository: Send + Sync {
 pub struct CredentialSecretRepository {
     credentials: Arc<dyn CredentialStore>,
     gate: Option<Arc<Store>>,
+    /// Identifies this repository for the durable credential-write lease.
+    holder: String,
+    /// Test seam, run immediately before a write fences itself. It exists so the
+    /// atomicity regression can force an `invalidate` to land between the
+    /// fast-path generation read and the authoritative, gated write.
+    pre_write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl CredentialSecretRepository {
@@ -291,6 +329,8 @@ impl CredentialSecretRepository {
         Self {
             credentials,
             gate: None,
+            holder: format!("cred-{}", uuid::Uuid::new_v4()),
+            pre_write_hook: Mutex::new(None),
         }
     }
 
@@ -299,16 +339,101 @@ impl CredentialSecretRepository {
         Self {
             credentials,
             gate: Some(gate),
+            holder: format!("cred-{}", uuid::Uuid::new_v4()),
+            pre_write_hook: Mutex::new(None),
         }
     }
 
-    fn fence(&self, ctx: &OperationContext) -> Result<(), ProviderError> {
+    /// Install the pre-write test seam. Only used by the atomicity regression
+    /// test; production code never sets it.
+    #[doc(hidden)]
+    pub fn set_pre_write_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .pre_write_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    fn run_pre_write_hook(&self) {
+        let hook = self
+            .pre_write_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run the fence and the credential write atomically with respect to the
+    /// same account gate.
+    ///
+    /// The account lock is held across the durable generation check *and* the
+    /// credential write (no await is held during credential I/O). With a durable
+    /// gate, the write additionally takes the cross-process account lease and
+    /// verifies the generation inside the lease transaction, so an
+    /// `invalidate`/removal in another process that ran first is observed.
+    fn write(
+        &self,
+        ctx: &OperationContext,
+        secret: &SecretEnvelope,
+        session_only: bool,
+    ) -> Result<(), ProviderError> {
+        // Fast-path check, exactly as the pre-F3 code did it. This one can pass
+        // for a stale context; only the gated re-check below is authoritative.
         ctx.ensure_active()?;
-        if let Some(gate) = &self.gate {
-            gate.check_generation(&ctx.account, ctx.generation)
+        if let Some(store) = &self.gate {
+            store
+                .check_generation(&ctx.account, ctx.generation)
                 .map_err(store_error_to_provider)?;
         }
-        Ok(())
+        // Test seam: an `invalidate` landing here is what the regression test
+        // reproduces. It must be caught by the gated fence below.
+        self.run_pre_write_hook();
+
+        let account = ctx.account.clone();
+        let body = || -> Result<(), ProviderError> {
+            ctx.ensure_active()?;
+            let stored = secret.to_stored_string()?;
+            if let Some(store) = &self.gate {
+                let lease = store
+                    .fence_credential_write(
+                        &account,
+                        &self.holder,
+                        ctx.generation,
+                        CREDENTIAL_WRITE_LEASE_TTL,
+                    )
+                    .map_err(store_error_to_provider)?;
+                let result = if session_only {
+                    self.credentials
+                        .set_session(&account, &stored)
+                        .map_err(credential_error)
+                } else {
+                    // Narrow the cross-process window: the lease must still be
+                    // ours immediately before the credential is written.
+                    store
+                        .ensure_lease(&lease)
+                        .map_err(store_error_to_provider)?;
+                    self.credentials
+                        .set(&account, &stored)
+                        .map_err(credential_error)
+                };
+                let _ = store.release_lease(&lease);
+                result
+            } else if session_only {
+                self.credentials
+                    .set_session(&account, &stored)
+                    .map_err(credential_error)
+            } else {
+                self.credentials
+                    .set(&account, &stored)
+                    .map_err(credential_error)
+            }
+        };
+        match &self.gate {
+            Some(store) => store.with_account_gate(&account, body),
+            None => body(),
+        }
     }
 
     fn read(&self, key: &AccountId) -> Result<Option<SecretEnvelope>, ProviderError> {
@@ -326,11 +451,7 @@ impl SecretRepository for CredentialSecretRepository {
     }
 
     fn save(&self, ctx: &OperationContext, secret: &SecretEnvelope) -> Result<(), ProviderError> {
-        self.fence(ctx)?;
-        let stored = secret.to_stored_string()?;
-        self.credentials
-            .set(&ctx.account, &stored)
-            .map_err(credential_error)
+        self.write(ctx, secret, false)
     }
 
     fn save_session(
@@ -338,17 +459,21 @@ impl SecretRepository for CredentialSecretRepository {
         ctx: &OperationContext,
         secret: &SecretEnvelope,
     ) -> Result<(), ProviderError> {
-        self.fence(ctx)?;
-        let stored = secret.to_stored_string()?;
-        self.credentials
-            .set_session(&ctx.account, &stored)
-            .map_err(credential_error)
+        self.write(ctx, secret, true)
     }
 
     fn delete(&self, account: &AccountId) -> Result<(), ProviderError> {
-        self.credentials.delete(account).map_err(credential_error)?;
-        let _ = self.credentials.delete_session(account);
-        Ok(())
+        // Removal runs on the same in-process gate as a credential write, so a
+        // write cannot be split from the delete that removes it.
+        let run = || {
+            self.credentials.delete(account).map_err(credential_error)?;
+            let _ = self.credentials.delete_session(account);
+            Ok(())
+        };
+        match &self.gate {
+            Some(store) => store.with_account_gate(account, run),
+            None => run(),
+        }
     }
 
     fn stage(
@@ -379,6 +504,34 @@ impl SecretRepository for CredentialSecretRepository {
             .delete_session(&AccountId(reference.as_str().to_string()))
             .map_err(credential_error)
     }
+}
+
+/// Sweep expired pending-auth rows and their staged credential entries.
+///
+/// Called at startup and before a new attempt begins, so an attempt that was
+/// abandoned (or left behind by a crashed process) cannot leak a staged secret
+/// forever. Returns how many rows were swept. The credential discard and row
+/// delete are both idempotent.
+pub fn sweep_expired_pending_auth(
+    store: &Store,
+    secrets: &dyn SecretRepository,
+) -> Result<usize, ProviderError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+    let rows = store
+        .expired_pending_auth(now)
+        .map_err(store_error_to_provider)?;
+    let mut swept = 0;
+    for record in rows {
+        if let Ok(reference) = StagedSecretRef::from_stored_key(&record.credential_ref) {
+            let _ = secrets.discard_staged(&reference);
+        }
+        let _ = store.remove_pending_auth(&record.attempt);
+        swept += 1;
+    }
+    Ok(swept)
 }
 
 /// Map a store failure to a safe, provider-neutral error. Internal SQL details

@@ -518,6 +518,18 @@ pub fn init(config: Config) -> Result<(), String> {
         .map_err(|error| format!("migrate store: {error}"))?;
     let sessions = Arc::new(crate::auth::AccountSessionManager::new(store.clone()));
 
+    // Drop pending-auth rows and staged references left by a previous run so an
+    // abandoned attempt cannot leak a protected secret.
+    {
+        let secrets = crate::auth::CredentialSecretRepository::with_gate(
+            config.credentials.clone(),
+            store.clone(),
+        );
+        if let Err(error) = crate::auth::sweep_expired_pending_auth(&store, &secrets) {
+            log::warn!("sweep expired pending authentication: {error}");
+        }
+    }
+
     let config_path = config::document_path(&config.config_dir);
     let (config_doc, startup_warning, writes_blocked) =
         load_or_migrate_document(&store, &config_path);
@@ -810,6 +822,12 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
     // clean restore and keep the old password.
     let mut warnings = Vec::new();
     for id in &dropped {
+        // Bump the generation (and fence out any in-flight writer) *before*
+        // deleting so a refresh already past its fence cannot re-persist a
+        // rotated credential after the delete.
+        if let Err(error) = state.sessions.invalidate(id) {
+            log::warn!("invalidate session for restored-away account {id}: {error}");
+        }
         if let Err(error) = state.config.credentials.delete(id) {
             log::warn!("delete password for restored-away account {id}: {error}");
             warnings.push(format!(
@@ -818,9 +836,6 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         }
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password for restored-away account {id}: {error}");
-        }
-        if let Err(error) = state.sessions.invalidate(id) {
-            log::warn!("invalidate session for restored-away account {id}: {error}");
         }
     }
 
@@ -872,15 +887,17 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
 
     let mut warnings = Vec::new();
     for id in &ids {
+        // Invalidate (bump generation, fence writers) before deleting so a
+        // refresh already past its fence cannot repopulate the credential.
+        if let Err(error) = state.sessions.invalidate(id) {
+            log::warn!("invalidate session during factory reset for {id}: {error}");
+        }
         if let Err(error) = state.config.credentials.delete(id) {
             log::warn!("delete password during factory reset for {id}: {error}");
             warnings.push(format!("A stored password could not be cleared: {error}"));
         }
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password during factory reset for {id}: {error}");
-        }
-        if let Err(error) = state.sessions.invalidate(id) {
-            log::warn!("invalidate session during factory reset for {id}: {error}");
         }
     }
 
@@ -1299,6 +1316,15 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
         // rotated credential for an account the user can no longer see.
         if let Err(error) = state.sessions.invalidate(id) {
             log::warn!("invalidate session for removed account {id}: {error}");
+        }
+        // A refresh already past its fence when the generation was bumped could
+        // have re-written a rotated credential; delete once more so nothing
+        // stale survives now that future writes are fenced.
+        if let Err(error) = state.config.credentials.delete(id) {
+            log::warn!("clear credential after invalidating removed account {id}: {error}");
+        }
+        if let Err(error) = state.config.credentials.delete_session(id) {
+            log::warn!("clear session credential after invalidating removed account {id}: {error}");
         }
 
         // Clear any selection that pointed at the removed account, then pick

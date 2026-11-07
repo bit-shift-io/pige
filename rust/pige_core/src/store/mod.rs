@@ -11,13 +11,14 @@ mod migrations;
 mod schema;
 mod search;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::account::Account;
+use crate::account::{Account, AccountId};
 use crate::mail::{Conversation, Folder, FolderId};
 
 use accounts::accounts_on;
@@ -95,6 +96,11 @@ impl StoreError {
 /// operation and never across an await.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Process-local per-account gate. A synchronous mutex that serializes
+    /// credential writes against invalidation/removal *within this process*;
+    /// the durable half of the gate (generation + lease) lives in `jobs`.
+    /// Entries are never removed, so a guard stays valid for the store's life.
+    gates: Mutex<HashMap<AccountId, Arc<Mutex<()>>>>,
 }
 
 impl Store {
@@ -113,6 +119,7 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            gates: Mutex::new(HashMap::new()),
         })
     }
 
@@ -120,6 +127,29 @@ impl Store {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Run `f` while holding the account's process-local gate.
+    ///
+    /// This is the in-process half of the account gate: the credential-write
+    /// path and `invalidate`/removal both take it, so a generation check and the
+    /// credential write it fences cannot be split by a concurrent invalidation.
+    /// `f` must be synchronous — never hold this across an await.
+    pub fn with_account_gate<T>(&self, account: &AccountId, f: impl FnOnce() -> T) -> T {
+        let gate = {
+            let mut gates = self
+                .gates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            gates
+                .entry(account.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f()
     }
 
     /// Read everything a snapshot needs inside one deferred SQLite transaction,

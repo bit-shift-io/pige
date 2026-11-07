@@ -72,6 +72,27 @@ fn ttl_ms(ttl: Duration) -> i64 {
     ttl.as_millis().min(i64::MAX as u128) as i64
 }
 
+/// The compare-and-set generation check executed *inside* a caller's SQLite
+/// transaction, so it cannot be split from the write it fences.
+fn check_generation_in(
+    tx: &rusqlite::Transaction<'_>,
+    account: &AccountId,
+    expected: u64,
+) -> Result<(), StoreError> {
+    let actual: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM account_generation WHERE account_id = ?1",
+            [&account.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let actual = actual.map_or(INITIAL_GENERATION, |value| value as u64);
+    if actual != expected {
+        return Err(StoreError::StaleGeneration { expected, actual });
+    }
+    Ok(())
+}
+
 impl Store {
     /// The current durable generation for `account`. A never-seen account is
     /// [`INITIAL_GENERATION`].
@@ -147,6 +168,11 @@ impl Store {
             Some((owner, _fencing, held_until)) if held_until > now && owner != holder => {
                 return Err(StoreError::LeaseHeld);
             }
+            // Re-acquiring your *own* live lease keeps the fencing token, so a
+            // caller's existing handle is not silently invalidated.
+            Some((owner, fencing, held_until)) if held_until > now && owner == holder => {
+                fencing as u64
+            }
             Some((_, fencing, _)) => fencing as u64 + 1,
             None => 1,
         };
@@ -168,8 +194,10 @@ impl Store {
         })
     }
 
-    /// Extend a held lease. Fails with [`StoreError::LeaseLost`] if another
-    /// holder took the lease or the fencing token moved.
+    /// Extend a held, unexpired lease. Fails with [`StoreError::LeaseLost`] if
+    /// another holder took the lease, the fencing token moved, or the lease has
+    /// already expired (an expired lease can only be re-acquired, which advances
+    /// the fencing token).
     pub fn renew_lease(
         &self,
         lease: &AccountLease,
@@ -181,12 +209,13 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let updated = tx.execute(
             "UPDATE account_lease SET expires_at = ?1
-             WHERE account_id = ?2 AND holder = ?3 AND fencing = ?4",
+             WHERE account_id = ?2 AND holder = ?3 AND fencing = ?4 AND expires_at > ?5",
             params![
                 expires_at,
                 lease.account.0,
                 lease.holder,
-                lease.fencing as i64
+                lease.fencing as i64,
+                now
             ],
         )?;
         if updated == 0 {
@@ -233,6 +262,93 @@ impl Store {
             }
             _ => Err(StoreError::LeaseLost),
         }
+    }
+
+    /// Acquire the account lease and verify `expected_generation` *in one
+    /// transaction*. This is the durable fence on the credential-write path: a
+    /// credential may only be written while holding this lease at the right
+    /// generation, so a removal/revocation that ran first is observed.
+    ///
+    /// Fails with [`StoreError::LeaseHeld`] if another live holder owns the
+    /// account or [`StoreError::StaleGeneration`] if it was invalidated.
+    pub fn fence_credential_write(
+        &self,
+        account: &AccountId,
+        holder: &str,
+        expected_generation: u64,
+        ttl: Duration,
+    ) -> Result<AccountLease, StoreError> {
+        let now = now_ms();
+        let expires_at = now.saturating_add(ttl_ms(ttl));
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        check_generation_in(&tx, account, expected_generation)?;
+        let existing: Option<(String, i64, i64)> = tx
+            .query_row(
+                "SELECT holder, fencing, expires_at FROM account_lease WHERE account_id = ?1",
+                [&account.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let fencing = match existing {
+            Some((owner, _, held_until)) if held_until > now && owner != holder => {
+                return Err(StoreError::LeaseHeld);
+            }
+            Some((owner, fencing, held_until)) if held_until > now && owner == holder => {
+                fencing as u64
+            }
+            Some((_, fencing, _)) => fencing as u64 + 1,
+            None => 1,
+        };
+        tx.execute(
+            "INSERT INTO account_lease (account_id, holder, fencing, expires_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 holder = excluded.holder,
+                 fencing = excluded.fencing,
+                 expires_at = excluded.expires_at",
+            params![account.0, holder, fencing as i64, expires_at],
+        )?;
+        tx.commit()?;
+        Ok(AccountLease {
+            account: account.clone(),
+            holder: holder.to_string(),
+            fencing,
+            expires_at_ms: expires_at,
+        })
+    }
+
+    /// Atomically advance the account generation and fence out every
+    /// outstanding lease in one transaction. Removal/revocation uses this so a
+    /// credential write started earlier can never complete: its lease is fenced
+    /// (any later `ensure_lease` fails) and its generation is stale.
+    pub fn invalidate_account(&self, account: &AccountId) -> Result<u64, StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM account_generation WHERE account_id = ?1",
+                [&account.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next = current.map_or(INITIAL_GENERATION + 1, |value| value as u64 + 1);
+        tx.execute(
+            "INSERT INTO account_generation (account_id, generation) VALUES (?1, ?2)
+             ON CONFLICT(account_id) DO UPDATE SET generation = excluded.generation",
+            params![account.0, next as i64],
+        )?;
+        // Keep the fencing token monotonic and drop any live holder so an older
+        // writer's `ensure_lease` fails before it writes.
+        tx.execute(
+            "INSERT INTO account_lease (account_id, holder, fencing, expires_at)
+             VALUES (?1, '', 1, 0)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 holder = '', fencing = account_lease.fencing + 1, expires_at = 0",
+            params![account.0],
+        )?;
+        tx.commit()?;
+        Ok(next)
     }
 
     /// Record a pending authentication attempt. Only non-secret references are
@@ -331,11 +447,13 @@ impl Store {
         generation: u64,
         cursor: &ProviderCursor,
     ) -> Result<(), StoreError> {
-        self.check_generation(&key.account, generation)?;
         let job_key = serde_json::to_string(key)?;
         let cursor_json = serde_json::to_string(cursor)?;
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
+        // Re-check inside the transaction: a plain `check_generation` beforehand
+        // could be split from this write by a concurrent invalidation.
+        check_generation_in(&tx, &key.account, generation)?;
         let existing: Option<i64> = tx
             .query_row(
                 "SELECT generation FROM job_checkpoints WHERE job_key = ?1",
@@ -444,6 +562,87 @@ mod tests {
             .acquire_lease(&account, "process-b", Duration::from_secs(60))
             .unwrap();
         assert!(second.fencing > first.fencing);
+    }
+
+    #[test]
+    fn an_expired_lease_cannot_be_renewed_but_can_be_reacquired() {
+        let (_dir, store) = store();
+        let account = AccountId::new();
+        let expired = store
+            .acquire_lease(&account, "process-a", Duration::from_millis(0))
+            .unwrap();
+        assert!(matches!(
+            store.renew_lease(&expired, Duration::from_secs(60)),
+            Err(StoreError::LeaseLost)
+        ));
+        let fresh = store
+            .acquire_lease(&account, "process-a", Duration::from_secs(60))
+            .unwrap();
+        assert!(fresh.fencing > expired.fencing);
+    }
+
+    #[test]
+    fn reacquiring_your_own_live_lease_keeps_the_fencing_token() {
+        let (_dir, store) = store();
+        let account = AccountId::new();
+        let first = store
+            .acquire_lease(&account, "process-a", Duration::from_secs(60))
+            .unwrap();
+        let again = store
+            .acquire_lease(&account, "process-a", Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(first.fencing, again.fencing);
+        // The earlier handle is still valid, and another process is still fenced.
+        store.ensure_lease(&first).unwrap();
+        assert!(matches!(
+            store.acquire_lease(&account, "process-b", Duration::from_secs(60)),
+            Err(StoreError::LeaseHeld)
+        ));
+    }
+
+    #[test]
+    fn credential_write_fence_checks_generation_inside_the_lease_transaction() {
+        let (_dir, store) = store();
+        let account = AccountId::new();
+        let lease = store
+            .fence_credential_write(&account, "cred-a", INITIAL_GENERATION, Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(lease.fencing, 1);
+        store.ensure_lease(&lease).unwrap();
+        store.release_lease(&lease).unwrap();
+
+        store.bump_generation(&account).unwrap();
+        assert!(matches!(
+            store.fence_credential_write(
+                &account,
+                "cred-a",
+                INITIAL_GENERATION,
+                Duration::from_secs(30)
+            ),
+            Err(StoreError::StaleGeneration { .. })
+        ));
+    }
+
+    #[test]
+    fn invalidate_account_bumps_generation_and_fences_outstanding_leases() {
+        let (_dir, store) = store();
+        let account = AccountId::new();
+        let lease = store
+            .fence_credential_write(&account, "cred-a", INITIAL_GENERATION, Duration::from_secs(60))
+            .unwrap();
+        let next = store.invalidate_account(&account).unwrap();
+        assert_eq!(next, 2);
+        assert_eq!(store.generation(&account).unwrap(), 2);
+        assert!(matches!(store.ensure_lease(&lease), Err(StoreError::LeaseLost)));
+        assert!(matches!(
+            store.fence_credential_write(
+                &account,
+                "cred-b",
+                INITIAL_GENERATION,
+                Duration::from_secs(60)
+            ),
+            Err(StoreError::StaleGeneration { .. })
+        ));
     }
 
     #[test]

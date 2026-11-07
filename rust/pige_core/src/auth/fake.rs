@@ -190,20 +190,56 @@ impl FakeAuthService {
         Ok(())
     }
 
-    /// Drop every expired pending attempt and its staged secret. Returns the
-    /// attempts that were reaped.
+    /// Sweep every staged secret that can no longer be committed: expired
+    /// pending attempts, terminal (resolved/cancelled) attempts whose commit
+    /// never happened, and pending rows left by another process or a restart.
+    /// Returns the attempts that were reaped.
+    ///
+    /// This is called at the start of every [`AuthenticationService::begin`], so
+    /// a completed-but-uncommitted staged entry cannot leak.
     pub fn reap_expired(&mut self) -> Result<Vec<AuthAttemptId>, ProviderError> {
         let now = now_ms();
+        let mut reaped = Vec::new();
+
+        // Collect first so the map can be mutated while sweeping.
+        let terminal: Vec<(AuthAttemptId, StagedSecretRef)> = self
+            .attempts
+            .iter()
+            .filter(|(_, state)| state.state != AttemptState::Pending)
+            .map(|(attempt, state)| (attempt.clone(), state.staged.clone()))
+            .collect();
         let expired: Vec<(AuthAttemptId, StagedSecretRef)> = self
             .attempts
             .iter()
             .filter(|(_, state)| state.state == AttemptState::Pending && now >= state.expires_at_ms)
             .map(|(attempt, state)| (attempt.clone(), state.staged.clone()))
             .collect();
+
         for (attempt, staged) in &expired {
             self.discard_attempt(attempt, staged)?;
+            reaped.push(attempt.clone());
         }
-        Ok(expired.into_iter().map(|(attempt, _)| attempt).collect())
+        for (attempt, staged) in &terminal {
+            self.secrets.discard_staged(staged)?;
+            self.store
+                .remove_pending_auth(attempt)
+                .map_err(super::secrets::store_error_to_provider)?;
+            self.attempts.remove(attempt);
+            reaped.push(attempt.clone());
+        }
+
+        // Pending rows written by another process or a previous run, whose
+        // in-memory attempt state this service never held.
+        for record in self
+            .store
+            .expired_pending_auth(now)
+            .map_err(super::secrets::store_error_to_provider)?
+        {
+            reaped.push(record.attempt);
+        }
+        super::secrets::sweep_expired_pending_auth(&self.store, self.secrets.as_ref())?;
+
+        Ok(reaped)
     }
 }
 
@@ -213,6 +249,9 @@ impl super::AuthenticationService for FakeAuthService {
         if let Some(error) = &self.script.fail_begin {
             return Err(error.clone());
         }
+        // Sweep expired and uncommitted staged secrets before starting a new
+        // attempt, so a leaked staged entry is reclaimed.
+        self.reap_expired()?;
         let attempt = AuthAttemptId::new(Uuid::new_v4().to_string());
         let account_id = request.account.clone().unwrap_or_default();
         let account = self.provisional_account(account_id, &request.provider);
@@ -221,17 +260,20 @@ impl super::AuthenticationService for FakeAuthService {
         let ctx = self.sessions.context(&account.id, self.script.ttl)?;
         let staged = self.secrets.stage(&attempt, &self.script.secret)?;
         let now = now_ms();
-        self.store
-            .insert_pending_auth(&PendingAuthRecord {
-                attempt: attempt.clone(),
-                account: Some(account.id.clone()),
-                provider: self.script.provider.clone(),
-                credential_ref: staged.as_str().to_string(),
-                generation: ctx.generation,
-                created_at_ms: now,
-                expires_at_ms: now.saturating_add(self.script.ttl.as_millis() as i64),
-            })
-            .map_err(super::secrets::store_error_to_provider)?;
+        if let Err(error) = self.store.insert_pending_auth(&PendingAuthRecord {
+            attempt: attempt.clone(),
+            account: Some(account.id.clone()),
+            provider: self.script.provider.clone(),
+            credential_ref: staged.as_str().to_string(),
+            generation: ctx.generation,
+            created_at_ms: now,
+            expires_at_ms: now.saturating_add(self.script.ttl.as_millis() as i64),
+        }) {
+            // The staged secret was written first; discard it so a failed
+            // pending-row insert cannot leak it.
+            let _ = self.secrets.discard_staged(&staged);
+            return Err(super::secrets::store_error_to_provider(error));
+        }
         self.attempts.insert(
             attempt.clone(),
             Attempt {
@@ -302,7 +344,7 @@ impl super::AuthenticationService for FakeAuthService {
             Some(_) => Ok(AuthProgress::Complete(AuthenticatedAccount {
                 account: self.provisional_account(account.clone(), &self.script.provider),
                 persistence: SecretPersistence::Persistent,
-                credential_ref: StagedSecretRef::for_account(account),
+                credential_ref: StagedSecretRef::for_account(account)?,
             })),
             None => Err(ProviderError::reauthenticate(
                 "there is no stored session for this account",

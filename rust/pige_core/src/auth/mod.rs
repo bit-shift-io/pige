@@ -21,7 +21,7 @@ pub use fake::{FakeAuthScript, FakeAuthService, FakeTokenRefresher};
 pub use secrets::{
     CredentialSecretRepository, GoogleSessionSecret, MAX_ENVELOPE_BYTES, ProtonSessionSecret,
     SECRET_ENVELOPE_VERSION, SecretEnvelope, SecretRepository, StagedSecretRef, StoredCredentials,
-    credential_error, store_error_to_provider,
+    credential_error, store_error_to_provider, sweep_expired_pending_auth,
 };
 pub use session::{AccountSessionManager, CachedTokenSource, TokenRefresher, TokenSource};
 pub use types::{

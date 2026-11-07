@@ -71,51 +71,66 @@ impl AccountSessionManager {
     /// Build a context bound to the account's durable generation and to the
     /// shared cancellation token.
     ///
-    /// If another process (or a restart) has advanced the durable generation,
-    /// the in-process token is rotated here so every older context is cancelled
-    /// before this one is handed out.
+    /// The sessions lock is taken *before* reading the durable generation, so a
+    /// concurrent [`Self::invalidate`] cannot lower the in-process generation
+    /// between the read and the lock. The in-process generation only ever
+    /// advances; if another process (or a restart) advanced the durable
+    /// generation, the shared token is rotated here so every older context is
+    /// cancelled before this one is handed out.
     pub fn context(
         &self,
         account: &AccountId,
         timeout: Duration,
     ) -> Result<OperationContext, ProviderError> {
-        let durable = self.generation(account)?;
         let mut sessions = self.sessions();
+        let durable = self.generation(account)?;
         let state = sessions.entry(account.clone()).or_insert_with(|| SessionState {
             generation: durable,
             cancellation: CancellationToken::new(),
         });
-        if state.generation != durable {
+        // Only ever advance: never lower the in-process generation back to a
+        // stale durable value.
+        if durable > state.generation {
             state.cancellation.cancel();
             state.cancellation = CancellationToken::new();
             state.generation = durable;
         }
+        let generation = state.generation;
         let parent = state.cancellation.clone();
         drop(sessions);
 
         Ok(OperationContext {
             account: account.clone(),
-            generation: durable,
+            generation,
             cancellation: parent.child_token(),
             deadline: Instant::now() + timeout,
         })
     }
 
-    /// Cancel every live context for `account` and durably increment its
-    /// generation. Called when an account is removed or re-authenticated.
+    /// Cancel every context older than the new generation and durably increment
+    /// the account's generation. Called when an account is removed or
+    /// re-authenticated.
+    ///
+    /// The durable bump and lease fencing run under the account gate, so a
+    /// credential write cannot be split from it in this process. Only contexts
+    /// *strictly older* than the new generation are cancelled: a context
+    /// legitimately created at the new generation survives.
     pub fn invalidate(&self, account: &AccountId) -> Result<(), ProviderError> {
-        let generation = self
-            .store
-            .bump_generation(account)
-            .map_err(store_error_to_provider)?;
+        let generation = self.store.with_account_gate(account, || {
+            self.store
+                .invalidate_account(account)
+                .map_err(store_error_to_provider)
+        })?;
         let mut sessions = self.sessions();
         let state = sessions.entry(account.clone()).or_insert_with(|| SessionState {
             generation,
             cancellation: CancellationToken::new(),
         });
-        state.cancellation.cancel();
-        state.cancellation = CancellationToken::new();
-        state.generation = generation;
+        if state.generation < generation {
+            state.cancellation.cancel();
+            state.cancellation = CancellationToken::new();
+            state.generation = generation;
+        }
         Ok(())
     }
 
@@ -170,6 +185,9 @@ pub trait TokenRefresher: Send + Sync {
 }
 
 struct CachedToken {
+    /// The generation that minted the token. A token from an older generation
+    /// must never be served to a context at a newer generation.
+    generation: u64,
     token: SecretString,
     expires_at: Instant,
 }
@@ -211,7 +229,12 @@ impl<R: TokenRefresher> TokenSource for CachedTokenSource<R> {
         ctx.ensure_active()?;
 
         let mut cache = self.cache.lock().await;
+        // Re-check after acquiring the cache mutex: the caller may have been
+        // cancelled (or its generation invalidated) while blocked on the lock,
+        // in which case it must not receive a token.
+        ctx.ensure_active()?;
         if let Some(cached) = cache.as_ref()
+            && cached.generation == ctx.generation
             && Instant::now() < cached.expires_at
         {
             return Ok(cached.token.clone());
@@ -219,6 +242,7 @@ impl<R: TokenRefresher> TokenSource for CachedTokenSource<R> {
 
         let token = self.refresher.refresh(ctx).await?;
         *cache = Some(CachedToken {
+            generation: ctx.generation,
             token: token.clone(),
             expires_at: Instant::now() + self.ttl,
         });
