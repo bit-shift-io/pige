@@ -721,7 +721,10 @@ S3 freezes a `ProtonDependencyDecision`: the accepted source/version/features,
 honest application identification and API-access expectations, the key-policy
 and format matrix, the protected session fields, the fork/upstream patch
 procedure and upkeep budget, and the live/device test evidence. It writes no
-product code and adds no dependency to `rust/Cargo.toml`/`Cargo.lock`.
+product code and adds no dependency to `rust/Cargo.toml`/`Cargo.lock`. Every
+build/link/gate outcome below is reproduced with exact commands and captured
+output in the committed transcript **`docs/s3-command-transcript.md`** (the
+earlier raw logs lived only in disposable `/tmp` storage).
 
 **Outcome: the non-live deliverables are complete and a real extraction build
 of the candidate library against the approved Rust crypto backend was
@@ -825,16 +828,25 @@ organize/filters/contacts (`mail/`), the HTTP transport with 401-refresh /
 exactly the 7-file patch above and built it with the S1-approved
 `proton-crypto 0.14.1` for the real Android target:
 
-- Host build + unit tests: `48 passed; 0 failed` (`s3-fork-host-tests.log`).
-- `aarch64-linux-android` release build: PASS (`s3-fork-arm64-build.log`);
-  `libproton_core.rlib` extracts to ELF64 `AArch64` objects.
+- Host build + unit tests: `48 passed; 0 failed` (`docs/s3-command-transcript.md`
+  §A1; disposable `s3-fork-host-tests.log`).
+- `aarch64-linux-android` release build: PASS (`docs/s3-command-transcript.md`
+  §A2; `libproton_core.rlib` extracts to ELF64 `AArch64` objects).
 - Cdylib link into a real Android shared object: `libproton_fork_probe.so`
   (460,712 bytes), `ELF64 AArch64 DYN`, `LOAD` align `0x4000`, `NEEDED libdl.so
-  libc.so` (`s3-fork-cdylib-build.log`).
-- Boundary gate on the extracted graph: PASS, `326`/`331` resolved packages,
-  `rustpgp` only (`s3-fork-0141-metadata.json`/`-tree.txt`).
-- Confirmed absent from the extracted tree: `gopenpgp-sys`, `rusqlite`,
-  `sqlite3`, `keyring`.
+  libc.so` (`docs/s3-command-transcript.md` §A3; disposable
+  `s3-fork-cdylib-build.log`).
+- Boundary gate on the extracted graph: PASS, `OK (338 resolved packages
+  checked)`, `rustpgp` only; `gopenpgp-sys`, `rusqlite`, `sqlite3`, `keyring`
+  absent. Reproduce with `cargo metadata --format-version 1 --filter-platform
+  aarch64-linux-android` plus the feature-resolved `cargo tree`; see
+  `docs/s3-command-transcript.md` §A4. (An *unfiltered* `cargo metadata` also
+  lists inactive *optional* deps such as `gopenpgp-sys` and would
+  false-positive the gate, so it must be run per-target.)
+
+These build, link and gate outcomes are reproduced with exact commands in the
+committed transcript **`docs/s3-command-transcript.md`** (§A); the underlying
+raw logs previously lived only in disposable `/tmp` storage.
 
 **Upkeep budget (frozen).** On each upstream release: (1) re-apply the ~450
 deleted lines / 7-file removal patch above; (2) keep the `proton-crypto` pin on
@@ -887,7 +899,7 @@ Sending (`mail/send.rs`), per recipient after `keys/all` lookup:
 | Recipient | Candidate package | S3 verdict |
 | --- | --- | --- |
 | Proton internal (verified key) | `Type 1` E2E | acceptable |
-| External with WKD/unverified key | `Type 8` PGP-inline | PGP-inline is **plaintext** to the transport; policy must confirm this is the contact's expressed preference |
+| External with WKD/unverified key | `Type 8` PGP-inline | `Type 8` is **OpenPGP-inline encrypted to the recipient's key**: the payload is E2E-encrypted to the contact and is *not* readable by Proton's servers. It is **not** Proton-internal E2E (so Proton cannot verify/decrypt it), but it is *not* plaintext — do not conflate it with the genuinely plaintext `Type 4` case below. Policy must still confirm inline PGP is the contact's expressed preference |
 | External keyless + EO password | `Type 2` encrypted-outside | not required in v1; acceptable but out of scope |
 | External keyless, no EO password | **`Type 4` cleartext, `tracing::warn!` only** | **BLOCKER — silent downgrade** |
 
@@ -954,6 +966,23 @@ synthesize.
     client payload; final Bcc privacy still depends on Proton server packaging
     (unverified, BLOCKED).
 
+**Stop-condition status (brief: "Stop if … policies cannot be honored").**
+This stop condition is **triggered by the candidate as extracted**: it cannot
+read the encrypted contact policy (§10.7 #2) and it silently degrades keyless
+external recipients to cleartext (§10.7 #1), so the recipient's policy cannot be
+honored. S3 therefore does **not** accept the candidate unchanged and does not
+proceed to integration on it. It is being handled as an explicit
+**user-reviewed exception** — on 2026-11-08 the user authorized continuing the
+feasibility work without blocking on this trigger, on the conditions that (a) the
+candidate is *not* frozen as-is, (b) P4 must resolve recipient policy before
+delivery and fail closed, and (c) restoring policy visibility + a fail-closed
+send path is a hard prerequisite before any real send. This is a logged decision,
+not a silent deferral; if the user withholds that exception, the correct outcome
+is BLOCKED. (The other two brief stop triggers — only-official-client
+impersonation, and an unmaintainable fork — are untriggered as far as known:
+honest identification is *required* and live acceptance UNVERIFIED per §10.3, and
+the patch surface is the small 7-file set in §10.4.)
+
 ### 10.8 Case checklist (brief line 31)
 
 Status is per-case. "synthetic" means exercised off-line on this host with no
@@ -972,8 +1001,8 @@ account (reproduced here); "static" means source inspection only, explicitly
 | 8 | MIME/attachments | **PASS (synthetic) / BLOCKED (live)** | `attachment_roundtrip`, `transport_body_wraps_and_decrypts`, `eml_has_headers_and_body`, `html` sanitizer tests (host); live fetch BLOCKED. |
 | 9 | mixed-recipient send | **FAIL (static) / BLOCKED (live)** | `mail/send.rs` silently emits `Type 4` cleartext for keyless external recipients (§10.7 #1). No authorized send was performed. |
 | 10 | encrypted contact policy | **BLOCKED / not representable** | `Contact` has no encrypted `Cards`; policy cannot be read (§10.7 #2). |
-| 11 | unsupported FIDO2-only login | **PASS (static, typed) / BLOCKED (live)** | `auth/mod.rs` returns a typed actionable error for a FIDO2-only 2FA bitmask; a real FIDO2-only account was not available. |
-| 12 | event expiry/reset | **BLOCKED** | Candidate `mail/sync.rs` handles the event `Refresh` flag by clearing and re-syncing (static); real event reset/pagination needs a live account. |
+| 11 | unsupported FIDO2-only login | **PASS (static inspection only — not a live pass) / BLOCKED (live)** | `auth/mod.rs` returns a typed actionable error for a FIDO2-only 2FA bitmask; a real FIDO2-only account was not available. |
+| 12 | event expiry/reset | **BLOCKED** | Event sync is **deleted** by the frozen patch (§10.4 removes `mail/sync.rs`); **P2 must re-own and reimplement** event stream/cursor handling and treat a server `Refresh` event by re-snapshotting rather than fabricating deltas. Real event reset/pagination needs a live account. |
 | 13 | contact metadata | **BLOCKED** | Candidate reads only name + emails (static); live contact list needed; encrypted fields/editing are out of v1 scope. |
 | 14 | signed/unsigned/invalid signature | **PASS (synthetic, partial)** | `self_draft_roundtrip_verifies` (Verified), `unverified_when_no_sender_key` (Unverified), `unknown_signer_is_unverified_not_verified`, `unsigned_body_is_unsigned_not_verified`, `provider_rejects_bad_detached_signature` (host). Integrated `Invalid` path not reproducible. |
 
@@ -1064,19 +1093,36 @@ adb shell am start -n bitshift.pige.protonprobe/.SendPolicyProbeActivity
 ```
 
 Event expiry/reset (live): list, mutate remotely, force an event `Refresh`, and
-assert the client re-snapshots rather than inventing deltas (candidate
-`mail/sync.rs` behaviour; needs a live account).
+assert the client re-snapshots rather than inventing deltas. This must be tested
+against **P2's re-owned event sync**, not the candidate: the frozen patch deletes
+`mail/sync.rs` (§10.4), so the candidate has no event-sync code post-patch.
+Needs a live account.
 
-The historical probe scaffold and raw output live under
-`/tmp/opencode/pige-provider-probes/` (disposable, never committed).
+**Environment note (downstream builds).** Building the full workspace with
+`CARGO_TARGET_DIR` on the small 16 GB `/tmp` tmpfs fails to link the `pige` GUI
+once the tmpfs fills (`No space left on device`, surfaced as a link error). It is
+a space artifact, not a code defect; keep the target directory on the larger
+`/home` filesystem. Recorded in `docs/s3-command-transcript.md` ("Capture note").
+
+The historical probe scaffold and raw output lived under a disposable scratch
+directory (never committed); the durable, sanitized evidence is now
+`docs/s3-command-transcript.md`.
 
 ### 10.10 Dependency and extraction decision
 
-**Accepted:** extract `proton-core 0.1.2` into a small MIT-preserving fork and
-build it against the S1-approved `proton-crypto 0.14.1` Rust (`rustpgp`)
-backend. This decision is grounded in a **reproduced** build (host tests + real
-`aarch64-linux-android` `.so` + boundary gate, §10.4), not an upstream README
-claim.
+**Accepted (with conditions):** extract `proton-core 0.1.2` into a small
+MIT-preserving fork and build it against the S1-approved `proton-crypto 0.14.1`
+Rust (`rustpgp`) backend. This decision is grounded in a **reproduced** build
+(host tests + real `aarch64-linux-android` `.so` + boundary gate, §10.4), not an
+upstream README claim; exact commands and outcomes are committed in
+`docs/s3-command-transcript.md`.
+
+This acceptance is **not clean**. The brief's stop condition "Stop if …
+policies cannot be honored" **is triggered** by the candidate as extracted (§10.7
+stop-condition status) and is handled as an explicit **user-reviewed exception**
+the user granted on 2026-11-08, on the conditions listed in §10.7. Without that
+exception the correct decision is BLOCKED; the exception does not waive the P4
+prerequisites below.
 
 **Explicitly not done here (owned by later tasks):**
 
@@ -1096,16 +1142,17 @@ claim.
 | --- | --- | --- |
 | `ProtonDependencyDecision` section | PASS | §10.1–§10.10 |
 | Accepted source/version/features frozen | PASS | §10.2 |
-| Honest app identification / access expectations | PASS (static) / BLOCKED (live acceptance) | §10.3, §10.9 |
+| Honest app identification / access expectations | PASS (static inspection only — not a live pass) / BLOCKED (live acceptance) | §10.3, §10.9 |
 | Fork / extraction patch inventory + upkeep budget | PASS | §10.4 |
-| Extracted fork host build + tests | PASS | §10.4, `s3-fork-host-tests.log` (48/0) |
-| Extracted fork `aarch64-linux-android` build/link | PASS | §10.4, `s3-fork-arm64-build.log`, `s3-fork-cdylib-build.log` |
-| Boundary gate on extracted graph | PASS | §10.4, `s3-fork-0141-metadata.json`/`-tree.txt` |
+| Extracted fork host build + tests | PASS | §10.4; `docs/s3-command-transcript.md` §A1 (48/0) |
+| Extracted fork `aarch64-linux-android` build/link | PASS | §10.4; `docs/s3-command-transcript.md` §A2–§A3 |
+| Boundary gate on extracted graph | PASS | §10.4; `docs/s3-command-transcript.md` §A4 (`OK (338 resolved packages checked)`) |
 | Protected session fields frozen | PASS | §10.5 |
 | Key-policy / format matrix | PASS | §10.6 |
 | Security/limitation findings recorded | PASS | §10.7 |
-| Mixed-recipient cleartext downgrade | **FAIL (static)** | §10.7 #1 |
-| Encrypted contact policy readable | **FAIL (static, missing)** | §10.7 #2 |
+| Stop condition "policies cannot be honored" | **TRIGGERED — user-reviewed exception** | §10.7 stop-condition status; §10.10 |
+| Mixed-recipient cleartext downgrade | **FAIL (static inspection)** | §10.7 #1 |
+| Encrypted contact policy readable | **FAIL (static inspection, missing)** | §10.7 #2 |
 | Case checklist present (14 cases) | PASS | §10.8 |
 | Live one/two-password, TOTP, read, events, contacts | BLOCKED | §10.8, §10.9 |
 | Human verification on Android host | BLOCKED | §10.8, §10.9 |
@@ -1113,9 +1160,10 @@ claim.
 | Any authorized test send | BLOCKED (no authorization) | §10.9 |
 | Key Transparency | Not implemented (documented) | §10.7 #5 |
 | FIDO2/WebAuthn | Unsupported (typed error) | §10.7 #6 |
-| Baseline `cargo test --workspace` at the S3 prior commit `64db57c` | PASS | 19 suites, 354 passed, 0 failed, 22 ignored (`s3-baseline-64db57c-test.log`) |
-| `cargo test --workspace` at the branch HEAD when S3 committed (`b75c977`, includes a concurrent F1 commit) | PASS | 20 suites, 360 passed, 0 failed, 22 ignored (`s3-head-test.log`) |
-| Boundary gate on committed workspace | PASS | `OK (619 resolved packages)` |
+| Baseline `cargo test --workspace` at the S3 prior commit `64db57c` | PASS | 19 suites, 354 passed, 0 failed, 22 ignored (disposable-log outcome, restated) |
+| `cargo test --workspace` at the branch HEAD when S3 committed (`b75c977`, includes a concurrent F1 commit) | PASS | 20 suites, 360 passed, 0 failed, 22 ignored (`s3-head-test.log`, disposable) |
+| Full `cargo test --workspace` at branch HEAD `8589d8a` (fix re-run) | PASS | 20 suites, 360 passed, 0 failed, 22 ignored (`docs/s3-command-transcript.md` §B2) |
+| Boundary gate on committed workspace | PASS | `OK (619 resolved packages)`; `docs/s3-command-transcript.md` §B1 |
 
 ### 10.12 Review-focus answers
 
@@ -1135,16 +1183,29 @@ claim.
   interaction is possible without console-token scraping; the on-device run is
   BLOCKED (§10.9).
 
-### 10.13 Evidence index (disposable, under `/tmp/opencode/pige-provider-probes/`)
+### 10.13 Evidence index
 
-- `proton-core-fork/` — the extracted fork built this task (not committed).
+**Committed (durable, sanitized):**
+
+- `docs/s3-command-transcript.md` — exact commands + captured outcomes for the
+  extracted-fork host tests (§A1), `aarch64-linux-android` build/link (§A2–§A3),
+  the extracted-graph boundary gate (§A4), the committed-workspace boundary gate
+  (§B1) and the full `cargo test --workspace` (§B2), plus the tmpfs link-failure
+  capture note. This is what §10.4 and §10.11 link to.
+
+**Disposable scratch (`/tmp/opencode/pige-provider-probes/`, never committed) —
+retained only as the historical run that the committed transcript restates:**
+
+- `proton-core-fork/` — the extracted fork built this task.
 - `proton-fork-cdylib/` — wrapper that links the fork into an Android `.so`.
-- `evidence/s3-fork-host-tests.log` — host unit tests (48 passed).
-- `evidence/s3-fork-arm64-build.log` — `aarch64-linux-android` release build.
-- `evidence/s3-fork-cdylib-build.log` — Android `.so` link.
+- `evidence/s3-fork-host-tests.log` — host unit tests (48 passed). §10.11; restated §A1.
+- `evidence/s3-fork-arm64-build.log` — `aarch64-linux-android` release build. §10.11; restated §A2.
+- `evidence/s3-fork-cdylib-build.log` — Android `.so` link. §10.11; restated §A3.
 - `evidence/s3-fork-metadata.json` / `s3-fork-tree.txt` (0.12.1) and
-  `s3-fork-0141-metadata.json` / `s3-fork-0141-tree.txt` (0.14.1).
-- `evidence/s3-extraction-diff.txt` / `s3-extraction-cargo.diff` — patch surface.
-- `evidence/s3-baseline-64db57c-test.log` — pristine baseline at the prior commit.
+  `evidence/s3-fork-0141-metadata.json` / `s3-fork-0141-tree.txt` (0.14.1) —
+  extracted-graph gate inputs. §10.11 (0.14.1); restated §A4.
+- `evidence/s3-extraction-diff.txt` / `s3-extraction-cargo.diff` — patch surface (§10.4).
+- `evidence/s3-baseline-64db57c-test.log` — baseline at the prior commit. §10.11.
+- `evidence/s3-head-test.log` — workspace HEAD when S3 committed. §10.11.
 
 No secret, token, key, address or message plaintext is committed.
