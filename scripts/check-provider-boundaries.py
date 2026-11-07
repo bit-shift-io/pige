@@ -54,10 +54,23 @@ SQLITE_LINK = "sqlite3"
 # SPDX tokens that represent unacceptable strong-copyleft licenses.
 FORBIDDEN_LICENSE_PREFIXES = ("AGPL",)
 
-# Packages explicitly approved despite a forbidden license expression.  Empty
-# today: nothing in Pige's graph is AGPL.  This is the escape hatch for a
-# deliberate, documented licensing decision (never silently added to).
-APPROVED_LICENSE_PACKAGES: frozenset[str] = frozenset()
+# Packages explicitly approved despite a licensing caveat, matched by package
+# *name* (so an approved dependency keeps working across version bumps).  A
+# package here is exempted from BOTH licensing rules: a forbidden (AGPL) SPDX
+# expression, and a missing SPDX ``license`` field.  The list is deliberately
+# tiny and every entry requires a documented, manual provenance review; never
+# add to it silently.
+#
+# ``proton-crypto`` and its sibling crates ``proton-rpgp`` / ``proton-srp``
+# publish only a ``license-file`` (no SPDX field); their bundled LICENSE is MIT
+# and they come from the same repo commit.  ``proton-crypto`` is the vetted
+# pure-Rust Proton crypto candidate for Pige; its two transitive siblings share
+# the identical license-file provenance.  The rest of the graph is empty today
+# (nothing else has a licensing caveat), so a future unknown crate with no SPDX
+# field now fails loudly instead of passing on a warning.
+APPROVED_LICENSE_PACKAGES: frozenset[str] = frozenset(
+    {"proton-crypto", "proton-rpgp", "proton-srp"}
+)
 
 
 def _is_forbidden_license(expression: str | None) -> tuple[bool, str | None]:
@@ -118,7 +131,17 @@ def check_go_crypto_backend(metadata: dict, tree_text: str, violations: list[str
 
 
 def check_licenses(metadata: dict, violations: list[str]) -> None:
-    """Reject forbidden (AGPL) licenses anywhere in the resolved graph."""
+    """Reject forbidden licenses and un-vetted missing SPDX metadata.
+
+    Two escalation conditions, both fatal unless the package name is on the
+    explicit ``APPROVED_LICENSE_PACKAGES`` allow-list:
+
+    * a resolved package whose SPDX expression contains an ``AGPL*`` token;
+    * a resolved *registry* package with no SPDX ``license`` field at all, so an
+      AGPL crate that ships only a ``license-file`` fails loudly instead of
+      slipping through on a warning.  Workspace/path packages are exempt (they
+      carry no registry license metadata by design).
+    """
     nodes = metadata.get("resolve", {}).get("nodes", [])
     packages = {pkg["id"]: pkg for pkg in metadata.get("packages", [])}
     resolved_ids = {node["id"] for node in nodes} or set(packages)
@@ -127,7 +150,14 @@ def check_licenses(metadata: dict, violations: list[str]) -> None:
         pkg = packages.get(pkg_id)
         if pkg is None:
             continue
-        if pkg_id in APPROVED_LICENSE_PACKAGES:
+        if pkg["name"] in APPROVED_LICENSE_PACKAGES:
+            continue
+        if pkg.get("source") and not pkg.get("license"):
+            violations.append(
+                "registry package has no SPDX license metadata and is not "
+                f"allow-listed: {pkg['id']} (verify provenance, then add it to "
+                "APPROVED_LICENSE_PACKAGES deliberately)"
+            )
             continue
         forbidden, token = _is_forbidden_license(pkg.get("license"))
         if forbidden:
@@ -155,12 +185,13 @@ def check_sqlite_links(metadata: dict, violations: list[str]) -> None:
 
 
 def license_gaps(metadata: dict) -> list[str]:
-    """Advisory: registry packages whose SPDX license cannot be resolved.
+    """Advisory provenance note for allow-listed license-file-only packages.
 
-    Some candidates (for example ``proton-crypto``, which publishes only a
-    ``license-file``) expose no ``license`` field in ``cargo metadata``.  That is
-    not by itself a violation, but it means the AGPL rule could not evaluate the
-    package, so it is surfaced for manual provenance review.
+    Missing SPDX metadata is now a *hard* failure for any package not on
+    ``APPROVED_LICENSE_PACKAGES`` (see :func:`check_licenses`).  For the small
+    set that *is* deliberately allow-listed (for example ``proton-crypto``,
+    which publishes only a ``license-file``), the absent SPDX field is still
+    surfaced on stderr so the manual MIT provenance check is visible in CI logs.
     """
     nodes = metadata.get("resolve", {}).get("nodes", [])
     packages = {pkg["id"]: pkg for pkg in metadata.get("packages", [])}
@@ -170,8 +201,11 @@ def license_gaps(metadata: dict) -> list[str]:
         pkg = packages.get(pkg_id)
         if pkg is None or not pkg.get("source"):
             continue  # workspace/path packages need no registry license.
-        if not pkg.get("license"):
-            gaps.append(f"no SPDX license metadata for registry package: {pkg['id']}")
+        if pkg["name"] in APPROVED_LICENSE_PACKAGES and not pkg.get("license"):
+            gaps.append(
+                f"allow-listed without SPDX metadata (license-file only, "
+                f"provenance manually reviewed): {pkg['id']}"
+            )
     return gaps
 
 
@@ -204,6 +238,14 @@ def main(argv: list[str] | None = None) -> int:
             tree_text = fh.read()
     except OSError as exc:
         print(f"error: cannot read cargo tree: {exc}", file=sys.stderr)
+        return 2
+
+    if not isinstance(metadata, dict):
+        print(
+            "error: metadata JSON must be an object at the top level "
+            f"(got {type(metadata).__name__})",
+            file=sys.stderr,
+        )
         return 2
 
     if "packages" not in metadata:

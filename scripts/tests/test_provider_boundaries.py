@@ -109,7 +109,7 @@ class ProviderBoundaryGateTests(unittest.TestCase):
             "    └── gopenpgp-sys v0.3.9\n"
         )
         result = run_gate(metadata, tree)
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         combined = (result.stdout + result.stderr).lower()
         self.assertIn("gopenpgp-sys", combined)
         self.assertIn("go", combined)
@@ -129,7 +129,7 @@ class ProviderBoundaryGateTests(unittest.TestCase):
             make_node(evil),
         ]
         result = run_gate(make_metadata(packages, nodes))
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         combined = result.stdout + result.stderr
         self.assertIn("AGPL-3.0-only", combined)
         self.assertIn(evil["id"], combined)
@@ -147,7 +147,7 @@ class ProviderBoundaryGateTests(unittest.TestCase):
             make_node(intruder),
         ]
         result = run_gate(make_metadata(packages, nodes))
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         combined = result.stdout + result.stderr
         self.assertIn("sqlite3", combined)
         self.assertIn(LIB_SQLITE["id"], combined)
@@ -185,11 +185,59 @@ class ProviderBoundaryGateTests(unittest.TestCase):
             "pige v2026.11.5 (/repo)\n"
             "└── proton-crypto v0.14.1\n"
             "    └── proton-rpgp v0.9.0\n"
+            # Decoy: a look-alike token whose "proton-crypto" is preceded by a
+            # word char/hyphen, so the (?<![\w-]) feature-line lookbehind in the
+            # gate must not treat this as the real proton-crypto feature.
+            "    └── my-proton-crypto feature \"gopgp\"\n"
         )
         result = run_gate(make_metadata(packages, nodes), tree)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        combined = (result.stdout + result.stderr).lower()
-        self.assertIn("ok", combined)
+        # Assert the exact documented success line, not a loose "ok" substring.
+        self.assertIn(
+            "provider boundary check: OK (8 resolved packages checked)",
+            result.stdout,
+        )
+
+    def test_rejects_missing_spdx_license_for_new_registry_package(self) -> None:
+        """A new registry crate with no SPDX field must fail, not merely warn.
+
+        This closes the hole where an AGPL crate shipping only a ``license-file``
+        would otherwise pass the MIT-distribution gate on a warning.
+        """
+        mystery = make_pkg("mystery-mail-sdk", "1.0.0", license=None)
+        packages = [RUSQLITE, LIB_SQLITE, PROTON_CRYPTO_RUST, mystery]
+        nodes = [
+            make_node(RUSQLITE),
+            make_node(LIB_SQLITE),
+            make_node(PROTON_CRYPTO_RUST, ["rustpgp"]),
+            make_node(mystery),
+        ]
+        result = run_gate(make_metadata(packages, nodes))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        combined = result.stdout + result.stderr
+        self.assertIn(mystery["id"], combined)
+        self.assertIn("SPDX", combined)
+
+    def test_accepts_allow_listed_license_file_package(self) -> None:
+        """The deliberately allow-listed ``proton-crypto`` may omit SPDX metadata."""
+        proton_no_spdx = make_pkg("proton-crypto", "0.14.1", license=None)
+        packages = [RUSQLITE, LIB_SQLITE, proton_no_spdx]
+        nodes = [
+            make_node(RUSQLITE),
+            make_node(LIB_SQLITE),
+            make_node(proton_no_spdx, ["rustpgp"]),
+        ]
+        result = run_gate(make_metadata(packages, nodes))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("provider boundary check: OK", result.stdout)
+        # Provenance is still surfaced as an advisory warning on stderr.
+        self.assertIn("allow-listed without SPDX metadata", result.stderr)
+
+    def test_rejects_non_object_metadata_json(self) -> None:
+        """Malformed (non-object) metadata must exit 2, never raise TypeError."""
+        result = run_gate(5)  # type: ignore[arg-type]
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("must be an object", result.stderr)
 
 
 if __name__ == "__main__":

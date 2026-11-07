@@ -82,12 +82,19 @@ names such as `gopenpgp-sys-stub` or `sqlite3-sys-fake` are ignored.
 | Rule | Escalation condition |
 | --- | --- |
 | Go crypto backend | a resolved package named exactly `gopenpgp-sys`, **or** `proton-crypto` with any of `default`/`gopgp`/`multi_be` enabled, **or** the feature-resolved tree shows the same |
-| Licenses | any resolved package whose SPDX expression contains an `AGPL*` token and is not explicitly allow-listed (allow-list is empty today) |
+| Licenses | any resolved package whose SPDX expression contains an `AGPL*` token, **or** any resolved *registry* package with no SPDX `license` field at all |
 | SQLite link | more than one resolved package with `links == "sqlite3"` |
 
-It also emits a **non-fatal warning** for any registry package with no SPDX
-`license` field (see the `proton-crypto` caveat in §4.3), so an AGPL package that
-hides behind a `license-file` is surfaced for manual provenance review.
+Both licensing hazards are **fatal (exit 1)** unless the package name is on
+`APPROVED_LICENSE_PACKAGES`. That allow-list is deliberately tiny and matched by
+package *name*: it currently holds only the vetted pure-Rust Proton crypto
+family (`proton-crypto`, `proton-rpgp`, `proton-srp`), which publish no SPDX
+field and ship an MIT `LICENSE` file from one repo commit (see §4.3). For those
+packages the gate still prints a non-fatal **provenance warning** on stderr so
+the manual review stays visible in CI logs. Every other crate lacking SPDX
+metadata now fails loudly instead of passing on a warning, closing the hole
+where a future AGPL crate could hide behind a `license-file`. Workspace/path
+packages are exempt from the SPDX rule (they carry no registry metadata).
 
 ### Test evidence (TDD)
 
@@ -104,13 +111,25 @@ GREEN — after implementation:
 
 ```
 $ python3 -m unittest discover -s scripts/tests -p 'test_provider_boundaries.py' -v
+test_accepts_allow_listed_license_file_package ... ok
 test_accepts_approved_rust_backend ... ok
 test_rejects_go_crypto_backend ... ok
+test_rejects_missing_spdx_license_for_new_registry_package ... ok
 test_rejects_multiple_sqlite_links ... ok
+test_rejects_non_object_metadata_json ... ok
 test_rejects_unapproved_agpl_package ... ok
-Ran 4 tests in 0.29s
+Ran 7 tests in 0.53s
 OK
 ```
+
+The four required named tests (`test_rejects_go_crypto_backend`,
+`test_rejects_unapproved_agpl_package`, `test_rejects_multiple_sqlite_links`,
+`test_accepts_approved_rust_backend`) assert the documented exit code `1` for the
+reject cases and the exact success banner for the accept case. The three added
+tests cover the missing-SPDX failure, the deliberate `proton-crypto` allow-list,
+and the non-object-JSON exit `2` path. The accepted tree also carries a
+`my-proton-crypto feature "gopgp"` decoy line to guard the `(?<![\w-])`
+feature-line lookbehind.
 
 Applied to the committed workspace, the gate passes:
 
@@ -157,9 +176,9 @@ Verified behaviour:
 - Approved probe metadata shows `proton-crypto` enabled features `["rustpgp"]`,
   `gopenpgp-sys` **absent**, `proton-rpgp` present.
 - A hazard probe using default features resolves `gopenpgp-sys 0.3.9` and
-  `proton-crypto` features `["default","gopgp"]`; the gate rejects it with five
-  distinct diagnostics (exit 1). This is the exact failure the gate exists to
-  prevent.
+  `proton-crypto` features `["default","gopgp"]`; the gate rejects it with six
+  distinct diagnostics (exit 1), including `gopenpgp-sys`'s own missing SPDX
+  field. This is the exact failure the gate exists to prevent.
 
 ### 4.3 Licenses and native links
 
@@ -185,9 +204,13 @@ Native `links` owners in the current workspace (all distinct, exactly one
 **License caveat (important).** `proton-crypto`, `proton-rpgp`, and `proton-srp`
 publish only a `license-file`; their `cargo metadata` license field is empty
 (crates.io normalizes it to "non-standard"). The bundled `LICENSE` files are MIT
-("(The MIT License) Copyright (c) 2025 Proton AG"). The gate therefore warns
-rather than silently trusting an absent SPDX field; a manual provenance check is
-required for any new package exhibiting this pattern.
+("(The MIT License) Copyright (c) 2025 Proton AG"), all from repo commit
+`853e98fc…`. These three names are the **only** entries in
+`APPROVED_LICENSE_PACKAGES`, a deliberate manual-provenance decision. Any *other*
+registry package whose SPDX field is missing now fails the gate (exit 1); the
+approved three still emit a provenance warning on stderr. So a future crate
+exhibiting the same `license-file`-only pattern is rejected until someone
+deliberately adds it after reviewing the bundled license.
 
 ### 4.4 `proton-core` (`filippofinke/protonmail-rs`) — extraction required
 
@@ -242,6 +265,7 @@ cargo build --release --target aarch64-linux-android
 | --- | --- |
 | Approved probe, host (`cargo build`) | **PASS** — `provider-probe` + `proton-rpgp`/`pgp`/`rsa`/Google clients compile |
 | Approved probe, `aarch64-linux-android` release | **PASS** — `libprovider_probe.so` (1,047,912 bytes) |
+| Probe test APK (probe `.so` packaged) | **PASS** — `app-release-unsigned.apk` (604,592 bytes) containing `lib/arm64-v8a/libprovider_probe.so` |
 | Boundary gate on approved probe metadata/tree | **PASS** — 285 resolved packages, one `sqlite3` owner, `rustpgp` only |
 | Hazard probe (default Go features) gate | **PASS (rejected as intended)** — exit 1 |
 | App release APK (`bash scripts/build.sh release`) | **PASS** — `app-release.apk` 29,212,840 bytes |
@@ -255,9 +279,42 @@ LOAD ... align 0x4000   (16 KiB max-page-size flag applied)
 NEEDED libdl.so, libc.so
 ```
 
+#### Probe test APK (actual packaging path)
+
+After the linked `libprovider_probe.so` above, the probe library was packaged into
+a disposable `arm64-v8a` APK with the same Gradle 9.8.1 wrapper and JDK 21 that
+`scripts/build.sh` uses, proving the candidate stack survives the real Android
+packaging path (not just `cargo build`/`cargo check`):
+
+```bash
+# disposable app under /tmp/opencode/pige-provider-probes/test-app (not committed)
+cp probe/target/aarch64-linux-android/release/libprovider_probe.so \
+   test-app/app/src/main/jniLibs/arm64-v8a/
+JAVA_HOME=/opt/jbr-21 ANDROID_HOME=$HOME/Android/Sdk \
+  bash android/gradlew -p /tmp/opencode/pige-provider-probes/test-app \
+       --no-daemon assembleRelease
+```
+
+Result: `BUILD SUCCESSFUL` (46 actionable tasks), producing
+`/tmp/opencode/pige-provider-probes/test-app/app/build/outputs/apk/release/app-release-unsigned.apk`
+(604,592 bytes). `unzip -l` shows the probe library inside the APK:
+
+```
+$ unzip -l app-release-unsigned.apk | grep -E 'lib/|\.so|AndroidManifest'
+   587104  01-01-1981 01:01   lib/arm64-v8a/libprovider_probe.so
+     1264  01-01-1981 01:01   AndroidManifest.xml
+```
+
+The APK entry is the debug-symbol-stripped form of the same probe artifact: the
+unstripped `jniLibs`/`target` file hashes to
+`84a4d1ef0149951e67234b1cb75c67f9a975b16ba38886a9898dbfb4b0bac2b3` and the
+stripped APK entry (`= stripReleaseDebugSymbols` output) hashes to
+`a3ec396549dc21d4e68dee3872d08b6c5f5e5b3f128755b85484389cb8c05f7a`.
+
 `bash scripts/build.sh release` additionally assembled the **full Pige release
-APK** for `arm64-v8a` with the existing `libpige.so`, i.e. the Android packaging
-path itself is verified end to end.
+APK** for `arm64-v8a` with the existing `libpige.so`, so both the product
+packaging path and the candidate-dependency probe packaging path are verified end
+to end.
 
 ## 6. PASS / BLOCKED matrix
 
@@ -265,6 +322,7 @@ path itself is verified end to end.
 | --- | --- | --- |
 | Baseline tests / clippy / desktop bin | PASS | §2 |
 | Android app release APK | PASS | §2, §5 |
+| Probe test APK (probe `.so` packaged) | PASS | §5 |
 | Boundary gate unit tests (RED→GREEN) | PASS | §3 |
 | Gate on committed workspace | PASS | §3 |
 | `google-gmail1` + `google-people1` arm64 link | PASS | §5 |
@@ -289,15 +347,18 @@ path itself is verified end to end.
 
 ## 8. Issues, concerns, and blockers
 
-- **Full probe APK not assembled.** The Pige release APK was assembled and the
-  probe libraries were linked for `arm64-v8a`, but a separate APK bundling the
-  probe `.so` was not produced. Per the S1 brief this is called out explicitly;
-  the Rust link proof and the app APK assembly together cover the requirement.
+- **Probe APK assembled (not just linked).** The candidate probe `.so` was
+  packaged into a disposable `arm64-v8a` APK (`app-release-unsigned.apk`,
+  604,592 bytes) with the same Gradle/JDK as `scripts/build.sh`; see §5 for the
+  command and `unzip -l` evidence. The product release APK was assembled
+  separately by `bash scripts/build.sh release`.
 - **No runtime/API exercise.** Google and Proton crates were compiled/linked but
   not invoked; no network calls or accounts were used. This is expected for S1.
-- **`proton-crypto` license metadata.** No SPDX field upstream; the gate warns and
-  provenance (MIT) was verified from the bundled `LICENSE`. A new candidate with
-  the same pattern needs manual review.
+- **`proton-crypto` license metadata.** No SPDX field upstream; provenance (MIT)
+  was verified from the bundled `LICENSE` and the family is now the only entry
+  in `APPROVED_LICENSE_PACKAGES`. Unlike before, any *other* registry package
+  missing SPDX metadata fails the gate (exit 1), so the same pattern elsewhere
+  cannot pass silently.
 - **`proton-core` extraction is real work.** It removes cache/keyring/session
   subsystems and re-targets SQLite; the fork must track upstream MIT changes.
   S3 owns the accept/reject decision.
