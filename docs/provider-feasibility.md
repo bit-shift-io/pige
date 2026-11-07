@@ -3,6 +3,7 @@
 Date: 2026-11-07
 Branch: `feat/mail-providers`
 Task: S1 — Toolchain, dependency and licensing evidence
+Task: S2 — Supported Google authorization and API probes (appended in §9)
 
 This document freezes the toolchain/dependency/licensing evidence that later
 provider tasks build on. It records what was measured on this branch before any
@@ -366,3 +367,228 @@ to end.
   that may be unnecessary once Pige owns tokens; revisit in S2.
 - **Not blocked:** every S1 deliverable is complete. The rows marked NOT RUN
   require disposable accounts/device or a later task and do not block S1.
+
+## 9. Google authorization decision (Task S2)
+
+Date: 2026-11-07
+Branch: `feat/mail-providers`
+Task: S2 — Supported Google authorization and API probes
+
+S2 freezes a `GoogleAuthDecision`: the OAuth registrations, the per-platform
+authorization flows, refresh-persistence ownership, the exact scopes, the
+`gmail.modify` capability truth, the non-Play-services answer, and the chosen
+mail/People SDK injection points. It writes no product code and adds no
+dependency to `rust/Cargo.toml`/`Cargo.lock`. It is a stop/go gate.
+
+**Outcome: the design is frozen and every non-live deliverable is complete; the
+live authorization/API cases are BLOCKED on an unregistered OAuth client and a
+disposable account; one required user distribution decision is recorded in
+§9.9.** Status is reported as DONE_WITH_CONCERNS for this reason.
+
+### 9.1 Decision summary
+
+| Decision | Frozen value |
+| --- | --- |
+| Desktop client | Google Cloud **Desktop app** OAuth client; public client; authorization code + PKCE (S256) + `state`; system browser; loopback redirect `http://127.0.0.1:<random port>` |
+| Android client | Google Cloud **Android** OAuth client; package `bitshift.pige`; signing SHA-1 in §9.2; **no redirect URI** |
+| Android authorization | Google Identity Services `AuthorizationClient` (`com.google.android.gms:play-services-auth`); consent returns through a `PendingIntent`/`IntentSender`; no WebView/OOB/loopback/service account |
+| Refresh ownership | Pige secret envelope owns credentials. Desktop: owns the refresh token. Android: on-demand access tokens while the grant is intact (grant state in the envelope); refresh token only via a server (`requestOfflineAccess`) — see §9.6 |
+| Mail scope | `https://www.googleapis.com/auth/gmail.modify` (+ `openid email profile` for identity) |
+| Contacts scopes | `https://www.googleapis.com/auth/contacts.readonly` + `https://www.googleapis.com/auth/contacts.other.readonly`, granted separately/later |
+| Permanent delete | `false` under `gmail.modify`; delete maps to trash (§9.5) |
+| Non-Play-services | No supported native flow without Play services → STOP (§9.9) |
+| Mail SDK | `google-gmail1` (MIT, S1 §4.1) behind `MailBackend`; Pige injects tokens |
+| Contacts SDK | `google-people1` (MIT, S1 §4.1) behind the contacts capability |
+
+### 9.2 Required Google Cloud registrations (exact)
+
+Everything below is created by the user in the Google Cloud Console; no secret is
+committed to the repository.
+
+Project and consent screen:
+
+1. Create/select a Cloud project and enable the **Gmail API** and **People API**.
+2. Configure the OAuth consent screen (Branding page): app name **Pige**, logo,
+   homepage, privacy-policy URL, terms-of-service URL.
+3. Declare scopes: `gmail.modify` (restricted), `contacts.readonly` and
+   `contacts.other.readonly` (sensitive), plus `openid`, `email`, `profile`.
+
+OAuth clients:
+
+| Client | Type | Identity | Redirect |
+| --- | --- | --- | --- |
+| Pige desktop | Desktop app | generated id/secret | loopback `http://127.0.0.1:<port>` (by client type) |
+| Pige Android | Android | package `bitshift.pige`, SHA-1 `7E:4B:01:BC:E7:61:75:E3:89:38:88:5D:91:A6:26:FE:D3:07:21:AD` | none |
+| Pige Android (debug) | Android | package `bitshift.pige`, SHA-1 `A0:4B:69:80:86:C4:44:A4:B3:6A:43:6D:98:11:CA:EE:64:40:B7:67` | none |
+| Pige server client | Web application | generated id | only if the offline/`serverAuthCode` path is chosen |
+
+The Android fingerprints are the real, verifiable identities of this branch's
+signing keys (evidence: `s2-registration-and-device.txt`): the committed shared
+test-phone key `android/keystore/pige-release.jks` (alias `qlaunch`) and the
+local debug key. Both must be registered because debug and release builds use
+different keys when `android/keystore.properties` is absent.
+
+The desktop and Android clients are **separate registrations**. There is no
+cross-platform callback URI, and the Android client has none at all — Android
+authorization never receives a redirect URI.
+
+### 9.3 Desktop flow (frozen)
+
+System browser → `https://accounts.google.com/o/oauth2/v2/auth` with
+`response_type=code`, `code_challenge` (S256), `state`, `access_type=offline` →
+loopback listener on `http://127.0.0.1:<random port>` → validate `state` →
+exchange at `https://oauth2.googleapis.com/token` with `code_verifier` (no
+client secret; Desktop apps are public clients). Cancellation
+(`error=access_denied`) and `state` mismatch are surfaced as typed auth errors;
+tokens are persisted in Pige's versioned secret envelope only.
+
+### 9.4 Android flow (proposed; live confirmation BLOCKED)
+
+`Identity.getAuthorizationClient(activity).authorize(request)` with an
+`AuthorizationRequest` carrying the scopes. If `result.hasResolution()`, launch
+`result.pendingIntent` through `StartIntentSenderForResult`; otherwise the grant
+already exists and `result.accessToken` is available. The result is read back
+with `getAuthorizationResultFromIntent`. The access token is passed to
+`google-gmail1`/`google-people1` through Pige's token boundary.
+
+This is the only Google-supported Android authorization API, and it ships in
+Google Play services. Review Focus #2 (a desktop/browser success is not Android
+success) is honoured: the desktop flow is never reused on Android and no
+desktop app is impersonated. The live behaviour that must be *observed* (consent
+return, Activity recreation, silent renewal, revocation) is BLOCKED; see §9.7.
+
+### 9.5 `gmail.modify` capability truth
+
+Gmail API reference: `users.messages.delete` ("immediately and permanently
+deletes ... cannot be undone") requires `https://mail.google.com/`. The Gmail
+API scope documentation states `gmail.modify` "does not allow immediate,
+permanent deletion of threads and messages, bypassing the trash." Pige therefore
+exposes `permanent_delete = false` and maps its delete command to
+`users.messages.trash` (recoverable), never `users.messages.delete`. Full-mail
+access is not requested silently.
+
+This is the documented API contract, confirmed from the Gmail API scopes and the
+`users.messages.delete` reference on 2026-11-07. The disposable-account runtime
+confirmation is BLOCKED with the rest of the live cases.
+
+### 9.6 Refresh persistence ownership
+
+- **Desktop.** Pige owns the refresh token and persists it in the per-account
+  versioned secret envelope; refresh is serialized per account with atomic
+  rotated-token saves, and secrets never enter the mail cache or config.
+- **Android.** Google's authorization guide directs that long-lived refresh
+  tokens be held by a backend server, not the device: `requestOfflineAccess`
+  returns a `serverAuthCode` that must be exchanged server-side. Without a
+  backend, Pige must not store a refresh token on device. The supported
+  device-only model is to call `authorize()` on demand: while the user's grant is
+  intact, Play services returns a fresh access token with no user interaction;
+  Pige persists only account identity and granted-scope state. This satisfies
+  "resume after process restart" without retaining a password or a device-side
+  refresh token, at the cost of periodic on-demand token calls and re-consent
+  after revocation.
+- The choice between "no device refresh token + on-demand `authorize()`" and
+  "add a minimal auth server" is the distribution decision in §9.9. Confirming
+  the actual token/refresh ownership on a real device is **BLOCKED**; the host
+  authorization bridge is not specified until it is confirmed.
+
+### 9.7 Checklist: cases
+
+| Case | Status | Why / evidence |
+| --- | --- | --- |
+| `desktop_pkce_cancel_and_state` | **BLOCKED** | Needs a registered Desktop app client + disposable account. Offline mechanics self-test PASSes (`s2-desktop-pkce-selftest.log`), but that is not Google proof. |
+| `android_consent_return_and_recreation` | **BLOCKED** | Needs the Android client (package+SHA-1) registered, a Web `serverClientId`, a disposable account, and the probe APK. Device is present. |
+| `mail_without_contacts_scope` | **BLOCKED** | Needs a live `gmail.modify` token from the disposable account. |
+| `resume_after_process_restart` | **BLOCKED** | Needs a live Android grant + probe APK. |
+| `contacts_later_grant` | **BLOCKED** | Needs a live grant + `contacts.readonly`/`contacts.other.readonly` consent. |
+| `revoked_grant_requires_login` | **BLOCKED** | Needs a live Android grant, then revocation (account permissions page / `revokeAccess`). |
+
+No case is marked PASS without having been run; no output is fabricated.
+
+Non-live evidence that *was* collected is real:
+
+- Android application identity and both signing SHA-1s (keytool).
+- Attached device: `iPlay60 mini Turbo`, Android 14 / API 34, `arm64-v8a`,
+  Google Play services `26.43.30`, Chrome and Play Store present
+  (`s2-registration-and-device.txt`).
+- Desktop PKCE mechanics self-test: `state` validation, cancellation, S256
+  challenge, and exchange-to-verifier binding all PASS offline
+  (`s2-desktop-pkce-selftest.log`).
+
+### 9.8 Exact blocked prerequisites and commands
+
+The non-live deliverables (this section, the registration enumeration, the flow,
+the scopes, the checklist, the disposable probe scaffold, and the device/cert
+evidence) are complete. Missing for the live runs:
+
+1. A Google Cloud project with a registered **Desktop app** OAuth client
+   (`GOOGLE_DESKTOP_CLIENT_ID`).
+2. A registered **Android** OAuth client for `bitshift.pige` with the two SHA-1s
+   in §9.2.
+3. A **Web application** client id (`GOOGLE_WEB_SERVER_CLIENT_ID`) if the
+   offline/`serverAuthCode` path is chosen.
+4. A **disposable Google account** (the attached device is signed into the real
+   account `bronson.mathews@gmail.com`, which must not be used for these tests)
+   and explicit authorization for one test send.
+
+Commands live in the disposable probe plan
+`/tmp/opencode/pige-provider-probes/google-auth-probe/README.md` (desktop PKCE,
+Android probe build/run, and API probes). Probe artefacts under
+`/tmp/opencode/pige-provider-probes/` are disposable and never committed.
+
+### 9.9 Required user distribution decision (STOP)
+
+The S2 brief: "If supported Google auth requires Play services or an auth
+server, stop for the user's distribution decision; do not proceed by
+impersonating a desktop app on Android."
+
+Finding: Google's supported Android authorization (GIS `AuthorizationClient`)
+requires Google Play services. Google no longer supports custom URI schemes on
+Android and has deprecated/disallowed loopback redirects for Android; OOB is
+removed and embedded WebViews are disallowed. There is therefore **no supported
+Google OAuth mechanism for a native Android app without Play services**; the only
+alternative (a Web client with an app-claimed HTTPS/App-Links redirect) is not a
+documented supported native-app flow and would require owning and verifying an
+HTTPS domain. In addition, Google directs that Android refresh tokens be held by
+a backend server, so true offline background refresh implies either an auth
+server or the on-demand `authorize()` model of §9.6.
+
+**Decision requested from the user** (engineering recommendation in parentheses):
+
+1. Accept a mandatory Google Play services dependency for Gmail/Contacts on
+   Android (recommended: yes — it is the only supported flow); and
+2. Choose between (a) device-only on-demand `authorize()` access tokens with no
+   on-device refresh token (recommended for v1; no backend), or (b) add a minimal
+   Pige auth server to hold refresh tokens; or
+3. Reconsider Android distribution for native Gmail if neither is acceptable.
+
+Until this decision is recorded, live Android authorization work stays parked.
+
+### 9.10 Selected SDK injection points
+
+- Mail: `google-gmail1` `7.0.0+20251215` (MIT, approved in S1 §4.1), used behind
+  Pige's provider-neutral `MailBackend`; Pige supplies the OAuth2 access token per
+  request. Prefer `default-features = false` to drop `yup-oauth2` so a single
+  token path is used on both platforms (S1 §4.1, §8); final feature wiring is
+  G-task work using S1's build evidence.
+- Contacts: `google-people1` `7.0.0+20251221` (MIT) behind the contacts
+  capability, independent of the mail scope grant.
+- No `google-gmail1`/`google-people1` dependency is added to the committed
+  workspace in S2.
+
+### 9.11 S2 PASS / FAIL / BLOCKED matrix
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| `GoogleAuthDecision` section frozen | PASS | §9.1–§9.10 |
+| Registration enumeration (clients, scopes, consent screen) | PASS | §9.2 |
+| Proposed platform flows + Play-services answer | PASS | §9.3–§9.4, §9.9 |
+| Case checklist present with PASS/FAIL/BLOCKED | PASS | §9.7 |
+| Android app identity + signing SHA-1s | PASS | §9.2, `s2-registration-and-device.txt` |
+| Device/Play-services/browser capability | PASS | §9.7, `s2-registration-and-device.txt` |
+| Desktop PKCE mechanics self-test (offline) | PASS (supplementary) | `s2-desktop-pkce-selftest.log` |
+| `desktop_pkce_cancel_and_state` (live Google) | BLOCKED | §9.7, §9.8 |
+| `android_consent_return_and_recreation` | BLOCKED | §9.7, §9.8 |
+| `mail_without_contacts_scope` | BLOCKED | §9.7, §9.8 |
+| `resume_after_process_restart` | BLOCKED | §9.7, §9.8 |
+| `contacts_later_grant` | BLOCKED | §9.7, §9.8 |
+| `revoked_grant_requires_login` | BLOCKED | §9.7, §9.8 |
