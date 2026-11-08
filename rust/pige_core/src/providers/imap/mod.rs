@@ -72,10 +72,14 @@ impl ImapProviderFactory {
 /// capability set. Submission arrives with F9. The mutation booleans are honest
 /// about what the adapter actually implements:
 ///
-/// - `labels` is false for every server. Gmail folds labels into folders, but
-///   removing a label needs the message's UID *inside that label's folder*,
-///   and a per-mailbox UID cannot name it; the adapter fails closed instead of
-///   acting on a foreign UID space.
+/// - `labels` means "label operations that are implemented". On Gmail a label
+///   is a folder, and adding one is a `COPY` of the *source* mailbox's own UIDs
+///   into the label folder — the same UID space, so it is genuine and correct:
+///   `labels` is `true` for Gmail. It is `false` for plain IMAP, which has no
+///   labels. Gmail *remove*-label is explicitly unsupported (it would need the
+///   message's UID *inside that label's folder*, which a per-mailbox UID cannot
+///   name); {@link ImapMutations} returns a per-item `Rejected(Unsupported)` for
+///   it rather than acting on a foreign UID space.
 /// - `permanent_delete` is true only where it is genuinely implemented: a
 ///   plain-IMAP expunge permanently deletes from the source mailbox. A Gmail
 ///   source UID addresses only that label, so Gmail stays false.
@@ -86,7 +90,7 @@ fn imap_capabilities(server: Capabilities) -> ProviderCapabilities {
         mutations: MutationCapabilities {
             read: true,
             star: true,
-            labels: false,
+            labels: server.gmail,
             move_messages: true,
             archive: true,
             trash: true,

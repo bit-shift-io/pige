@@ -966,8 +966,73 @@ async fn gmail_remove_label_never_uses_source_uid() {
         "must not even select a foreign mailbox to act on its UID space: {:?}",
         transport.select_calls
     );
-    // Label removal is not implemented, so label management is not advertised.
-    assert!(!session.capabilities.mutations.labels);
+    // Label *addition* is implemented (COPY into the label folder), so label
+    // management is advertised even though removal stays unsupported.
+    assert!(session.capabilities.mutations.labels);
+}
+
+#[tokio::test]
+async fn gmail_add_label_copies_source_uid_into_label_folder() {
+    // Adding a Gmail label is a COPY of the *source* mailbox's own UID into the
+    // label folder — the same UID space (Gmail COPY = add label), so it is
+    // correct and must succeed. It never deletes or moves the source message.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: true,
+                move_ext: false,
+            },
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                folder("Work", FolderKind::Other),
+            ],
+            states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+            messages: HashMap::from([("INBOX".to_string(), vec![message(1, "labeled mail")])]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let target = identity::message_remote_id("INBOX", 1, Uid(1));
+    let mut session = open(transports.clone()).await;
+    assert!(
+        session.capabilities.mutations.labels,
+        "Gmail add-label is implemented, so label management is advertised"
+    );
+
+    let result = session
+        .mutation_service()
+        .unwrap()
+        .apply(
+            request(
+                MutationAction::AddLabel(RemoteCollectionId::from("Work")),
+                vec![target],
+            ),
+            &context(),
+        )
+        .await
+        .expect("add label request");
+
+    assert_eq!(result.items[0].outcome, MutationOutcome::Applied);
+
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert_eq!(
+        transport.copy_calls,
+        vec![("INBOX".to_string(), vec![Uid(1)], "Work".to_string())],
+        "add-label copies the source mailbox's own UID into the label folder"
+    );
+    assert!(
+        transport.delete_calls.is_empty(),
+        "adding a label must not delete the source: {:?}",
+        transport.delete_calls
+    );
+    assert!(
+        transport.move_calls.is_empty(),
+        "adding a label is a COPY, not a MOVE: {:?}",
+        transport.move_calls
+    );
 }
 
 #[tokio::test]
@@ -989,8 +1054,9 @@ async fn imap_advertises_only_implemented_mutations() {
     assert!(plain.capabilities.mutations.permanent_delete);
     assert!(!plain.capabilities.mutations.labels);
 
-    // Gmail: neither label management nor permanent delete can be performed
-    // correctly, so neither is advertised.
+    // Gmail: add-label (COPY into the label folder) is implemented, so label
+    // management is advertised; permanent delete cannot be performed correctly
+    // with a per-label UID, so it is not.
     let gmail = Arc::new(FakeTransportFactory::default());
     gmail.add_transport(
         account().id.clone(),
@@ -1003,7 +1069,7 @@ async fn imap_advertises_only_implemented_mutations() {
         },
     );
     let gmail = open(gmail).await;
-    assert!(!gmail.capabilities.mutations.labels);
+    assert!(gmail.capabilities.mutations.labels);
     assert!(!gmail.capabilities.mutations.permanent_delete);
 }
 
