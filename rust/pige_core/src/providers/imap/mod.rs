@@ -132,7 +132,10 @@ impl ProviderFactory for ImapProviderFactory {
         let mailbox_transport = self.open_transport(account).await?;
         let mutation_transport = self.open_transport(account).await?;
 
-        let mut session = ProviderSession::new(imap_capabilities(server));
+        let mut session = ProviderSession::new(imap_capabilities(server))
+            .with_provider(crate::providers::types::ProviderId::from(
+                crate::providers::IMAP_SMTP_PROVIDER,
+            ));
         session.mailbox = Some(Box::new(ImapMailbox::new(mailbox_transport)));
         session.sync = Some(Box::new(ImapSync::new(sync_transport)));
         session.mutations = Some(Box::new(ImapMutations::new(mutation_transport, server)));

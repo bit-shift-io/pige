@@ -297,6 +297,8 @@ fn two_labels_share_one_native_message() {
         .apply_change_page(
             &context(&account.id),
             &job(&account.id),
+            GMAIL_PROVIDER,
+            None,
             &ChangePage {
                 changes: vec![
                     MailChange::UpsertCollection(label_a.clone()),
@@ -346,6 +348,8 @@ fn two_labels_share_one_native_message() {
         .apply_change_page(
             &context(&account.id),
             &job(&account.id),
+            GMAIL_PROVIDER,
+            Some(&ProviderCursor::new(1, "page-1")),
             &ChangePage {
                 changes: vec![MailChange::SetMembership {
                     message: record.remote_id.clone(),
@@ -580,6 +584,8 @@ fn page_and_cursor_commit_atomically() {
         .apply_change_page(
             &context(&account.id),
             &key,
+            GMAIL_PROVIDER,
+            None,
             &ChangePage {
                 changes: vec![MailChange::UpsertCollection(collection(
                     "LabelA",
@@ -597,6 +603,8 @@ fn page_and_cursor_commit_atomically() {
     let failed = store.apply_change_page(
         &context(&account.id),
         &key,
+        GMAIL_PROVIDER,
+        Some(&ProviderCursor::new(1, "cp-1")),
         &ChangePage {
             changes: vec![
                 MailChange::UpsertMessage {
@@ -640,6 +648,8 @@ fn page_and_cursor_commit_atomically() {
         .apply_change_page(
             &context(&account.id),
             &key,
+            GMAIL_PROVIDER,
+            Some(&ProviderCursor::new(1, "cp-1")),
             &ChangePage {
                 changes: vec![MailChange::UpsertMessage {
                     message: MessageRecord {
@@ -712,6 +722,8 @@ fn collection_upsert_preserves_folder_state() {
         .apply_change_page(
             &context(&account.id),
             &key,
+            IMAP_SMTP_PROVIDER,
+            None,
             &ChangePage {
                 changes: vec![MailChange::UpsertCollection(record("INBOX", None, None))],
                 checkpoint: ProviderCursor::new(1, "cp-1"),
@@ -736,6 +748,8 @@ fn collection_upsert_preserves_folder_state() {
         .apply_change_page(
             &context(&account.id),
             &key,
+            IMAP_SMTP_PROVIDER,
+            Some(&ProviderCursor::new(1, "cp-1")),
             &ChangePage {
                 changes: vec![MailChange::UpsertCollection(record("INBOX", Some(2), Some(3)))],
                 checkpoint: ProviderCursor::new(1, "cp-2"),

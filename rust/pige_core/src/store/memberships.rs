@@ -9,22 +9,19 @@
 //!
 //! [`Store::apply_change_page`] applies a whole provider change page — content
 //! upserts, membership edits, and the resumable checkpoint — in one
-//! generation-fenced transaction, so a failure leaves neither a half-applied
-//! page nor an advanced cursor.
+//! generation- and cursor-fenced transaction, so a failure leaves neither a
+//! half-applied page nor an advanced cursor.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::account::{AccountId, MailBackend};
-use crate::mail::{
-    FolderId, MessageId, StoredMessage, ThreadAssigner, thread::participants_of,
-};
+use crate::account::AccountId;
+use crate::mail::{FolderId, MessageId, StoredMessage, ThreadAssigner, thread::participants_of};
 use crate::providers::{
-    ChangePage, JobKey, MailChange, MessageRecord, OperationContext, RemoteCollectionId,
-    RemoteMessageId,
+    ChangePage, JobKey, MailChange, MessageRecord, OperationContext, ProviderCursor,
+    RemoteCollectionId, RemoteMessageId,
 };
 
 use super::messages::{delete_messages_on, merge_threads_on, messages_for_account_on, upsert_message_on};
-use super::remote_ids::IMAP_SMTP_BACKEND_KEY;
 use super::{Store, StoreError};
 
 impl Store {
@@ -73,17 +70,27 @@ impl Store {
 
     /// Apply one provider change page atomically: every content upsert,
     /// membership edit, and collection change lands together with the page's
-    /// checkpoint, and only while the account generation still matches.
+    /// checkpoint, and only while the account generation still matches and the
+    /// job's stored cursor is still `expected_previous`.
+    ///
+    /// `transport` is the backend key of the session that produced the page, so
+    /// a Gmail- or Proton-typed account synced over IMAP writes `imap-smtp`
+    /// rows instead of rows under its configured backend. `expected_previous`
+    /// is the cursor the page was produced against (`None` for a first page);
+    /// a mismatch is [`StoreError::StalePage`], which the caller discards
+    /// rather than applying.
     pub fn apply_change_page(
         &self,
         ctx: &OperationContext,
         key: &JobKey,
+        transport: &str,
+        expected_previous: Option<&ProviderCursor>,
         page: &ChangePage,
     ) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         super::jobs::check_generation_in(&tx, &ctx.account, ctx.generation)?;
-        let backend = account_backend_key(&tx, &ctx.account)?;
+        super::jobs::check_checkpoint_in(&tx, key, expected_previous)?;
 
         let mut threads =
             ThreadAssigner::from_messages(&messages_for_account_on(&tx, &ctx.account)?);
@@ -91,16 +98,16 @@ impl Store {
         for change in &page.changes {
             match change {
                 MailChange::UpsertCollection(record) => {
-                    upsert_collection_on(&tx, &ctx.account, &backend, record)?;
+                    upsert_collection_on(&tx, &ctx.account, transport, record)?;
                 }
                 MailChange::RemoveCollection(remote) => {
-                    remove_collection_on(&tx, &ctx.account, &backend, remote)?;
+                    remove_collection_on(&tx, &ctx.account, transport, remote)?;
                 }
                 MailChange::UpsertMessage { message, .. } => {
-                    upsert_remote_message_on(&tx, &ctx.account, &backend, &mut threads, message)?;
+                    upsert_remote_message_on(&tx, &ctx.account, transport, &mut threads, message)?;
                 }
                 MailChange::RemoveMessage(remote) => {
-                    let id = remote_message_on(&tx, &ctx.account, &backend, remote)?
+                    let id = remote_message_on(&tx, &ctx.account, transport, remote)?
                         .ok_or_else(|| StoreError::UnknownRemoteMessage(remote.clone()))?;
                     delete_messages_on(&tx, &[id])?;
                 }
@@ -109,7 +116,7 @@ impl Store {
                     collection,
                     present,
                 } => {
-                    set_membership_on(&tx, &ctx.account, &backend, message, collection, *present)?;
+                    set_membership_on(&tx, &ctx.account, transport, message, collection, *present)?;
                 }
             }
         }
@@ -118,27 +125,6 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-}
-
-/// Map a serialized `accounts.backend` value (or `None` for a pre-v5 row) to
-/// the provider dispatch key used to scope remote mappings.
-pub(crate) fn provider_key_for_json(backend: Option<&str>) -> &'static str {
-    match backend.and_then(|json| serde_json::from_str::<MailBackend>(json).ok()) {
-        Some(MailBackend::Gmail { .. }) => crate::providers::GMAIL_PROVIDER,
-        Some(MailBackend::Proton { .. }) => crate::providers::PROTON_PROVIDER,
-        Some(MailBackend::ImapSmtp { .. }) | None => IMAP_SMTP_BACKEND_KEY,
-    }
-}
-
-fn account_backend_key(conn: &Connection, account: &AccountId) -> Result<String, StoreError> {
-    let backend: Option<String> = conn
-        .query_row(
-            "SELECT backend FROM accounts WHERE id = ?1",
-            [&account.0],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(provider_key_for_json(backend.as_deref()).to_string())
 }
 
 pub(crate) fn message_memberships_on(

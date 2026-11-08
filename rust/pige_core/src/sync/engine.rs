@@ -26,6 +26,8 @@ pub enum SyncError {
     Store(#[from] StoreError),
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
+    #[error("provider error: {0}")]
+    Provider(#[from] crate::providers::ProviderError),
 }
 
 /// Summary of one newly-arrived inbox message, for notifications.

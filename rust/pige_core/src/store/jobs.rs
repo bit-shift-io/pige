@@ -128,6 +128,33 @@ pub(crate) fn set_checkpoint_in(
     Ok(())
 }
 
+/// Compare-and-swap guard executed *inside* a page's SQLite transaction: the
+/// store's cursor for `key` must still equal `expected` (including both being
+/// absent) or the page was produced against a checkpoint another writer has
+/// since moved past. Such a page must be discarded, never applied, so a late or
+/// out-of-order page cannot regress state.
+pub(crate) fn check_checkpoint_in(
+    conn: &rusqlite::Connection,
+    key: &JobKey,
+    expected: Option<&ProviderCursor>,
+) -> Result<(), StoreError> {
+    let job_key = serde_json::to_string(key)?;
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT cursor FROM job_checkpoints WHERE job_key = ?1",
+            [&job_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let stored: Option<ProviderCursor> =
+        stored.map(|json| serde_json::from_str(&json)).transpose()?;
+    if stored.as_ref() == expected {
+        Ok(())
+    } else {
+        Err(StoreError::StalePage)
+    }
+}
+
 impl Store {
     /// The current durable generation for `account`. A never-seen account is
     /// [`INITIAL_GENERATION`].
@@ -487,6 +514,13 @@ impl Store {
         set_checkpoint_in(&tx, key, generation, cursor)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Read one job's resumable cursor, if any. This is the value a caller
+    /// passes back as the expected-previous checkpoint of the next committed
+    /// page, and the cursor it sends to the provider.
+    pub fn job_checkpoint(&self, key: &JobKey) -> Result<Option<ProviderCursor>, StoreError> {
+        Ok(self.checkpoint(key)?.map(|checkpoint| checkpoint.cursor))
     }
 
     /// Read one job's checkpoint, if any.

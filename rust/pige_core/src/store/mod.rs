@@ -83,6 +83,11 @@ pub enum StoreError {
     /// job it belongs to.
     #[error("job checkpoint from generation {generation} is stale")]
     StaleCheckpoint { generation: u64 },
+    /// A change page was based on a job cursor the store has since moved past
+    /// (for example a concurrent mutation or a second process advanced it).
+    /// Applying it could regress newer state, so it is discarded.
+    #[error("a change page based on an outdated checkpoint was discarded")]
+    StalePage,
     /// Another process holds the account's cross-process lease.
     #[error("account is busy with another operation")]
     LeaseHeld,

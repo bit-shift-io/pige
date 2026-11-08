@@ -15,9 +15,10 @@ use crate::account::Account;
 use super::error::ProviderError;
 use super::types::{
     BodyContent, ChangePage, CollectionRecord, ContactPage, ContactSourceId, HistoryPage,
-    HistoryRequest, MutationRequest, MutationResult, OperationContext, PreparedSubmission,
-    ProviderCapabilities, ProviderCursor, ReconcileOutcome, RemoteAttachmentId, RemoteMessageId,
-    SentCopyPolicy, SubmissionOutcome, SubmissionReceipt, SubmissionRequest, SyncRequest,
+    HistoryRequest, IMAP_SMTP_PROVIDER, MutationRequest, MutationResult, OperationContext,
+    PreparedSubmission, ProviderCapabilities, ProviderCursor, ProviderId, ReconcileOutcome,
+    RemoteAttachmentId, RemoteMessageId, SentCopyPolicy, SubmissionOutcome, SubmissionReceipt,
+    SubmissionRequest, SyncRequest,
 };
 
 /// Read-side mailbox access: collections, bodies, attachments, and history.
@@ -117,6 +118,11 @@ pub trait AddressBookService: Send {
 /// services themselves are optional so a provider can implement only part of
 /// the surface. Shared adapter state may live behind an internal `Arc`.
 pub struct ProviderSession {
+    /// The transport that produced this session, used to scope durable remote
+    /// mappings. A Gmail- or Proton-typed account can still be synced over the
+    /// IMAP transport, and its page must be keyed by `imap-smtp`, not by the
+    /// account's configured backend. Defaults to [`IMAP_SMTP_PROVIDER`].
+    pub provider: ProviderId,
     pub capabilities: ProviderCapabilities,
     pub mailbox: Option<Box<dyn MailboxService>>,
     pub sync: Option<Box<dyn SyncService>>,
@@ -126,9 +132,12 @@ pub struct ProviderSession {
 }
 
 impl ProviderSession {
-    /// An empty session advertising `capabilities`.
+    /// An empty session advertising `capabilities` and keyed by the legacy
+    /// IMAP/SMTP transport. Use [`ProviderSession::with_provider`] to name a
+    /// different transport.
     pub fn new(capabilities: ProviderCapabilities) -> Self {
         Self {
+            provider: ProviderId::from(IMAP_SMTP_PROVIDER),
             capabilities,
             mailbox: None,
             sync: None,
@@ -136,6 +145,14 @@ impl ProviderSession {
             submission: None,
             address_book: None,
         }
+    }
+
+    /// Name the transport that produced this session for durable mapping
+    /// scoping.
+    #[must_use]
+    pub fn with_provider(mut self, provider: ProviderId) -> Self {
+        self.provider = provider;
+        self
     }
 
     pub fn mailbox_service(&mut self) -> Result<&mut Box<dyn MailboxService>, ProviderError> {
@@ -175,6 +192,7 @@ impl fmt::Debug for ProviderSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProviderSession")
+            .field("provider", &self.provider)
             .field("capabilities", &self.capabilities)
             .field("mailbox", &self.mailbox.is_some())
             .field("sync", &self.sync.is_some())
