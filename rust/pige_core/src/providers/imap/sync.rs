@@ -49,6 +49,13 @@ pub struct ImapSyncState {
     pub version: u32,
     /// Per-mailbox progress, in the order mailboxes were first seen.
     pub mailboxes: Vec<MailboxProgress>,
+    /// Mailboxes a caller asked to begin tracking on the next page. The shared
+    /// [`SyncRequest`] (F1-owned) carries no mailbox, so an on-demand `Other`
+    /// folder has no in-band way to name itself; F7 folds the request into the
+    /// cursor with [`request_mailbox`]. Cleared once the next page has attempted
+    /// them.
+    #[serde(default)]
+    pub requested: Vec<String>,
 }
 
 /// Durable progress for a single mailbox inside [`ImapSyncState`].
@@ -89,11 +96,35 @@ pub fn decode_sync_cursor(cursor: &ProviderCursor) -> Result<ImapSyncState, Prov
     Ok(state)
 }
 
+/// Ask the next [`SyncService::next_page`] to begin tracking `mailbox`, even an
+/// `Other` folder the cursor does not yet know.
+///
+/// The shared `SyncRequest` (F1-owned) carries no mailbox, so an on-demand
+/// folder cannot name itself through the neutral interface. F7 folds the
+/// requested mailbox into the checked cursor with this helper; the next page
+/// bootstraps it under its own `(mailbox, UIDVALIDITY, UID)` identity, and
+/// thereafter it is tracked normally. Adoption is needed only once — once a
+/// page has recorded progress for the mailbox, ordinary deltas keep it current.
+pub fn request_mailbox(
+    cursor: Option<&ProviderCursor>,
+    mailbox: &str,
+) -> Result<ProviderCursor, ProviderError> {
+    let mut state = match cursor {
+        Some(cursor) => decode_sync_cursor(cursor)?,
+        None => ImapSyncState::empty(),
+    };
+    if !state.requested.iter().any(|name| name == mailbox) {
+        state.requested.push(mailbox.to_string());
+    }
+    encode_sync_cursor(&state)
+}
+
 impl ImapSyncState {
     fn empty() -> Self {
         Self {
             version: SYNC_CURSOR_VERSION,
             mailboxes: Vec::new(),
+            requested: Vec::new(),
         }
     }
 
@@ -179,12 +210,16 @@ impl SyncService for ImapSync {
             .retain(|mailbox| !vanished.iter().any(|gone| gone.name == mailbox.name));
 
         // Sync the special folders automatically, in engine order, plus any
-        // folder the cursor already tracks (an on-demand "Other" folder keeps
-        // syncing once it has been adopted).
+        // folder the cursor already tracks, plus any folder a caller asked to
+        // adopt on this page with [`request_mailbox`]. A brand-new on-demand
+        // "Other" folder reaches this set through the request and then keeps
+        // syncing on its own once progress exists.
         let mut to_sync: Vec<RemoteFolder> = folders
             .iter()
             .filter(|folder| {
-                sync_order(folder.kind).is_some() || state.progress(&folder.name).is_some()
+                sync_order(folder.kind).is_some()
+                    || state.progress(&folder.name).is_some()
+                    || state.requested.iter().any(|name| name == &folder.name)
             })
             .cloned()
             .collect();
@@ -230,6 +265,11 @@ impl SyncService for ImapSync {
             };
             state.set_progress(progress);
         }
+
+        // A requested mailbox has now either been adopted (progress recorded)
+        // or does not exist / could not be selected; either way the request is
+        // spent and a caller re-requests if it still wants the folder.
+        state.requested.clear();
 
         Ok(ChangePage {
             changes,

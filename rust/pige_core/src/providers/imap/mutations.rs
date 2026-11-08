@@ -14,9 +14,16 @@
 //! - Generic servers use `MOVE` where advertised and COPY + delete otherwise.
 //!
 //! A multi-step write that fails *after* its first step has changed the server
-//! is reported as [`MutationOutcome::Unknown`]: never retry it blindly. An
-//! `Archive`/`Move` that only removed a label is distinct from a
-//! `DeletePermanently`, which expunges.
+//! is reported as [`MutationOutcome::Unknown`]: never retry it blindly.
+//!
+//! An `Archive`/`Move` that only removes a Gmail label is deliberately distinct
+//! from a permanent delete. A permanent delete must expunge the message from
+//! its canonical home, but the only UID this adapter holds is the one from the
+//! mailbox that named the target — and Gmail gives the same message a different
+//! UID in every label, including `[Gmail]/All Mail`. Expunging the source label
+//! is exactly a label removal, not a permanent delete, so Gmail
+//! `DeletePermanently` (like Gmail `RemoveLabel`) fails closed with
+//! `Unsupported` rather than touch another mailbox's UID space.
 
 use async_trait::async_trait;
 
@@ -139,24 +146,36 @@ impl ImapMutations {
                 self.select(mailbox).await?;
                 self.copy(uids, label.as_str()).await
             }
-            MutationAction::RemoveLabel(label) => {
-                // Only Gmail folds labels into folders. Removing a label is a
-                // delete *scoped to that label*; on a plain IMAP server a
-                // folder is the message's only home, so removing it would
-                // delete the message — genuinely unsupported, never a silent
-                // permanent delete.
-                if !self.capabilities.gmail {
-                    return Err(ProviderError::unsupported(
-                        "removing a label on this mail server",
-                    ));
-                }
-                self.select(label.as_str()).await?;
-                self.remove(uids).await
+            MutationAction::RemoveLabel(_label) => {
+                // Removing a label requires the message's UID *within the label
+                // folder*. IMAP UIDs are per-mailbox and Gmail gives the same
+                // message a different UID in each label, so the source
+                // mailbox's UID cannot address the label. Selecting the label
+                // folder and deleting the source UID would target a different
+                // message (or nothing), so this fails closed until an
+                // `X-GM-MSGID` resolution path exists — never touch another
+                // mailbox's UID space. On a plain IMAP server a folder is the
+                // message's only home, so removing it would delete the message;
+                // also genuinely unsupported, never a silent permanent delete.
+                Err(ProviderError::unsupported(
+                    "removing a label on this mail server",
+                ))
             }
             MutationAction::Move(dest) => self.move_to(mailbox, uids, dest.as_str()).await,
             MutationAction::Archive => self.archive(mailbox, uids).await,
             MutationAction::Trash => self.trash(mailbox, uids).await,
             MutationAction::DeletePermanently => {
+                if self.capabilities.gmail {
+                    // The source UID names the source label, not
+                    // `[Gmail]/All Mail`, so expunging it would only remove
+                    // that label — indistinguishable from `Archive`. A true
+                    // deletion needs the All Mail UID, which this adapter
+                    // cannot resolve from a per-mailbox id. Fail closed rather
+                    // than degrade to a label removal.
+                    return Err(ProviderError::unsupported(
+                        "permanently deleting a Gmail message",
+                    ));
+                }
                 self.select(mailbox).await?;
                 self.remove(uids).await
             }

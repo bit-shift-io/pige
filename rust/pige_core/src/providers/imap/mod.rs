@@ -69,8 +69,16 @@ impl ImapProviderFactory {
 }
 
 /// Capabilities advertised by the IMAP adapter, derived from the server's own
-/// capability set. Submission arrives with F9. The label capability is honest:
-/// Gmail folds labels into folders, a plain IMAP server does not.
+/// capability set. Submission arrives with F9. The mutation booleans are honest
+/// about what the adapter actually implements:
+///
+/// - `labels` is false for every server. Gmail folds labels into folders, but
+///   removing a label needs the message's UID *inside that label's folder*,
+///   and a per-mailbox UID cannot name it; the adapter fails closed instead of
+///   acting on a foreign UID space.
+/// - `permanent_delete` is true only where it is genuinely implemented: a
+///   plain-IMAP expunge permanently deletes from the source mailbox. A Gmail
+///   source UID addresses only that label, so Gmail stays false.
 fn imap_capabilities(server: Capabilities) -> ProviderCapabilities {
     ProviderCapabilities {
         mailbox: true,
@@ -78,11 +86,11 @@ fn imap_capabilities(server: Capabilities) -> ProviderCapabilities {
         mutations: MutationCapabilities {
             read: true,
             star: true,
-            labels: server.gmail,
+            labels: false,
             move_messages: true,
             archive: true,
             trash: true,
-            permanent_delete: true,
+            permanent_delete: !server.gmail,
         },
         submission: false,
         contacts: crate::providers::types::ContactCapabilities::default(),

@@ -847,6 +847,300 @@ async fn gmail_imap_archive_removes_source_label_only() {
 }
 
 #[tokio::test]
+async fn gmail_permanent_delete_is_not_label_removal() {
+    // A Gmail message is named per mailbox: the source label's UID does not
+    // address `[Gmail]/All Mail`, so expunging the source would remove only the
+    // source label — exactly what `Archive` does. The adapter cannot address a
+    // true permanent delete with a source UID, so it must fail closed rather
+    // than silently degrade to a label removal.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: true,
+                move_ext: false,
+            },
+            folders: vec![folder("INBOX", FolderKind::Inbox)],
+            states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+            messages: HashMap::from([("INBOX".to_string(), vec![message(1, "kept")])]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let target = identity::message_remote_id("INBOX", 1, Uid(1));
+    let mut session = open(transports.clone()).await;
+    let deleted = session
+        .mutation_service()
+        .unwrap()
+        .apply(
+            request(MutationAction::DeletePermanently, vec![target]),
+            &context(),
+        )
+        .await
+        .expect("delete request");
+
+    assert!(
+        matches!(
+            &deleted.items[0].outcome,
+            MutationOutcome::Rejected(error) if error.kind == ErrorKind::Unsupported
+        ),
+        "Gmail permanent delete must fail closed, not equal archive/label removal: {:?}",
+        deleted.items[0].outcome
+    );
+
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert!(
+        transport.delete_calls.is_empty(),
+        "Gmail permanent delete must not expunge the source label: {:?}",
+        transport.delete_calls
+    );
+    // The capability must not claim a permanent delete the adapter cannot do.
+    assert!(!session.capabilities.mutations.permanent_delete);
+}
+
+#[tokio::test]
+async fn gmail_remove_label_never_uses_source_uid() {
+    // INBOX UID 1 and Work UID 900 name the same Gmail message. IMAP UIDs are
+    // per-mailbox, so deleting INBOX UID 1 after selecting Work would target a
+    // different message (or nothing). The adapter must never act on a UID from
+    // another mailbox's UID space.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: true,
+                move_ext: false,
+            },
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                folder("Work", FolderKind::Other),
+            ],
+            states: HashMap::from([
+                ("INBOX".to_string(), state(1, 2)),
+                ("Work".to_string(), state(7, 901)),
+            ]),
+            messages: HashMap::from([
+                ("INBOX".to_string(), vec![message(1, "work mail")]),
+                ("Work".to_string(), vec![message(900, "work mail")]),
+            ]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let target = identity::message_remote_id("INBOX", 1, Uid(1));
+    let mut session = open(transports.clone()).await;
+    let result = session
+        .mutation_service()
+        .unwrap()
+        .apply(
+            request(
+                MutationAction::RemoveLabel(RemoteCollectionId::from("Work")),
+                vec![target],
+            ),
+            &context(),
+        )
+        .await
+        .expect("remove label request");
+
+    assert!(
+        matches!(
+            &result.items[0].outcome,
+            MutationOutcome::Rejected(error) if error.kind == ErrorKind::Unsupported
+        ),
+        "Gmail label removal needs the per-label UID and must fail closed: {:?}",
+        result.items[0].outcome
+    );
+
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert!(
+        transport.delete_calls.is_empty(),
+        "must never delete INBOX UID 1 from the Work mailbox: {:?}",
+        transport.delete_calls
+    );
+    assert!(
+        transport.select_calls.iter().all(|name| name != "Work"),
+        "must not even select a foreign mailbox to act on its UID space: {:?}",
+        transport.select_calls
+    );
+    // Label removal is not implemented, so label management is not advertised.
+    assert!(!session.capabilities.mutations.labels);
+}
+
+#[tokio::test]
+async fn imap_advertises_only_implemented_mutations() {
+    // Plain IMAP: an expunge permanently deletes from the source mailbox, and
+    // labels do not exist.
+    let plain = Arc::new(FakeTransportFactory::default());
+    plain.add_transport(
+        account().id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: false,
+                move_ext: true,
+            },
+            ..FakeTransport::default()
+        },
+    );
+    let plain = open(plain).await;
+    assert!(plain.capabilities.mutations.permanent_delete);
+    assert!(!plain.capabilities.mutations.labels);
+
+    // Gmail: neither label management nor permanent delete can be performed
+    // correctly, so neither is advertised.
+    let gmail = Arc::new(FakeTransportFactory::default());
+    gmail.add_transport(
+        account().id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: true,
+                move_ext: false,
+            },
+            ..FakeTransport::default()
+        },
+    );
+    let gmail = open(gmail).await;
+    assert!(!gmail.capabilities.mutations.labels);
+    assert!(!gmail.capabilities.mutations.permanent_delete);
+}
+
+#[tokio::test]
+async fn new_other_folder_can_be_adopted_on_demand() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                folder("Work", FolderKind::Other),
+            ],
+            states: HashMap::from([
+                ("INBOX".to_string(), state(1, 2)),
+                ("Work".to_string(), state(9, 51)),
+            ]),
+            messages: HashMap::from([
+                ("INBOX".to_string(), vec![message(1, "inbox")]),
+                ("Work".to_string(), vec![message(50, "work")]),
+            ]),
+            ..FakeTransport::default()
+        },
+    );
+
+    // A first page auto-syncs only special folders: a brand-new Other folder is
+    // announced as a collection, but its messages are not fetched and no
+    // progress is recorded for it.
+    let mut session = open(transports.clone()).await;
+    let first = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("first sync");
+    assert!(
+        upserted(&first)
+            .iter()
+            .all(|(mailbox, _, _)| mailbox != "Work"),
+        "an Other folder is not auto-synced before it is requested"
+    );
+    let cursor = sync::decode_sync_cursor(&first.checkpoint).expect("sync cursor");
+    assert!(
+        cursor
+            .mailboxes
+            .iter()
+            .all(|mailbox| mailbox.name != "Work"),
+        "no progress exists for the untouched Other folder"
+    );
+
+    // F7 can name the folder through the cursor: `request_mailbox` folds it into
+    // the checkpoint, and the next page bootstraps it under its own identity.
+    let seeded = sync::request_mailbox(Some(&first.checkpoint), "Work").expect("seed request");
+    let mut session = open(transports.clone()).await;
+    let adopted = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: Some(seeded),
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("adopting sync");
+    assert_eq!(
+        upserted(&adopted),
+        vec![("Work".to_string(), 9, 50)],
+        "the requested Other folder is bootstrapped"
+    );
+    let adopted_cursor = adopted.checkpoint.clone();
+    let cursor = sync::decode_sync_cursor(&adopted_cursor).expect("sync cursor");
+    assert!(
+        cursor.requested.is_empty(),
+        "a spent adoption request is not carried forward"
+    );
+    assert!(
+        cursor
+            .mailboxes
+            .iter()
+            .any(|mailbox| mailbox.name == "Work"),
+        "the adopted folder is now tracked by its own progress"
+    );
+
+    // It keeps syncing without another request: a newer Work UID is reported by
+    // the ordinary delta path.
+    let after = FakeTransport {
+        folders: vec![
+            folder("INBOX", FolderKind::Inbox),
+            folder("Work", FolderKind::Other),
+        ],
+        states: HashMap::from([
+            ("INBOX".to_string(), state(1, 2)),
+            ("Work".to_string(), state(9, 52)),
+        ]),
+        messages: HashMap::from([
+            ("INBOX".to_string(), vec![message(1, "inbox")]),
+            (
+                "Work".to_string(),
+                vec![message(50, "work"), message(51, "new work")],
+            ),
+        ]),
+        ..FakeTransport::default()
+    };
+    transports.add_transport(account.id.clone(), after);
+
+    let mut session = open(transports.clone()).await;
+    let delta = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: Some(adopted_cursor),
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("delta sync");
+    assert!(
+        upserted(&delta)
+            .iter()
+            .any(|(mailbox, _, uid)| mailbox == "Work" && *uid == 51),
+        "the adopted folder keeps syncing on its own: {:?}",
+        upserted(&delta)
+    );
+}
+
+#[tokio::test]
 async fn copy_delete_fallback_reports_partial_outcome() {
     let transports = Arc::new(FakeTransportFactory::default());
     let account = account();
