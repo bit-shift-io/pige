@@ -11,10 +11,10 @@ use pige_core::providers::{
     ChangePage, CollectionRecord, GMAIL_PROVIDER, IMAP_SMTP_PROVIDER, JobKey, JobKind, MailChange,
     MessageRecord, OperationContext, ProviderCursor, RemoteCollectionId, RemoteMessageId,
 };
-use pige_core::store::{clear_migration_fault, inject_migration_fault};
+use pige_core::store::{ImapCoords, clear_migration_fault, inject_migration_fault};
 use pige_core::{
     Account, AccountId, Flags, FolderId, FolderKind, MailBackend, MessageHeader, MessageId,
-    SCHEMA_VERSION, Store, StoreError, ThreadId,
+    SCHEMA_VERSION, Store, StoreError, ThreadId, Uid,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -26,6 +26,32 @@ fn gmail_account(id: &str) -> Account {
         email: format!("{id}@example.com"),
         display_name: id.to_string(),
         backend: MailBackend::gmail(id),
+        contact_sources: Vec::new(),
+        sort_order: 0,
+        color: None,
+    }
+}
+
+fn imap_account(id: &str) -> Account {
+    use pige_core::account::{Security, ServerConfig};
+    Account {
+        id: AccountId(id.to_string()),
+        label: id.to_string(),
+        email: format!("{id}@example.com"),
+        display_name: id.to_string(),
+        backend: MailBackend::imap_smtp(
+            format!("{id}@example.com"),
+            ServerConfig {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                security: Security::Tls,
+            },
+            ServerConfig {
+                host: "smtp.example.com".to_string(),
+                port: 465,
+                security: Security::Tls,
+            },
+        ),
         contact_sources: Vec::new(),
         sort_order: 0,
         color: None,
@@ -640,4 +666,166 @@ fn page_and_cursor_commit_atomically() {
         store.checkpoint(&key).unwrap().unwrap().cursor,
         ProviderCursor::new(1, "cp-2")
     );
+}
+
+/// A provider collection upsert must not clobber the IMAP-owned folder state:
+/// an omitted counter leaves the rollup alone, and `UIDVALIDITY`/`UIDNEXT` are
+/// never rewritten, so no spurious epoch reset happens on the sync path.
+#[test]
+fn collection_upsert_preserves_folder_state() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("pige.db");
+    let store = Store::open(&path).unwrap();
+    store.migrate().unwrap();
+    let account = imap_account("acc");
+    store.upsert_account(&account).unwrap();
+
+    let folder_id = FolderId("inbox".to_string());
+    store
+        .upsert_folder(&pige_core::Folder {
+            id: folder_id.clone(),
+            account_id: account.id.clone(),
+            name: "INBOX".to_string(),
+            delimiter: Some("/".to_string()),
+            kind: FolderKind::Inbox,
+            unread: 5,
+            total: 9,
+            uidvalidity: Some(42),
+            uidnext: Some(100),
+        })
+        .unwrap();
+
+    let key = job(&account.id);
+    let record = |remote: &str, unread: Option<u32>, total: Option<u32>| CollectionRecord {
+        remote_id: RemoteCollectionId::new(remote),
+        name: "INBOX".to_string(),
+        kind: FolderKind::Inbox,
+        delimiter: Some("/".to_string()),
+        total,
+        unread,
+    };
+
+    // Counters omitted: the existing rollups and sync state must survive.
+    store
+        .apply_change_page(
+            &context(&account.id),
+            &key,
+            &ChangePage {
+                changes: vec![MailChange::UpsertCollection(record("INBOX", None, None))],
+                checkpoint: ProviderCursor::new(1, "cp-1"),
+                has_more: false,
+            },
+        )
+        .unwrap();
+
+    let folder = store
+        .folders(&account.id)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == folder_id)
+        .expect("folder survives a collection upsert");
+    assert_eq!(folder.unread, 5, "omitted unread must preserve the rollup");
+    assert_eq!(folder.total, 9, "omitted total must preserve the rollup");
+    assert_eq!(folder.uidvalidity, Some(42), "UIDVALIDITY must not be reset");
+    assert_eq!(folder.uidnext, Some(100), "UIDNEXT must not be cleared");
+
+    // Counters reported: they update, but the IMAP epoch is still untouched.
+    store
+        .apply_change_page(
+            &context(&account.id),
+            &key,
+            &ChangePage {
+                changes: vec![MailChange::UpsertCollection(record("INBOX", Some(2), Some(3)))],
+                checkpoint: ProviderCursor::new(1, "cp-2"),
+                has_more: false,
+            },
+        )
+        .unwrap();
+    let folder = store
+        .folders(&account.id)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == folder_id)
+        .unwrap();
+    assert_eq!(folder.unread, 2);
+    assert_eq!(folder.total, 3);
+    assert_eq!(folder.uidvalidity, Some(42), "UIDVALIDITY must not be reset");
+    assert_eq!(folder.uidnext, Some(100), "UIDNEXT must not be cleared");
+}
+
+/// An IMAP sync mapping for a Gmail-typed account is keyed by the transport
+/// (`imap-smtp`), so it matches the sync engine's own write instead of leaving
+/// two mapping rows for one message.
+#[test]
+fn imap_mapping_is_keyed_by_transport() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("pige.db");
+    let store = Store::open(&path).unwrap();
+    store.migrate().unwrap();
+    // A Gmail-typed account that is nevertheless still syncing over IMAP.
+    let account = gmail_account("acc");
+    store.upsert_account(&account).unwrap();
+
+    let folder_id = FolderId("inbox".to_string());
+    store
+        .upsert_folder(&pige_core::Folder {
+            id: folder_id.clone(),
+            account_id: account.id.clone(),
+            name: "INBOX".to_string(),
+            delimiter: Some("/".to_string()),
+            kind: FolderKind::Inbox,
+            unread: 0,
+            total: 0,
+            uidvalidity: None,
+            uidnext: None,
+        })
+        .unwrap();
+
+    let id = MessageId("m-1".to_string());
+    store
+        .upsert_message(&pige_core::StoredMessage {
+            id: id.clone(),
+            account_id: account.id.clone(),
+            folder_id: Some(folder_id.clone()),
+            uid: Some(Uid(7)),
+            uidvalidity: Some(1),
+            header: header(Some("<m1@example.com>"), "One"),
+            flags: Flags::default(),
+            thread_id: ThreadId("t-1".to_string()),
+            snippet: String::new(),
+            has_attachments: false,
+        })
+        .unwrap();
+
+    let coords = ImapCoords::new("INBOX", 1, Uid(7));
+    let remote = coords.encode();
+    assert_eq!(
+        store
+            .remote_message_for(&account.id, IMAP_SMTP_PROVIDER, &remote)
+            .unwrap(),
+        Some(id.clone()),
+        "the mapping must live under the transport's backend key"
+    );
+    assert_eq!(
+        store
+            .remote_message_for(&account.id, GMAIL_PROVIDER, &remote)
+            .unwrap(),
+        None,
+        "no mapping may be filed under the account's configured backend"
+    );
+    assert_eq!(store.imap_coords(&id).unwrap(), Some(coords));
+
+    // The sync engine's own mapping write upserts onto the same row.
+    store
+        .set_remote_message(&account.id, IMAP_SMTP_PROVIDER, &remote, &id)
+        .unwrap();
+    let conn = raw(&path);
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM remote_messages WHERE account_id = ?1 AND message_id = ?2",
+            rusqlite::params![account.id.0, id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "one message must keep exactly one mapping row");
 }

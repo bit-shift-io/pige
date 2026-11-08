@@ -117,6 +117,56 @@ pub(crate) fn upsert_folder_on(conn: &Connection, folder: &Folder) -> Result<(),
     Ok(())
 }
 
+/// A folder upsert requested by a provider collection.
+///
+/// Unlike a full [`Folder`] this carries *optional* counters, so the store can
+/// tell "the provider reported zero" from "the provider said nothing", and it
+/// deliberately has no `uidvalidity`/`uidnext` fields: those sync counters are
+/// owned by the IMAP path and must never be rewritten from a collection record.
+pub(crate) struct ProviderFolderUpsert<'a> {
+    pub id: &'a FolderId,
+    pub account_id: &'a AccountId,
+    pub name: &'a str,
+    pub delimiter: Option<&'a str>,
+    pub kind: FolderKind,
+    pub unread: Option<u32>,
+    pub total: Option<u32>,
+}
+
+/// Insert or update a folder described by a provider collection.
+///
+/// Unlike [`upsert_folder_on`], this never writes the `uidvalidity`/`uidnext`
+/// sync counters, because the IMAP sync path owns them and a collection upsert
+/// must not start a spurious epoch reset. It also overwrites `unread`/`total`
+/// only when the provider actually reported a value, so a record that omits
+/// counters cannot zero a folder's rollups.
+pub(crate) fn upsert_provider_folder_on(
+    conn: &Connection,
+    folder: &ProviderFolderUpsert<'_>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO folders (id, account_id, name, delimiter, kind, unread, total)
+         VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, 0), COALESCE(?7, 0))
+         ON CONFLICT(id) DO UPDATE SET
+             account_id = excluded.account_id,
+             name = excluded.name,
+             delimiter = excluded.delimiter,
+             kind = excluded.kind,
+             unread = COALESCE(?6, folders.unread),
+             total = COALESCE(?7, folders.total)",
+        params![
+            folder.id.0,
+            folder.account_id.0,
+            folder.name,
+            folder.delimiter,
+            folder.kind.as_str(),
+            folder.unread,
+            folder.total,
+        ],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn folders_on(
     conn: &Connection,
     account: &AccountId,

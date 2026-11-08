@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::{AccountId, MailBackend};
 use crate::mail::{
-    Folder, FolderId, MessageId, StoredMessage, ThreadAssigner, thread::participants_of,
+    FolderId, MessageId, StoredMessage, ThreadAssigner, thread::participants_of,
 };
 use crate::providers::{
     ChangePage, JobKey, MailChange, MessageRecord, OperationContext, RemoteCollectionId,
@@ -246,18 +246,23 @@ fn upsert_collection_on(
             by_name.map(FolderId).unwrap_or_default()
         }
     };
-    let folder = Folder {
-        id: folder_id.clone(),
-        account_id: account.clone(),
-        name: record.name.clone(),
-        delimiter: record.delimiter.clone(),
-        kind: record.kind,
-        unread: record.unread.unwrap_or(0),
-        total: record.total.unwrap_or(0),
-        uidvalidity: None,
-        uidnext: None,
-    };
-    super::folders::upsert_folder_on(conn, &folder)?;
+    // Never touch `uidvalidity`/`uidnext` here: the IMAP sync path owns those
+    // counters, and overwriting them from a collection record would start a
+    // spurious epoch reset. Counters are written only when the provider
+    // actually reported them, so an upsert that omits `unread`/`total` cannot
+    // zero an existing folder's rollups.
+    super::folders::upsert_provider_folder_on(
+        conn,
+        &super::folders::ProviderFolderUpsert {
+            id: &folder_id,
+            account_id: account,
+            name: &record.name,
+            delimiter: record.delimiter.as_deref(),
+            kind: record.kind,
+            unread: record.unread,
+            total: record.total,
+        },
+    )?;
     set_remote_collection_on(conn, account, backend, &record.remote_id, &folder_id)?;
     Ok(folder_id)
 }

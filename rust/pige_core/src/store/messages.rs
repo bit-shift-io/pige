@@ -18,19 +18,26 @@ use crate::mail::{
 };
 use crate::providers::RemoteMessageId;
 
-use super::remote_ids::ImapCoords;
+use super::remote_ids::{IMAP_SMTP_BACKEND_KEY, ImapCoords};
 use super::{Store, StoreError};
 
 /// Content columns plus a projected, deterministic first folder membership.
 /// `messages` no longer stores a folder, UID, or UIDVALIDITY: membership comes
 /// from `message_collections` and remote identity from `remote_messages`.
-pub(crate) const COLUMNS: &str = "m.id, m.account_id, m.message_id, m.in_reply_to, \
+///
+/// Built by a function rather than a `const` so the IMAP projection can filter
+/// on [`IMAP_SMTP_BACKEND_KEY`] instead of a duplicated string literal.
+fn columns() -> String {
+    format!(
+        "m.id, m.account_id, m.message_id, m.in_reply_to, \
      m.references_json, m.thread_id, m.subject, \
      m.from_json, m.to_json, m.cc_json, m.date, m.size, m.flags, m.snippet, m.has_attachments, \
      (SELECT mc.folder_id FROM message_collections mc WHERE mc.message_id = m.id \
       ORDER BY mc.folder_id LIMIT 1), \
      (SELECT rm.remote_id FROM remote_messages rm WHERE rm.message_id = m.id \
-      AND rm.backend_key = 'imap-smtp' ORDER BY rm.remote_id LIMIT 1)";
+      AND rm.backend_key = '{IMAP_SMTP_BACKEND_KEY}' ORDER BY rm.remote_id LIMIT 1)"
+    )
+}
 
 /// The newest uncached Inbox message in a conversation.
 #[derive(Debug, Clone)]
@@ -131,9 +138,10 @@ impl Store {
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.connection();
         let sql = format!(
-            "SELECT {COLUMNS} FROM messages m
+            "SELECT {} FROM messages m
              WHERE m.thread_id = ?1
-             ORDER BY m.date DESC, m.rowid DESC"
+             ORDER BY m.date DESC, m.rowid DESC",
+            columns()
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([&thread_id.0])?;
@@ -389,28 +397,35 @@ pub(crate) fn upsert_message_on(
     }
 
     // A message carrying both a folder and IMAP UID coordinates records its
-    // durable remote identity here, so a later re-sync resolves to the same
-    // local id. A message with no UID (a native API message) writes none.
+    // durable IMAP remote identity here, so a later re-sync resolves to the
+    // same local id. The mapping is keyed by the *transport* that produced the
+    // coordinates (`imap-smtp`), never by the account's configured backend: a
+    // Gmail- or Proton-typed account may still be syncing over IMAP, and the
+    // sync engine records the identical coordinate under `imap-smtp`. Keying by
+    // the configured backend would split one message into two mapping rows.
+    // A message with no UID (a native API message) writes no IMAP mapping.
     if let (Some(folder), Some(uid), Some(uidvalidity)) =
         (&message.folder_id, message.uid, message.uidvalidity)
-        && let Some((mailbox, backend_json)) = conn
+        && let Some(mailbox) = conn
             .query_row(
-                "SELECT f.name, a.backend FROM folders f
-                 JOIN accounts a ON a.id = f.account_id
-                 WHERE f.id = ?1",
+                "SELECT name FROM folders WHERE id = ?1",
                 [&folder.0],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
     {
-        let backend = super::memberships::provider_key_for_json(backend_json.as_deref());
         let remote = ImapCoords::new(mailbox, uidvalidity, uid).encode();
         conn.execute(
             "INSERT INTO remote_messages (account_id, backend_key, remote_id, message_id)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(account_id, backend_key, remote_id) DO UPDATE SET
                  message_id = excluded.message_id",
-            params![message.account_id.0, backend, remote.as_str(), message.id.0],
+            params![
+                message.account_id.0,
+                IMAP_SMTP_BACKEND_KEY,
+                remote.as_str(),
+                message.id.0
+            ],
         )?;
     }
 
@@ -483,11 +498,12 @@ pub(crate) fn messages_on(
     before_date: Option<i64>,
 ) -> Result<Vec<StoredMessage>, StoreError> {
     let sql = format!(
-        "SELECT {COLUMNS} FROM messages m
+        "SELECT {} FROM messages m
          JOIN message_collections mc ON mc.message_id = m.id AND mc.folder_id = ?1
          WHERE (?2 IS NULL OR m.date < ?2)
          ORDER BY m.date DESC, m.rowid DESC
-         LIMIT ?3"
+         LIMIT ?3",
+        columns()
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![folder.0, before_date, i64::from(limit)])?;
@@ -503,7 +519,7 @@ pub(crate) fn message_on(
     conn: &Connection,
     id: &MessageId,
 ) -> Result<Option<StoredMessage>, StoreError> {
-    let sql = format!("SELECT {COLUMNS} FROM messages m WHERE m.id = ?1");
+    let sql = format!("SELECT {} FROM messages m WHERE m.id = ?1", columns());
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([&id.0])?;
     match rows.next()? {
@@ -517,9 +533,10 @@ pub(crate) fn messages_for_account_on(
     account: &AccountId,
 ) -> Result<Vec<StoredMessage>, StoreError> {
     let sql = format!(
-        "SELECT {COLUMNS} FROM messages m
+        "SELECT {} FROM messages m
          WHERE m.account_id = ?1
-         ORDER BY m.date ASC, m.rowid ASC"
+         ORDER BY m.date ASC, m.rowid ASC",
+        columns()
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([&account.0])?;
