@@ -51,9 +51,9 @@ fn message(folder: &Folder, uid: u32, uidvalidity: u32, date: i64) -> StoredMess
     StoredMessage {
         id: MessageId(format!("message-{uid}")),
         account_id: folder.account_id.clone(),
-        folder_id: folder.id.clone(),
-        uid: Uid(uid),
-        uidvalidity,
+        folder_id: Some(folder.id.clone()),
+        uid: Some(Uid(uid)),
+        uidvalidity: Some(uidvalidity),
         header: MessageHeader {
             message_id: Some(format!("<{uid}@example.com>")),
             in_reply_to: None,
@@ -238,12 +238,12 @@ fn messages_page_by_date_and_delete_below_uid() {
 
     let page = store.messages(&folder.id, 2, None).unwrap();
     assert_eq!(page.len(), 2);
-    assert_eq!(page[0].uid, Uid(5));
-    assert_eq!(page[1].uid, Uid(4));
+    assert_eq!(page[0].uid, Some(Uid(5)));
+    assert_eq!(page[1].uid, Some(Uid(4)));
 
     let older = store.messages(&folder.id, 10, Some(1_700_000_003)).unwrap();
     assert_eq!(older.len(), 2);
-    assert_eq!(older[0].uid, Uid(2));
+    assert_eq!(older[0].uid, Some(Uid(2)));
 
     let removed = store.delete_messages_below_uid(&folder.id, Uid(3)).unwrap();
     assert_eq!(removed, 2);

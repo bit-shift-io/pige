@@ -7,13 +7,41 @@ mod v3;
 mod v4;
 mod v5;
 mod v6;
+mod v7;
 
-use rusqlite::OptionalExtension;
+use std::cell::Cell;
+use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::SCHEMA_VERSION;
 
 use super::schema::SCHEMA_SQL;
 use super::{Store, StoreError};
+
+thread_local! {
+    /// Test-only fault injection point for the v7 message-table rebuild. `0`
+    /// means no fault; any other value makes the migration fail at the matching
+    /// step so a test can prove rollback. Thread-local so one test's injection
+    /// can never affect a concurrently running migration in another test.
+    static MIGRATION_FAULT: Cell<u8> = const { Cell::new(0) };
+}
+
+/// Inject a failure into the next migration on this thread (test-only).
+#[doc(hidden)]
+pub fn inject_migration_fault(point: u8) {
+    MIGRATION_FAULT.with(|fault| fault.set(point));
+}
+
+/// Clear any injected migration failure on this thread (test-only).
+#[doc(hidden)]
+pub fn clear_migration_fault() {
+    MIGRATION_FAULT.with(|fault| fault.set(0));
+}
+
+pub(crate) fn migration_fault() -> u8 {
+    MIGRATION_FAULT.with(Cell::get)
+}
 
 impl Store {
     /// Create or upgrade the database to `SCHEMA_VERSION`. Idempotent: calling
@@ -26,56 +54,111 @@ impl Store {
     /// list previews cached before the transfer-encoding decoder landed; v5
     /// versions the account mirror by typed backend; v6 adds durable account
     /// generations, cross-process leases, pending-auth references, and
-    /// generation-fenced checkpoints.
+    /// generation-fenced checkpoints; v7 separates remote message identity from
+    /// collection membership.
     pub fn migrate(&self) -> Result<(), StoreError> {
+        self.migrate_to(SCHEMA_VERSION)
+    }
+
+    /// Upgrade the database to `target` (clamped to [`SCHEMA_VERSION`]).
+    ///
+    /// This is the real migration pipeline; integration tests use it with an
+    /// older `target` to build fixtures from the *actual* historical schema
+    /// rather than a hand-rolled approximation.
+    ///
+    /// The whole upgrade is one transaction. When it reaches v7 it runs on a
+    /// dedicated connection with foreign-key enforcement disabled *before* the
+    /// transaction, because dropping and recreating `messages` must not let the
+    /// child tables' `ON DELETE CASCADE` delete bodies and attachments. That
+    /// connection is discarded afterwards; ordinary store operations always run
+    /// with foreign keys enabled.
+    #[doc(hidden)]
+    pub fn migrate_to(&self, target: u32) -> Result<(), StoreError> {
+        let target = target.min(SCHEMA_VERSION);
         let mut version = self.existing_schema_version()?.unwrap_or(0);
-        if version == SCHEMA_VERSION {
-            return Ok(());
-        }
         if version > SCHEMA_VERSION {
             return Err(StoreError::SchemaTooNew {
                 found: version,
                 supported: SCHEMA_VERSION,
             });
         }
+        if version >= target {
+            return Ok(());
+        }
 
-        let conn = self.connection();
+        // A dedicated migration connection so v7 can toggle `foreign_keys`
+        // before its transaction; it never touches the live store connection.
+        let conn = Connection::open(&self.path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let disable_foreign_keys = version < 7 && target >= 7;
+        if disable_foreign_keys {
+            // Only the v7 rebuild needs this, and only on this dedicated
+            // connection before its transaction. Ordinary store operations —
+            // and every other migration — keep foreign keys enforced.
+            conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        } else {
+            conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        }
+
         let tx = conn.unchecked_transaction()?;
 
-        if version < 1 {
+        if version < 1 && target >= 1 {
             tx.execute_batch(SCHEMA_SQL)?;
             version = 1;
         }
-        if version < 2 {
+        if version < 2 && target >= 2 {
             v2::apply(&tx)?;
             version = 2;
         }
-        if version < 3 {
+        if version < 3 && target >= 3 {
             v3::apply(&tx)?;
             version = 3;
         }
-        if version < 4 {
+        if version < 4 && target >= 4 {
             v4::apply(&tx)?;
             version = 4;
         }
-        if version < 5 {
+        if version < 5 && target >= 5 {
             v5::apply(&tx)?;
             version = 5;
         }
-        if version < 6 {
+        if version < 6 && target >= 6 {
             v6::apply(&tx)?;
             version = 6;
         }
+        if version < 7 && target >= 7 {
+            v7::apply(&tx)?;
+            version = 7;
+        }
 
-        debug_assert_eq!(version, SCHEMA_VERSION);
+        // The rebuild must not leave a dangling reference behind; check before
+        // committing so a violation rolls the whole migration back.
+        if disable_foreign_keys {
+            let violations: i64 =
+                tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })?;
+            if violations > 0 {
+                return Err(StoreError::corrupt(
+                    "migration.foreign_key_check",
+                    violations.to_string(),
+                ));
+            }
+        }
+
+        debug_assert_eq!(version, target);
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [SCHEMA_VERSION.to_string()],
+            [version.to_string()],
         )?;
         tx.commit()?;
 
-        log::debug!("store migrated to schema version {SCHEMA_VERSION}");
+        if disable_foreign_keys {
+            conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        }
+
+        log::debug!("store migrated to schema version {version}");
         Ok(())
     }
 

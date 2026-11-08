@@ -54,13 +54,16 @@ pub(crate) fn search_on(
                  m.date AS date,
                  m.id AS message_id,
                  ROW_NUMBER() OVER (
-                     PARTITION BY f.thread_id ORDER BY m.date DESC, m.uid DESC, m.id DESC
+                     PARTITION BY f.thread_id ORDER BY m.date DESC, m.rowid DESC, m.id DESC
                  ) AS rank
              FROM message_fts f
              JOIN messages m ON m.id = f.message_id
              WHERE message_fts MATCH ?1
                AND (?2 IS NULL OR f.account_id = ?2)
-               AND (?3 IS NULL OR f.folder_id = ?3)
+               AND (?3 IS NULL OR EXISTS (
+                       SELECT 1 FROM message_collections mc
+                       WHERE mc.message_id = m.id AND mc.folder_id = ?3
+                   ))
          )
          SELECT thread_id, account_id, subject, from_json, date
          FROM matches
@@ -92,7 +95,7 @@ pub(crate) fn index_message_on(
 ) -> Result<(), StoreError> {
     let row = conn
         .query_row(
-            "SELECT thread_id, account_id, folder_id, subject, from_json, to_json, cc_json
+            "SELECT thread_id, account_id, subject, from_json, to_json, cc_json
              FROM messages WHERE id = ?1",
             [&message_id.0],
             |row| {
@@ -103,7 +106,6 @@ pub(crate) fn index_message_on(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
                 ))
             },
         )
@@ -114,7 +116,7 @@ pub(crate) fn index_message_on(
         "DELETE FROM message_fts WHERE message_id = ?1",
         [&message_id.0],
     )?;
-    let Some((thread_id, account_id, folder_id, subject, from_json, to_json, cc_json)) = row else {
+    let Some((thread_id, account_id, subject, from_json, to_json, cc_json)) = row else {
         return Ok(());
     };
 
@@ -144,7 +146,9 @@ pub(crate) fn index_message_on(
             message_id.0,
             thread_id,
             account_id,
-            folder_id,
+            // Folder scoping now resolves through `message_collections`, so the
+            // legacy UNINDEXED column carries no authority and is left empty.
+            "",
             subject,
             address_terms(&from),
             address_terms(to.iter().chain(cc.iter())),

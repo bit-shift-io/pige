@@ -310,12 +310,25 @@ fn message_key(message_id: &str) -> String {
 /// Whether a row still carries the pre-threading per-message id
 /// (`{account}:{folder}:{uidvalidity}:{uid}`). These are the only rows the
 /// one-time rethread pass may rewrite; UUID ids are left untouched.
+///
+/// The original folder and UID columns no longer exist on `messages`, but the
+/// *shape* of a legacy id is still recognisable: a four-part colon id scoped to
+/// this account whose last two parts are numbers. Account ids are UUIDs, so no
+/// account id itself contains a colon.
 pub fn is_legacy_thread_id(message: &StoredMessage) -> bool {
-    message.thread_id.0
-        == format!(
-            "{}:{}:{}:{}",
-            message.account_id.0, message.folder_id.0, message.uidvalidity, message.uid.0
-        )
+    let mut parts = message.thread_id.0.split(':');
+    let (Some(account), Some(_folder), Some(uidvalidity), Some(uid), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    account == message.account_id.0
+        && uidvalidity.parse::<u32>().is_ok()
+        && uid.parse::<u32>().is_ok()
 }
 
 #[cfg(test)]

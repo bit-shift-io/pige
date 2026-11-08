@@ -1,13 +1,14 @@
 //! Incremental read-path sync for one account.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::account::{Account, AccountId};
 use crate::mail::{
     Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner, ThreadId, Uid,
     sender_display, thread::participants_of,
 };
-use crate::store::{Store, StoreError};
+use crate::providers::IMAP_SMTP_PROVIDER;
+use crate::store::{ImapCoords, Store, StoreError};
 use crate::transport::{MailTransport, RemoteFolder, RemoteMessage, TransportError, UidRange};
 
 /// How many bytes of each message to fetch to fill snippets. The prefix
@@ -193,11 +194,22 @@ pub(crate) async fn sync_folder(
         Some(high_water) => (Uid(high_water), Uid(state.uidnext.saturating_sub(1))),
     };
 
-    // Cached messages that predate this sync, for flag reconciliation.
+    // Cached messages that predate this sync, for flag reconciliation. Their
+    // IMAP UIDs are decoded from the durable remote mapping, not a column.
     let cached = store
         .messages(&folder_id, u32::MAX, None)
         .map_err(|e| format!("read {}: {e}", remote.name))?;
-    let mut cached_uids: Vec<Uid> = cached.iter().map(|m| m.uid).collect();
+    let cached_uids_by_id: HashMap<MessageId, Uid> = cached
+        .iter()
+        .filter_map(|message| {
+            store
+                .imap_coords(&message.id)
+                .ok()
+                .flatten()
+                .map(|coords| (message.id.clone(), coords.uid))
+        })
+        .collect();
+    let mut cached_uids: Vec<Uid> = cached_uids_by_id.values().copied().collect();
     cached_uids.sort_unstable();
 
     // Fetch and store headers for the new UIDs.
@@ -210,9 +222,17 @@ pub(crate) async fn sync_folder(
         Vec::new()
     };
 
-    let mut inserted: Vec<StoredMessage> = Vec::new();
+    let mut inserted: Vec<(Uid, StoredMessage)> = Vec::new();
     for message in &fetched {
-        let id = MessageId::new();
+        // The IMAP remote identity names this message durably. Re-syncing an
+        // already-cached copy resolves to its existing local id instead of
+        // creating a duplicate content row.
+        let remote_id =
+            ImapCoords::new(remote.name.clone(), state.uidvalidity, message.uid).encode();
+        let id = store
+            .remote_message_for(&account_id, IMAP_SMTP_PROVIDER, &remote_id)
+            .map_err(|e| format!("read remote {}: {e}", remote.name))?
+            .unwrap_or_else(MessageId::new);
         let mut header = message.header.clone();
         // The transport-reported RFC822.SIZE is authoritative over the size the
         // header parser leaves at 0.
@@ -227,18 +247,18 @@ pub(crate) async fn sync_folder(
                 .map_err(|e| format!("merge {}: {e}", remote.name))?;
             // Messages inserted earlier in this batch still carry the losing id
             // in memory; keep their snippet upserts on the survivor.
-            for stored in &mut inserted {
+            for (_, stored) in &mut inserted {
                 if stored.thread_id == from {
                     stored.thread_id = into.clone();
                 }
             }
         }
         let stored = StoredMessage {
-            id,
+            id: id.clone(),
             account_id: account_id.clone(),
-            folder_id: folder_id.clone(),
-            uid: message.uid,
-            uidvalidity: state.uidvalidity,
+            folder_id: Some(folder_id.clone()),
+            uid: Some(message.uid),
+            uidvalidity: Some(state.uidvalidity),
             header,
             flags: message.flags,
             thread_id,
@@ -248,26 +268,27 @@ pub(crate) async fn sync_folder(
         store
             .upsert_message(&stored)
             .map_err(|e| format!("store {}: {e}", remote.name))?;
-        inserted.push(stored);
+        store
+            .set_remote_message(&account_id, IMAP_SMTP_PROVIDER, &remote_id, &id)
+            .map_err(|e| format!("map {}: {e}", remote.name))?;
+        inserted.push((message.uid, stored));
     }
 
     // Fill snippets for the newest messages without fetching full bodies. New
     // messages are read first; cached messages whose snippet is empty are
     // refilled too, which restores previews cleared by the v4 repair migration.
-    let mut own_ids: std::collections::HashMap<Uid, MessageId> = inserted
+    let mut own_ids: HashMap<Uid, MessageId> = inserted
         .iter()
-        .map(|message| (message.uid, message.id.clone()))
-        .chain(
-            cached
-                .iter()
-                .map(|message| (message.uid, message.id.clone())),
-        )
+        .map(|(uid, message)| (*uid, message.id.clone()))
         .collect();
+    for (id, uid) in &cached_uids_by_id {
+        own_ids.insert(*uid, id.clone());
+    }
     let mut newest: Vec<Uid> = fetched.iter().map(|m| m.uid).collect();
     let mut missing: Vec<Uid> = cached
         .iter()
         .filter(|message| message.snippet.trim().is_empty())
-        .map(|message| message.uid)
+        .filter_map(|message| cached_uids_by_id.get(&message.id).copied())
         .collect();
     newest.append(&mut missing);
     newest.sort_unstable_by(|a, b| b.cmp(a));
@@ -299,15 +320,23 @@ pub(crate) async fn sync_folder(
             .map_err(|e| format!("flags {}: {e}", remote.name))?;
         let returned: HashSet<Uid> = flags.iter().map(|(uid, _)| *uid).collect();
         for (uid, flag) in &flags {
-            if let Some(stored) = cached.iter().find(|m| m.uid == *uid) {
+            if let Some(id) = cached_uids_by_id
+                .iter()
+                .find(|(_, candidate)| *candidate == uid)
+                .map(|(id, _)| id)
+            {
                 store
-                    .set_flags(&stored.id, flag)
+                    .set_flags(id, flag)
                     .map_err(|e| format!("flags {}: {e}", remote.name))?;
             }
         }
         let expunged: Vec<MessageId> = cached
             .iter()
-            .filter(|message| !returned.contains(&message.uid))
+            .filter(|message| {
+                cached_uids_by_id
+                    .get(&message.id)
+                    .is_some_and(|uid| !returned.contains(uid))
+            })
             .map(|message| message.id.clone())
             .collect();
         if !expunged.is_empty() {
@@ -346,10 +375,10 @@ pub(crate) async fn sync_folder(
         return Ok(Vec::new());
     }
     let mut sorted = inserted;
-    sorted.sort_unstable_by_key(|m| std::cmp::Reverse(m.uid));
+    sorted.sort_unstable_by_key(|(uid, _)| std::cmp::Reverse(*uid));
     Ok(sorted
         .into_iter()
-        .map(|m| NewMailSummary {
+        .map(|(_, m)| NewMailSummary {
             account_id: account_id.clone(),
             folder_id: folder_id.clone(),
             thread_id: m.thread_id.clone(),

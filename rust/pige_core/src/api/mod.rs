@@ -36,7 +36,7 @@ use crate::search::{SearchHit, SearchScope};
 use crate::send::{
     self, OutboxEntry, OutboxId, OutgoingMessage, compose::forward_message, compose::reply_message,
 };
-use crate::store::{Body, PrefetchCandidate, Store};
+use crate::store::{Body, ImapCoords, PrefetchCandidate, Store};
 use crate::sync::sync_account as run_sync_account;
 use crate::transport::{Capabilities, RemoteFolder, UidRange};
 
@@ -1656,11 +1656,8 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
             let (account, folder_row) = locate_folder(&state.store, folder)?;
             let oldest = state
                 .store
-                .messages(folder, u32::MAX, None)
-                .map_err(|error| format!("read cached messages: {error}"))?
-                .iter()
-                .map(|message| message.uid)
-                .min();
+                .oldest_uid_in_folder(folder)
+                .map_err(|error| format!("read oldest uid: {error}"))?;
             let sender = state.events.clone();
             (
                 Some(BackfillRequest {
@@ -1876,10 +1873,22 @@ fn prefetch_candidate_is_current(state: &AppState, candidate: &PrefetchCandidate
             .ok()
             .flatten()
             .is_some_and(|m| {
+                let in_folder = state
+                    .store
+                    .message_memberships(&m.id)
+                    .map(|memberships| memberships.contains(&candidate.folder_id))
+                    .unwrap_or(false);
+                let same_remote = state
+                    .store
+                    .imap_coords(&m.id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|coords| {
+                        coords.uid == candidate.uid && coords.uidvalidity == candidate.uidvalidity
+                    });
                 m.account_id == candidate.account_id
-                    && m.folder_id == candidate.folder_id
-                    && m.uid == candidate.uid
-                    && m.uidvalidity == candidate.uidvalidity
+                    && in_folder
+                    && same_remote
                     && m.header.size <= MAX_BODY_BYTES
             })
 }
@@ -1893,7 +1902,7 @@ fn prefetch_candidate_is_current(state: &AppState, candidate: &PrefetchCandidate
 /// `body: None` so the reader always renders its chrome even offline.
 pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
     // Phase 1: read the conversation, its cached body, and the fetch decision.
-    let (messages, config, account, folder, cached, too_large, events, initial, generation) = {
+    let (messages, config, account, folder, uid, cached, too_large, events, initial, generation) = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
@@ -1912,13 +1921,26 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             .into_iter()
             .find(|account| account.id == messages[0].account_id)
             .ok_or_else(|| "conversation account missing".to_string())?;
+        let location = state
+            .store
+            .message_location(&messages[0].id)
+            .map_err(|error| format!("read message location: {error}"))?
+            .ok_or_else(|| "conversation message missing".to_string())?;
         let folder = state
             .store
             .folders(&account.id)
             .map_err(|error| format!("read folders: {error}"))?
             .into_iter()
-            .find(|folder| folder.id == messages[0].folder_id)
+            .find(|folder| folder.id == location.folder_id)
             .ok_or_else(|| "conversation folder missing".to_string())?;
+        // IMAP coordinates are optional: a native provider message has none and
+        // simply opens its cached body (or an empty reader) without a fetch.
+        let uid = state
+            .store
+            .imap_coords(&messages[0].id)
+            .ok()
+            .flatten()
+            .map(|coords| coords.uid);
         let cached = state
             .store
             .body(&messages[0].id)
@@ -1946,6 +1968,7 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             state.config.clone(),
             account,
             folder,
+            uid,
             cached,
             too_large,
             state.events.clone(),
@@ -1960,12 +1983,15 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
 
     // Phase 2: fetch raw bytes only when uncached and under the size cap.
     let fetched = if cached.is_none() && !too_large {
-        match fetch_body_bytes(&config, &account, &folder, &messages[0]).await {
-            Ok(raw) => Some(raw),
-            Err(error) => {
-                log::warn!("open conversation {thread_id}: {error}");
-                None
-            }
+        match uid {
+            Some(uid) => match fetch_body_bytes(&config, &account, &folder, uid).await {
+                Ok(raw) => Some(raw),
+                Err(error) => {
+                    log::warn!("open conversation {thread_id}: {error}");
+                    None
+                }
+            },
+            None => None,
         }
     } else {
         None
@@ -2268,7 +2294,7 @@ pub fn open_url(url: &str) -> Result<(), String> {
 /// hands the file to [`Opener::open_file`]. Parts over
 /// [`crate::mail::MAX_ATTACHMENT_BYTES`] are rejected before they are written.
 pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf, String> {
-    let (config, account, folder, stored_message, stored_part, cached_path) = {
+    let (config, account, folder, uid, stored_part, cached_path) = {
         let guard = lock_state();
         let state = guard
             .as_ref()
@@ -2279,13 +2305,24 @@ pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf,
             .message(message)
             .map_err(|error| format!("read message: {error}"))?
             .ok_or_else(|| format!("unknown message {message}"))?;
+        let uid = state
+            .store
+            .imap_coords(&stored_message.id)
+            .ok()
+            .flatten()
+            .map(|coords| coords.uid);
         let account = find_account(&state.store, &stored_message.account_id)?;
+        let location = state
+            .store
+            .message_location(message)
+            .map_err(|error| format!("read message location: {error}"))?
+            .ok_or_else(|| format!("unknown message {message}"))?;
         let folder = state
             .store
             .folders(&account.id)
             .map_err(|error| format!("read folders: {error}"))?
             .into_iter()
-            .find(|folder| folder.id == stored_message.folder_id)
+            .find(|folder| folder.id == location.folder_id)
             .ok_or_else(|| "message folder is not cached".to_string())?;
 
         let stored = state
@@ -2302,7 +2339,7 @@ pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf,
             state.config.clone(),
             account,
             folder,
-            stored_message,
+            uid,
             stored_part,
             cached_path,
         )
@@ -2317,7 +2354,10 @@ pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf,
                 check_attachment_size(part.size).map_err(|error| error.to_string())?;
             }
 
-            let raw = fetch_body_bytes(&config, &account, &folder, &stored_message).await?;
+            let Some(uid) = uid else {
+                return Err("this message has no IMAP identity to fetch".to_string());
+            };
+            let raw = fetch_body_bytes(&config, &account, &folder, uid).await?;
             let parts = extract_attachments(&raw);
             let part_meta = parts
                 .iter()
@@ -2390,7 +2430,7 @@ async fn fetch_body_bytes(
     config: &Config,
     account: &Account,
     folder: &Folder,
-    message: &StoredMessage,
+    uid: Uid,
 ) -> Result<Vec<u8>, String> {
     let mut transport = config
         .transport
@@ -2407,9 +2447,9 @@ async fn fetch_body_bytes(
         .await
         .map_err(|error| format!("select {}: {error}", folder.name))?;
     transport
-        .fetch_body(message.uid)
+        .fetch_body(uid)
         .await
-        .map_err(|error| format!("fetch body {}: {error}", message.uid))
+        .map_err(|error| format!("fetch body {uid}: {error}"))
 }
 
 /// Resolve the newest message's body: too-large wins, then the cached body,
@@ -2662,6 +2702,12 @@ async fn backfill_older(
         } = message.clone();
         let mut header = header;
         header.size = size;
+        let remote_id = ImapCoords::new(folder.name.clone(), uidvalidity, uid).encode();
+        // A re-page of an already-cached UID reuses its local content id.
+        let id = store
+            .remote_message_for(&account.id, crate::providers::IMAP_SMTP_PROVIDER, &remote_id)
+            .map_err(|error| format!("read remote older {}: {error}", folder.name))?
+            .unwrap_or_else(MessageId::new);
         let participants = participants_of(&header);
         let thread_id = threads.assign(&account.id, &header, header.date, &participants);
         for (from, into) in threads.take_merges() {
@@ -2670,11 +2716,11 @@ async fn backfill_older(
                 .map_err(|error| format!("merge older {}: {error}", folder.name))?;
         }
         let stored = StoredMessage {
-            id: MessageId::new(),
+            id: id.clone(),
             account_id: account.id.clone(),
-            folder_id: folder.id.clone(),
-            uid,
-            uidvalidity,
+            folder_id: Some(folder.id.clone()),
+            uid: Some(uid),
+            uidvalidity: Some(uidvalidity),
             header,
             flags,
             thread_id,
@@ -2684,6 +2730,14 @@ async fn backfill_older(
         store
             .upsert_message(&stored)
             .map_err(|error| format!("store older {}: {error}", folder.name))?;
+        store
+            .set_remote_message(
+                &account.id,
+                crate::providers::IMAP_SMTP_PROVIDER,
+                &remote_id,
+                &id,
+            )
+            .map_err(|error| format!("map older {}: {error}", folder.name))?;
     }
 
     // Older headers can carry unread flags, so refresh the folder rollups too.

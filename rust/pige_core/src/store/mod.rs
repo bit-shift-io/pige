@@ -6,20 +6,23 @@ mod attachments;
 mod bodies;
 mod folders;
 mod jobs;
+mod memberships;
 mod messages;
 mod migrations;
+mod remote_ids;
 mod schema;
 mod search;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::account::{Account, AccountId};
-use crate::mail::{Conversation, Folder, FolderId};
+use crate::mail::{Conversation, Folder, FolderId, MessageId};
+use crate::providers::{RemoteCollectionId, RemoteMessageId};
 
 use accounts::accounts_on;
 use folders::{folder_total_on, folders_on};
@@ -29,6 +32,12 @@ pub use attachments::StoredAttachment;
 pub use bodies::Body;
 pub use jobs::{AccountLease, INITIAL_GENERATION, PendingAuthRecord};
 pub use messages::PrefetchCandidate;
+pub use remote_ids::{IMAP_SMTP_BACKEND_KEY, ImapCoords, MessageLocation};
+
+/// Test-only hooks for migration fault injection. Never called in production;
+/// exported so integration tests can exercise rollback paths.
+#[doc(hidden)]
+pub use migrations::{clear_migration_fault, inject_migration_fault};
 
 /// A consistent read of the cache used to build one UI snapshot.
 #[derive(Debug, Default)]
@@ -80,6 +89,15 @@ pub enum StoreError {
     /// The caller's lease was taken over by another process before it wrote.
     #[error("account lease was lost before the write")]
     LeaseLost,
+    /// A local message has no remote mapping, so its remote identity is unknown.
+    #[error("message {0} has no remote mapping")]
+    NoRemoteMessage(MessageId),
+    /// A change referenced a provider collection that has not been cached yet.
+    #[error("unknown remote collection {0}")]
+    UnknownRemoteCollection(RemoteCollectionId),
+    /// A change referenced a provider message that has not been cached yet.
+    #[error("unknown remote message {0}")]
+    UnknownRemoteMessage(RemoteMessageId),
 }
 
 impl StoreError {
@@ -96,6 +114,11 @@ impl StoreError {
 /// operation and never across an await.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The database path. Kept so the migration can open a dedicated
+    /// connection and, for the message-table rebuild only, run with foreign-key
+    /// enforcement disabled before its transaction; ordinary store operations
+    /// never touch the path or disable foreign keys.
+    path: PathBuf,
     /// Process-local per-account gate. A synchronous mutex that serializes
     /// credential writes against invalidation/removal *within this process*;
     /// the durable half of the gate (generation + lease) lives in `jobs`.
@@ -119,6 +142,7 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path: path.to_path_buf(),
             gates: Mutex::new(HashMap::new()),
         })
     }

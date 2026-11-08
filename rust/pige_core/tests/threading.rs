@@ -246,9 +246,9 @@ fn rethread_legacy_thread_ids_groups_existing_mail_and_keeps_uuid_threads() {
                    thread_id: ThreadId| StoredMessage {
         id: MessageId(format!("message-{uid}")),
         account_id: account.id.clone(),
-        folder_id: folder.id.clone(),
-        uid: Uid(uid),
-        uidvalidity: 1,
+        folder_id: Some(folder.id.clone()),
+        uid: Some(Uid(uid)),
+        uidvalidity: Some(1),
         header: MessageHeader {
             message_id: Some(message_id.to_string()),
             in_reply_to: references.last().cloned(),
@@ -304,15 +304,15 @@ fn rethread_legacy_thread_ids_groups_existing_mail_and_keeps_uuid_threads() {
     let messages = store.messages(&folder.id, 10, None).unwrap();
     let first = messages
         .iter()
-        .find(|message| message.uid == Uid(1))
+        .find(|message| message.uid == Some(Uid(1)))
         .unwrap();
     let second = messages
         .iter()
-        .find(|message| message.uid == Uid(2))
+        .find(|message| message.uid == Some(Uid(2)))
         .unwrap();
     let stable = messages
         .iter()
-        .find(|message| message.uid == Uid(3))
+        .find(|message| message.uid == Some(Uid(3)))
         .unwrap();
 
     assert_eq!(first.thread_id, second.thread_id);
@@ -636,9 +636,9 @@ async fn open_conversation_returns_every_message_in_the_thread() {
         let mut message = StoredMessage {
             id: MessageId(format!("message-{uid}")),
             account_id: account_id.clone(),
-            folder_id: folder.id.clone(),
-            uid: Uid(uid),
-            uidvalidity: 1,
+            folder_id: Some(folder.id.clone()),
+            uid: Some(Uid(uid)),
+            uidvalidity: Some(1),
             header: MessageHeader {
                 message_id: Some(format!("<{uid}@example.com>")),
                 in_reply_to: None,

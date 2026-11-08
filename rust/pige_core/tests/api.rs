@@ -154,9 +154,9 @@ fn stored_message(folder: &Folder, uid: u32) -> StoredMessage {
     StoredMessage {
         id: MessageId(format!("message-{uid}")),
         account_id: folder.account_id.clone(),
-        folder_id: folder.id.clone(),
-        uid: Uid(uid),
-        uidvalidity: 1,
+        folder_id: Some(folder.id.clone()),
+        uid: Some(Uid(uid)),
+        uidvalidity: Some(1),
         header: MessageHeader {
             message_id: Some(format!("<{uid}@example.com>")),
             in_reply_to: None,
@@ -860,11 +860,11 @@ async fn load_older_threads_reference_chain_before_subject_fallback() {
         .expect("read cached messages");
     let parent = messages
         .iter()
-        .find(|message| message.uid == Uid(1))
+        .find(|message| message.uid == Some(Uid(1)))
         .expect("backfilled parent");
     let child = messages
         .iter()
-        .find(|message| message.uid == Uid(2))
+        .find(|message| message.uid == Some(Uid(2)))
         .expect("backfilled child");
 
     // Alpha and Beta must join through References, not the subject fallback.
@@ -1195,7 +1195,7 @@ async fn prefetch_does_not_cache_when_local_message_epoch_changes_during_fetch()
     let inbox = store.folders(&account).unwrap().remove(0);
     let mut replacement = stored_message(&inbox, 1);
     replacement.id = MessageId("inbox-message-1".into());
-    replacement.uidvalidity = 2;
+    replacement.uidvalidity = Some(2);
     store.upsert_message(&replacement).unwrap();
     pause.add_permits(1);
     prefetch.await.unwrap();
@@ -1277,7 +1277,7 @@ async fn prefetch_caches_inbox_bodies_when_enabled() {
     let mut oversized = boundary.clone();
     oversized.id = MessageId("oversized".into());
     oversized.thread_id = ThreadId("oversized".into());
-    oversized.uid = Uid(3);
+    oversized.uid = Some(Uid(3));
     oversized.header.size += 1;
     store.upsert_message(&oversized).unwrap();
     api::prefetch_bodies().await;
@@ -1500,11 +1500,13 @@ async fn delayed_mutation_of_a_does_not_cancel_a_newer_open_of_b() {
         pause.add_permits(1);
         // Move follows removal with a destination sync. The fake shares B's
         // session, so observe the removal, then release B before awaiting it.
+        // The optimistic removal drops the folder *membership*; the content row
+        // (and its body) is deliberately preserved.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while store
-                .message(&MessageId("inbox-message-1".into()))
+            while !store
+                .message_memberships(&MessageId("inbox-message-1".into()))
                 .unwrap()
-                .is_some()
+                .is_empty()
             {
                 tokio::task::yield_now().await;
             }

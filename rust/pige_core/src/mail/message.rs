@@ -71,15 +71,27 @@ impl Flags {
     }
 }
 
-/// A cached message row. `thread_id` is assigned at insert time; until real
-/// threading lands each message gets its own thread.
+/// A cached message row. This is the **content identity** of a message: the
+/// persisted row is keyed by the local [`MessageId`] and carries no folder or
+/// mailbox UID columns. Folder membership lives in `message_collections` and
+/// remote identity lives in `remote_messages`; both are many-to-many-safe.
+///
+/// The `folder_id` and `uid`/`uidvalidity` fields are **projections**, not
+/// columns. On read they are resolved from the message's memberships and its
+/// IMAP remote mapping; on write they are hints. `upsert_message` records an
+/// IMAP remote mapping only when `uid` and `uidvalidity` are both present, and
+/// a message with no UID (for example a native API message) simply has neither.
+/// No UID field is mandatory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub id: MessageId,
     pub account_id: AccountId,
-    pub folder_id: super::FolderId,
-    pub uid: Uid,
-    pub uidvalidity: u32,
+    /// The folder read scope, when the row was read under one. Never identity.
+    pub folder_id: Option<super::FolderId>,
+    /// IMAP UID, populated from the remote mapping when the message has one.
+    pub uid: Option<Uid>,
+    /// IMAP UIDVALIDITY epoch for `uid`.
+    pub uidvalidity: Option<u32>,
     pub header: MessageHeader,
     pub flags: Flags,
     pub thread_id: ThreadId,

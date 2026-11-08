@@ -403,14 +403,33 @@ fn resolve_target(state: &AppState, thread: &ThreadId) -> Result<Target, String>
         .ok_or_else(|| "conversation folder missing".to_string())?;
     let messages: Vec<StoredMessage> = messages
         .into_iter()
-        .filter(|message| message.folder_id == folder_id)
+        .filter(|message| {
+            state
+                .store
+                .message_memberships(&message.id)
+                .map(|memberships| memberships.contains(&folder_id))
+                .unwrap_or(false)
+        })
         .collect();
     if messages.is_empty() {
         return Err(format!(
             "conversation {thread} has no messages in the current folder"
         ));
     }
-    let uids = messages.iter().map(|message| message.uid).collect();
+    let uids: Vec<Uid> = messages
+        .iter()
+        .filter_map(|message| {
+            state
+                .store
+                .imap_coords(&message.id)
+                .ok()
+                .flatten()
+                .map(|coords| coords.uid)
+        })
+        .collect();
+    if uids.len() != messages.len() {
+        return Err("a message in this conversation has no IMAP identity".to_string());
+    }
     Ok(Target {
         account,
         folder,
@@ -451,6 +470,10 @@ fn remote_folder(folder: &Folder) -> RemoteFolder {
 }
 
 /// Apply the optimistic local removal and clear the stale reader selection.
+///
+/// Only the current folder's membership is removed: the content, its body, and
+/// any other collection membership survive, so a rollback restores the view
+/// without re-downloading anything.
 fn remove_optimistically(target: &Target, sender: &Sender) -> Result<(), String> {
     {
         let mut guard = lock_state();
@@ -460,10 +483,12 @@ fn remove_optimistically(target: &Target, sender: &Sender) -> Result<(), String>
             .iter()
             .map(|message| message.id.clone())
             .collect();
-        state
-            .store
-            .delete_messages(&ids)
-            .map_err(|error| format!("delete conversation: {error}"))?;
+        for message in &target.messages {
+            state
+                .store
+                .remove_membership(&message.id, &target.folder.id)
+                .map_err(|error| format!("remove conversation: {error}"))?;
+        }
         if state.selected_conversation.as_ref().is_some_and(|detail| {
             detail.account_id == target.account.id
                 && detail
@@ -492,12 +517,12 @@ fn conclude(
     outcome.map(|()| snapshot())
 }
 
-/// Restore the rows removed by an optimistic mutation.
+/// Restore the memberships removed by an optimistic mutation.
 fn rollback_removal(target: &Target) {
     let mut guard = lock_state();
     if let Some(state) = guard.as_mut() {
         for message in &target.messages {
-            if let Err(error) = state.store.upsert_message(message) {
+            if let Err(error) = state.store.add_membership(&message.id, &target.folder.id) {
                 log::error!("rollback message {}: {error}", message.id);
             }
         }

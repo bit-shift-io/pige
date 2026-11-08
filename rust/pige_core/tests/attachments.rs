@@ -174,9 +174,9 @@ fn message(folder: &Folder, thread: &str) -> StoredMessage {
     StoredMessage {
         id: MessageId("message-1".to_string()),
         account_id: folder.account_id.clone(),
-        folder_id: folder.id.clone(),
-        uid: Uid(1),
-        uidvalidity: 1,
+        folder_id: Some(folder.id.clone()),
+        uid: Some(Uid(1)),
+        uidvalidity: Some(1),
         header: MessageHeader {
             message_id: Some("<report@example.com>".to_string()),
             in_reply_to: None,

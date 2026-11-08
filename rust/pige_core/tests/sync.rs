@@ -4,12 +4,21 @@ use std::collections::{HashMap, HashSet};
 
 use pige_core::{
     Account, AccountId, Address, AuthKind, Flags, FolderKind, MailBackend, MessageHeader, Security,
-    ServerConfig, Store, Uid,
+    ServerConfig, Store, StoredMessage, Uid,
     search::{SearchScope, search},
     sync::sync_account,
     transport::{FakeTransport, FolderState, RemoteFolder, RemoteMessage, UidRange},
 };
 use tempfile::TempDir;
+
+/// The IMAP UID a cached message was stored under, decoded from its mapping.
+fn uid_of(store: &Store, message: &StoredMessage) -> Uid {
+    store
+        .imap_coords(&message.id)
+        .unwrap()
+        .expect("cached message has IMAP coordinates")
+        .uid
+}
 
 fn account() -> Account {
     Account {
@@ -115,7 +124,7 @@ async fn first_sync_inserts_newest_headers_and_reports_inbox_mail() {
 
     let messages = store.messages(&folders[0].id, 10, None).unwrap();
     assert_eq!(messages.len(), 5);
-    assert_eq!(messages[0].uid, Uid(5)); // newest first
+    assert_eq!(uid_of(&store, &messages[0]), Uid(5)); // newest first
 
     assert_eq!(report.new_inbox.len(), 5);
     assert_eq!(report.new_inbox[0].subject, "five");
@@ -223,7 +232,10 @@ async fn uidvalidity_change_drops_stale_messages_and_refetches() {
     let folders = store.folders(&account.id).unwrap();
     let messages = store.messages(&folders[0].id, 20, None).unwrap();
     assert_eq!(messages.len(), 2);
-    assert!(messages.iter().all(|m| m.uidvalidity == 2));
+    assert!(messages.iter().all(|m| store
+        .imap_coords(&m.id)
+        .unwrap()
+        .is_some_and(|coords| coords.uidvalidity == 2)));
     let subjects: Vec<&str> = messages.iter().map(|m| m.header.subject.as_str()).collect();
     assert!(subjects.contains(&"fresh-one"));
     assert!(subjects.contains(&"fresh-two"));
@@ -271,7 +283,7 @@ async fn flag_changes_are_reconciled_without_refetching_headers() {
 
     let folders = store.folders(&account.id).unwrap();
     let messages = store.messages(&folders[0].id, 20, None).unwrap();
-    let seen = messages.iter().find(|m| m.uid == Uid(1)).unwrap();
+    let seen = messages.iter().find(|m| uid_of(&store, m) == Uid(1)).unwrap();
     assert!(seen.flags.seen);
 
     // Headers were not refetched for already-cached UIDs.
@@ -326,7 +338,7 @@ async fn expunged_uids_are_removed_from_the_cache_and_search() {
 
     let remaining = store.messages(&folder_id, 10, None).unwrap();
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].uid, Uid(1));
+    assert_eq!(uid_of(&store, &remaining[0]), Uid(1));
     assert!(
         search(&store, "expungeme", &SearchScope::AllAccounts, 10)
             .unwrap()
@@ -366,7 +378,7 @@ async fn newest_snippets_are_filled_without_fetching_full_bodies() {
     let stored = store.messages(&folders[0].id, 200, None).unwrap();
     assert_eq!(stored.len(), 100);
     for message in &stored {
-        assert_eq!(message.snippet, format!("snippet {}", message.uid.0));
+        assert_eq!(message.snippet, format!("snippet {}", uid_of(&store, message).0));
     }
 
     // Full bodies were never fetched.

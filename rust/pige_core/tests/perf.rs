@@ -84,9 +84,9 @@ fn seed(store: &Store) {
         let message = StoredMessage {
             id: MessageId(format!("message-{index}")),
             account_id: account.id.clone(),
-            folder_id: inbox.id.clone(),
-            uid: Uid(index + 1),
-            uidvalidity: 1,
+            folder_id: Some(inbox.id.clone()),
+            uid: Some(Uid(index + 1)),
+            uidvalidity: Some(1),
             header: MessageHeader {
                 message_id: Some(format!("<{index}@example.com>")),
                 in_reply_to: None,

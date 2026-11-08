@@ -27,11 +27,11 @@ pub use mail::{
     StoredMessage, ThreadAssigner, ThreadId, Uid,
 };
 pub use search::{SearchHit, SearchScope, fts_query, search};
-pub use store::{Body, Store, StoreError};
+pub use store::{Body, ImapCoords, MessageLocation, Store, StoreError};
 
 /// Bumped whenever the persisted schema changes; later tasks version the store
 /// against this so a mismatched database can be migrated or rebuilt.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 #[cfg(test)]
 mod tests {

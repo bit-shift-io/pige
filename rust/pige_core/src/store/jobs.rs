@@ -74,8 +74,8 @@ fn ttl_ms(ttl: Duration) -> i64 {
 
 /// The compare-and-set generation check executed *inside* a caller's SQLite
 /// transaction, so it cannot be split from the write it fences.
-fn check_generation_in(
-    tx: &rusqlite::Transaction<'_>,
+pub(crate) fn check_generation_in(
+    tx: &rusqlite::Connection,
     account: &AccountId,
     expected: u64,
 ) -> Result<(), StoreError> {
@@ -90,6 +90,41 @@ fn check_generation_in(
     if actual != expected {
         return Err(StoreError::StaleGeneration { expected, actual });
     }
+    Ok(())
+}
+
+/// Store a job cursor inside a caller-owned transaction, re-checking the
+/// generation and refusing to regress an existing checkpoint. Factored out so
+/// [`Store::apply_change_page`](crate::store::Store::apply_change_page) can
+/// commit the page's changes and its checkpoint atomically.
+pub(crate) fn set_checkpoint_in(
+    conn: &rusqlite::Connection,
+    key: &JobKey,
+    generation: u64,
+    cursor: &ProviderCursor,
+) -> Result<(), StoreError> {
+    let job_key = serde_json::to_string(key)?;
+    let cursor_json = serde_json::to_string(cursor)?;
+    check_generation_in(conn, &key.account, generation)?;
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT generation FROM job_checkpoints WHERE job_key = ?1",
+            [&job_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing
+        && existing as u64 > generation
+    {
+        return Err(StoreError::StaleCheckpoint { generation });
+    }
+    conn.execute(
+        "INSERT INTO job_checkpoints (job_key, generation, cursor) VALUES (?1, ?2, ?3)
+         ON CONFLICT(job_key) DO UPDATE SET
+             generation = excluded.generation,
+             cursor = excluded.cursor",
+        params![job_key, generation as i64, cursor_json],
+    )?;
     Ok(())
 }
 
@@ -447,32 +482,9 @@ impl Store {
         generation: u64,
         cursor: &ProviderCursor,
     ) -> Result<(), StoreError> {
-        let job_key = serde_json::to_string(key)?;
-        let cursor_json = serde_json::to_string(cursor)?;
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        // Re-check inside the transaction: a plain `check_generation` beforehand
-        // could be split from this write by a concurrent invalidation.
-        check_generation_in(&tx, &key.account, generation)?;
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT generation FROM job_checkpoints WHERE job_key = ?1",
-                [&job_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(existing) = existing
-            && existing as u64 > generation
-        {
-            return Err(StoreError::StaleCheckpoint { generation });
-        }
-        tx.execute(
-            "INSERT INTO job_checkpoints (job_key, generation, cursor) VALUES (?1, ?2, ?3)
-             ON CONFLICT(job_key) DO UPDATE SET
-                 generation = excluded.generation,
-                 cursor = excluded.cursor",
-            params![job_key, generation as i64, cursor_json],
-        )?;
+        set_checkpoint_in(&tx, key, generation, cursor)?;
         tx.commit()?;
         Ok(())
     }

@@ -129,9 +129,9 @@ fn seed_account_data(store: &Store, owner: &AccountId, tag: &str) {
     let message = StoredMessage {
         id: MessageId(format!("{tag}-message")),
         account_id: owner.clone(),
-        folder_id: folder.id.clone(),
-        uid: Uid(1),
-        uidvalidity: 1,
+        folder_id: Some(folder.id.clone()),
+        uid: Some(Uid(1)),
+        uidvalidity: Some(1),
         header: MessageHeader {
             message_id: Some(format!("<{tag}@example.com>")),
             in_reply_to: None,

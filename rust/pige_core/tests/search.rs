@@ -70,9 +70,9 @@ fn message(
     StoredMessage {
         id: MessageId(format!("{}-message-{uid}", folder.id.0)),
         account_id: folder.account_id.clone(),
-        folder_id: folder.id.clone(),
-        uid: Uid(uid),
-        uidvalidity: 1,
+        folder_id: Some(folder.id.clone()),
+        uid: Some(Uid(uid)),
+        uidvalidity: Some(1),
         header: MessageHeader {
             message_id: Some(format!("<{uid}@example.com>")),
             in_reply_to: None,

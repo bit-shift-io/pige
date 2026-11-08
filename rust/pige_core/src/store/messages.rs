@@ -1,4 +1,11 @@
-//! Message persistence, flag updates, paging, and conversation aggregation.
+//! Message persistence, folder membership, flag updates, paging, and
+//! conversation aggregation.
+//!
+//! `messages` holds content identity only, keyed by the local [`MessageId`].
+//! Folder membership is a separate many-to-many relation (`message_collections`)
+//! and remote identity lives in `remote_messages`; neither is content. Queries
+//! that need a folder project it in, so the same content can appear under many
+//! labels without being duplicated.
 
 use std::collections::HashSet;
 
@@ -9,12 +16,21 @@ use crate::mail::{
     Address, Conversation, Flags, FolderId, MessageHeader, MessageId, StoredMessage,
     ThreadAssigner, ThreadId, Uid, thread::is_legacy_thread_id, thread::participants_of,
 };
+use crate::providers::RemoteMessageId;
 
+use super::remote_ids::ImapCoords;
 use super::{Store, StoreError};
 
-const COLUMNS: &str = "id, account_id, folder_id, uid, uidvalidity, \
-     message_id, in_reply_to, references_json, thread_id, subject, \
-     from_json, to_json, cc_json, date, size, flags, snippet, has_attachments";
+/// Content columns plus a projected, deterministic first folder membership.
+/// `messages` no longer stores a folder, UID, or UIDVALIDITY: membership comes
+/// from `message_collections` and remote identity from `remote_messages`.
+pub(crate) const COLUMNS: &str = "m.id, m.account_id, m.message_id, m.in_reply_to, \
+     m.references_json, m.thread_id, m.subject, \
+     m.from_json, m.to_json, m.cc_json, m.date, m.size, m.flags, m.snippet, m.has_attachments, \
+     (SELECT mc.folder_id FROM message_collections mc WHERE mc.message_id = m.id \
+      ORDER BY mc.folder_id LIMIT 1), \
+     (SELECT rm.remote_id FROM remote_messages rm WHERE rm.message_id = m.id \
+      AND rm.backend_key = 'imap-smtp' ORDER BY rm.remote_id LIMIT 1)";
 
 /// The newest uncached Inbox message in a conversation.
 #[derive(Debug, Clone)]
@@ -33,126 +49,16 @@ impl Store {
         max_bytes: u32,
         per_account: u32,
     ) -> Result<Vec<PrefetchCandidate>, StoreError> {
-        let conn = self.connection();
-        let mut stmt = conn.prepare(
-            "WITH inbox AS (
-                SELECT *,
-                    ROW_NUMBER() OVER (PARTITION BY account_id, thread_id ORDER BY date DESC, uid DESC) AS thread_rank,
-                    MAX(CASE WHEN (flags & 1) = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY account_id, thread_id) AS unread
-                FROM messages WHERE folder_id IN (SELECT id FROM folders WHERE kind = 'inbox')
-            ), candidates AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY unread DESC, date DESC, uid DESC) AS account_rank
-                FROM inbox WHERE thread_rank = 1 AND size <= ?1 AND body_state = 'headers'
-                    AND NOT EXISTS (SELECT 1 FROM bodies WHERE message_id = inbox.id)
-            )
-            SELECT account_id, folder_id, id, uid, uidvalidity FROM candidates WHERE account_rank <= ?2
-            ORDER BY account_id, unread DESC, date DESC, uid DESC"
-        )?;
-        let rows = stmt.query_map(params![max_bytes, per_account], |row| {
-            Ok(PrefetchCandidate {
-                account_id: AccountId(row.get(0)?),
-                folder_id: FolderId(row.get(1)?),
-                message_id: MessageId(row.get(2)?),
-                uid: Uid(row.get(3)?),
-                uidvalidity: row.get(4)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        prefetch_candidates_on(&self.connection(), max_bytes, per_account)
     }
 
+    /// Insert or update one content row. When [`StoredMessage::folder_id`] is
+    /// set, the row's membership of that folder is ensured as well; the
+    /// authoritative membership may still be edited separately.
     pub fn upsert_message(&self, message: &StoredMessage) -> Result<(), StoreError> {
-        let references_json = encode_json(&message.header.references)?;
-        let from_json = encode_json(&message.header.from)?;
-        let to_json = encode_json(&message.header.to)?;
-        let cc_json = encode_json(&message.header.cc)?;
-
-        // The natural key is (account, folder, UIDVALIDITY, UID), so a header
-        // refresh updates the cached row without changing its local id. Body
-        // state and raw paths are left intact for the body fetch path.
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-
-        // A header refresh may move a message to a different thread (for
-        // example when threading first learns about a reply). Remember the old
-        // thread so its aggregates are recomputed too.
-        let previous_thread: Option<String> = tx
-            .query_row(
-                "SELECT thread_id FROM messages
-                 WHERE account_id = ?1 AND folder_id = ?2 AND uidvalidity = ?3 AND uid = ?4",
-                params![
-                    message.account_id.0,
-                    message.folder_id.0,
-                    message.uidvalidity,
-                    message.uid.0,
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        tx.execute(
-            "INSERT INTO messages (
-                 id, account_id, folder_id, uid, uidvalidity,
-                 message_id, in_reply_to, references_json, thread_id, subject,
-                 from_json, to_json, cc_json, date, size, flags, snippet, has_attachments
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-             ON CONFLICT(account_id, folder_id, uidvalidity, uid) DO UPDATE SET
-                 message_id = excluded.message_id,
-                 in_reply_to = excluded.in_reply_to,
-                 references_json = excluded.references_json,
-                 thread_id = excluded.thread_id,
-                 subject = excluded.subject,
-                 from_json = excluded.from_json,
-                 to_json = excluded.to_json,
-                 cc_json = excluded.cc_json,
-                 date = excluded.date,
-                 size = excluded.size,
-                 flags = excluded.flags,
-                 snippet = excluded.snippet,
-                 has_attachments = excluded.has_attachments",
-            params![
-                message.id.0,
-                message.account_id.0,
-                message.folder_id.0,
-                message.uid.0,
-                message.uidvalidity,
-                message.header.message_id,
-                message.header.in_reply_to,
-                references_json,
-                message.thread_id.0,
-                message.header.subject,
-                from_json,
-                to_json,
-                cc_json,
-                message.header.date,
-                message.header.size,
-                message.flags.to_bits(),
-                message.snippet,
-                message.has_attachments,
-            ],
-        )?;
-
-        // Resolve the natural-key row's id: an update keeps the original local
-        // id, so index that row rather than a freshly generated one.
-        let stored_id: String = tx.query_row(
-            "SELECT id FROM messages
-             WHERE account_id = ?1 AND folder_id = ?2 AND uidvalidity = ?3 AND uid = ?4",
-            params![
-                message.account_id.0,
-                message.folder_id.0,
-                message.uidvalidity,
-                message.uid.0,
-            ],
-            |row| row.get(0),
-        )?;
-        super::search::index_message_on(&tx, &MessageId(stored_id))?;
-
-        recompute_thread_on(&tx, &message.thread_id)?;
-        if let Some(previous) = previous_thread
-            && previous != message.thread_id.0
-        {
-            recompute_thread_on(&tx, &ThreadId(previous))?;
-        }
+        upsert_message_on(&tx, message)?;
         tx.commit()?;
         Ok(())
     }
@@ -198,6 +104,26 @@ impl Store {
         message_on(&conn, id)
     }
 
+    /// The oldest IMAP UID cached for a folder, if any message there has an IMAP
+    /// mapping. Used to page older headers.
+    pub fn oldest_uid_in_folder(&self, folder: &FolderId) -> Result<Option<Uid>, StoreError> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT rm.remote_id FROM message_collections mc
+             JOIN remote_messages rm ON rm.message_id = mc.message_id
+             WHERE mc.folder_id = ?1",
+        )?;
+        let mut rows = stmt.query([&folder.0])?;
+        let mut oldest: Option<Uid> = None;
+        while let Some(row) = rows.next()? {
+            let remote: String = row.get(0)?;
+            if let Some(coords) = ImapCoords::decode(&RemoteMessageId::new(remote)) {
+                oldest = Some(oldest.map_or(coords.uid, |current| current.min(coords.uid)));
+            }
+        }
+        Ok(oldest)
+    }
+
     /// Every message in one conversation, newest first.
     pub fn messages_for_thread(
         &self,
@@ -205,9 +131,9 @@ impl Store {
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.connection();
         let sql = format!(
-            "SELECT {COLUMNS} FROM messages
-             WHERE thread_id = ?1
-             ORDER BY date DESC, uid DESC"
+            "SELECT {COLUMNS} FROM messages m
+             WHERE m.thread_id = ?1
+             ORDER BY m.date DESC, m.rowid DESC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([&thread_id.0])?;
@@ -240,32 +166,13 @@ impl Store {
         Ok(())
     }
 
-    /// Remove cached rows by local id, recomputing the threads they belonged to.
-    /// The FTS triggers drop the matching search rows as the messages go.
+    /// Remove cached content by local id, recomputing the threads they belonged
+    /// to. Membership rows, remote mappings, bodies, attachments, and the FTS
+    /// rows cascade away with the message.
     pub fn delete_messages(&self, ids: &[MessageId]) -> Result<usize, StoreError> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        let mut affected: HashSet<ThreadId> = HashSet::new();
-        let mut deleted = 0;
-        for id in ids {
-            let thread: Option<String> = tx
-                .query_row(
-                    "SELECT thread_id FROM messages WHERE id = ?1",
-                    [&id.0],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            deleted += tx.execute("DELETE FROM messages WHERE id = ?1", [&id.0])?;
-            if let Some(thread) = thread {
-                affected.insert(ThreadId(thread));
-            }
-        }
-        for thread in affected {
-            recompute_thread_on(&tx, &thread)?;
-        }
+        let deleted = delete_messages_on(&tx, ids)?;
         tx.commit()?;
         Ok(deleted)
     }
@@ -277,19 +184,7 @@ impl Store {
         account: &AccountId,
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.connection();
-        let sql = format!(
-            "SELECT {COLUMNS} FROM messages
-             WHERE account_id = ?1
-             ORDER BY date ASC, uid ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query([&account.0])?;
-
-        let mut messages = Vec::new();
-        while let Some(row) = rows.next()? {
-            messages.push(message_from_row(row)?);
-        }
-        Ok(messages)
+        messages_for_account_on(&conn, account)
     }
 
     /// Recompute the aggregate row for one conversation from its messages:
@@ -368,45 +263,42 @@ impl Store {
         }
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3",
-            params![into.0, account.0, from.0],
-        )?;
-        recompute_thread_on(&tx, into)?;
-        recompute_thread_on(&tx, from)?;
+        merge_threads_on(&tx, account, from, into)?;
         tx.commit()?;
         Ok(())
     }
 
     /// Remove messages older than `uid` in one folder, returning the number of
-    /// rows deleted. Used when a server reports a UID high-water mark.
+    /// rows deleted. The UID comes from each message's IMAP remote mapping, so
+    /// it is decoded rather than split from a formatted key.
     pub fn delete_messages_below_uid(
         &self,
         folder: &FolderId,
         uid: Uid,
     ) -> Result<usize, StoreError> {
-        let conn = self.connection();
-        let tx = conn.unchecked_transaction()?;
-        let mut affected = Vec::new();
-        {
-            let mut stmt = tx.prepare(
-                "SELECT DISTINCT thread_id FROM messages
-                 WHERE folder_id = ?1 AND uid < ?2",
+        let ids = {
+            let conn = self.connection();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, rm.remote_id FROM messages m
+                 JOIN message_collections mc ON mc.message_id = m.id AND mc.folder_id = ?1
+                 LEFT JOIN remote_messages rm ON rm.message_id = m.id",
             )?;
-            let mut rows = stmt.query(params![folder.0, uid.0])?;
+            let mut rows = stmt.query([&folder.0])?;
+            let mut ids = Vec::new();
             while let Some(row) = rows.next()? {
-                affected.push(ThreadId(row.get(0)?));
+                let id: String = row.get(0)?;
+                let remote: Option<String> = row.get(1)?;
+                let older = remote
+                    .as_deref()
+                    .and_then(|raw| ImapCoords::decode(&RemoteMessageId::new(raw)))
+                    .is_some_and(|coords| coords.uid < uid);
+                if older {
+                    ids.push(MessageId(id));
+                }
             }
-        }
-        let deleted = tx.execute(
-            "DELETE FROM messages WHERE folder_id = ?1 AND uid < ?2",
-            params![folder.0, uid.0],
-        )?;
-        for thread in affected {
-            recompute_thread_on(&tx, &thread)?;
-        }
-        tx.commit()?;
-        Ok(deleted)
+            ids
+        };
+        self.delete_messages(&ids)
     }
 
     /// Conversation list for one folder: one row per thread using its newest
@@ -428,6 +320,162 @@ impl Store {
     }
 }
 
+/// Insert or update one message row and (when projected) its folder membership
+/// inside a caller-owned transaction.
+pub(crate) fn upsert_message_on(
+    conn: &Connection,
+    message: &StoredMessage,
+) -> Result<(), StoreError> {
+    let references_json = encode_json(&message.header.references)?;
+    let from_json = encode_json(&message.header.from)?;
+    let to_json = encode_json(&message.header.to)?;
+    let cc_json = encode_json(&message.header.cc)?;
+
+    // A header refresh may move a message to a different thread. Remember the
+    // old thread so its aggregates are recomputed too.
+    let previous_thread: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM messages WHERE id = ?1",
+            [&message.id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    conn.execute(
+        "INSERT INTO messages (
+             id, account_id, message_id, in_reply_to, references_json, thread_id, subject,
+             from_json, to_json, cc_json, date, size, flags, snippet, has_attachments
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(id) DO UPDATE SET
+             account_id = excluded.account_id,
+             message_id = excluded.message_id,
+             in_reply_to = excluded.in_reply_to,
+             references_json = excluded.references_json,
+             thread_id = excluded.thread_id,
+             subject = excluded.subject,
+             from_json = excluded.from_json,
+             to_json = excluded.to_json,
+             cc_json = excluded.cc_json,
+             date = excluded.date,
+             size = excluded.size,
+             flags = excluded.flags,
+             snippet = excluded.snippet,
+             has_attachments = excluded.has_attachments",
+        params![
+            message.id.0,
+            message.account_id.0,
+            message.header.message_id,
+            message.header.in_reply_to,
+            references_json,
+            message.thread_id.0,
+            message.header.subject,
+            from_json,
+            to_json,
+            cc_json,
+            message.header.date,
+            message.header.size,
+            message.flags.to_bits(),
+            message.snippet,
+            message.has_attachments,
+        ],
+    )?;
+
+    if let Some(folder) = &message.folder_id {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_collections (message_id, folder_id)
+             VALUES (?1, ?2)",
+            params![message.id.0, folder.0],
+        )?;
+    }
+
+    // A message carrying both a folder and IMAP UID coordinates records its
+    // durable remote identity here, so a later re-sync resolves to the same
+    // local id. A message with no UID (a native API message) writes none.
+    if let (Some(folder), Some(uid), Some(uidvalidity)) =
+        (&message.folder_id, message.uid, message.uidvalidity)
+        && let Some((mailbox, backend_json)) = conn
+            .query_row(
+                "SELECT f.name, a.backend FROM folders f
+                 JOIN accounts a ON a.id = f.account_id
+                 WHERE f.id = ?1",
+                [&folder.0],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+    {
+        let backend = super::memberships::provider_key_for_json(backend_json.as_deref());
+        let remote = ImapCoords::new(mailbox, uidvalidity, uid).encode();
+        conn.execute(
+            "INSERT INTO remote_messages (account_id, backend_key, remote_id, message_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id, backend_key, remote_id) DO UPDATE SET
+                 message_id = excluded.message_id",
+            params![message.account_id.0, backend, remote.as_str(), message.id.0],
+        )?;
+    }
+
+    super::search::index_message_on(conn, &message.id)?;
+
+    recompute_thread_on(conn, &message.thread_id)?;
+    if let Some(previous) = previous_thread
+        && previous != message.thread_id.0
+    {
+        recompute_thread_on(conn, &ThreadId(previous))?;
+    }
+    Ok(())
+}
+
+/// Delete content rows (and, through cascades, their memberships, remote
+/// mappings, bodies, attachments, and FTS rows) inside a caller-owned
+/// transaction, recomputing the affected threads.
+pub(crate) fn delete_messages_on(
+    conn: &Connection,
+    ids: &[MessageId],
+) -> Result<usize, StoreError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut affected: HashSet<ThreadId> = HashSet::new();
+    let mut deleted = 0;
+    for id in ids {
+        let thread: Option<String> = conn
+            .query_row(
+                "SELECT thread_id FROM messages WHERE id = ?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        deleted += conn.execute("DELETE FROM messages WHERE id = ?1", [&id.0])?;
+        if let Some(thread) = thread {
+            affected.insert(ThreadId(thread));
+        }
+    }
+    for thread in affected {
+        recompute_thread_on(conn, &thread)?;
+    }
+    Ok(deleted)
+}
+
+/// Fold every message from `from` into `into` for one account inside a
+/// caller-owned transaction.
+pub(crate) fn merge_threads_on(
+    conn: &Connection,
+    account: &AccountId,
+    from: &ThreadId,
+    into: &ThreadId,
+) -> Result<(), StoreError> {
+    if from == into {
+        return recompute_thread_on(conn, into);
+    }
+    conn.execute(
+        "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3",
+        params![into.0, account.0, from.0],
+    )?;
+    recompute_thread_on(conn, into)?;
+    recompute_thread_on(conn, from)?;
+    Ok(())
+}
+
 pub(crate) fn messages_on(
     conn: &Connection,
     folder: &FolderId,
@@ -435,9 +483,10 @@ pub(crate) fn messages_on(
     before_date: Option<i64>,
 ) -> Result<Vec<StoredMessage>, StoreError> {
     let sql = format!(
-        "SELECT {COLUMNS} FROM messages
-         WHERE folder_id = ?1 AND (?2 IS NULL OR date < ?2)
-         ORDER BY date DESC, uid DESC
+        "SELECT {COLUMNS} FROM messages m
+         JOIN message_collections mc ON mc.message_id = m.id AND mc.folder_id = ?1
+         WHERE (?2 IS NULL OR m.date < ?2)
+         ORDER BY m.date DESC, m.rowid DESC
          LIMIT ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -454,7 +503,7 @@ pub(crate) fn message_on(
     conn: &Connection,
     id: &MessageId,
 ) -> Result<Option<StoredMessage>, StoreError> {
-    let sql = format!("SELECT {COLUMNS} FROM messages WHERE id = ?1");
+    let sql = format!("SELECT {COLUMNS} FROM messages m WHERE m.id = ?1");
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([&id.0])?;
     match rows.next()? {
@@ -463,14 +512,158 @@ pub(crate) fn message_on(
     }
 }
 
+pub(crate) fn messages_for_account_on(
+    conn: &Connection,
+    account: &AccountId,
+) -> Result<Vec<StoredMessage>, StoreError> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM messages m
+         WHERE m.account_id = ?1
+         ORDER BY m.date ASC, m.rowid ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([&account.0])?;
+
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next()? {
+        messages.push(message_from_row(row)?);
+    }
+    Ok(messages)
+}
+
 pub(crate) fn message_count_on(conn: &Connection, folder: &FolderId) -> Result<u32, StoreError> {
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE folder_id = ?1",
+        "SELECT COUNT(*) FROM message_collections WHERE folder_id = ?1",
         [&folder.0],
         |row| row.get(0),
     )?)
 }
 
+/// Rank Inbox messages into prefetch candidates. The work is done in Rust
+/// because a message's IMAP UID is decoded from its opaque remote id rather
+/// than stored in a column.
+fn prefetch_candidates_on(
+    conn: &Connection,
+    max_bytes: u32,
+    per_account: u32,
+) -> Result<Vec<PrefetchCandidate>, StoreError> {
+    struct RowData {
+        account: AccountId,
+        folder: FolderId,
+        message: MessageId,
+        thread: ThreadId,
+        date: i64,
+        seen: bool,
+        size: i64,
+        fetchable: bool,
+        coords: Option<ImapCoords>,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.account_id, mc.folder_id, rm.remote_id, m.thread_id, m.date,
+                (m.flags & 1) = 0, m.size, m.body_state = 'headers'
+                    AND NOT EXISTS (SELECT 1 FROM bodies b WHERE b.message_id = m.id)
+         FROM messages m
+         JOIN message_collections mc ON mc.message_id = m.id
+         JOIN folders f ON f.id = mc.folder_id AND f.kind = 'inbox'
+         LEFT JOIN remote_messages rm ON rm.message_id = m.id
+         ORDER BY m.account_id, m.thread_id, m.date DESC, m.rowid DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let remote: Option<String> = row.get(3)?;
+        Ok(RowData {
+            message: MessageId(row.get(0)?),
+            account: AccountId(row.get(1)?),
+            folder: FolderId(row.get(2)?),
+            coords: remote
+                .as_deref()
+                .and_then(|raw| ImapCoords::decode(&RemoteMessageId::new(raw))),
+            thread: ThreadId(row.get(4)?),
+            date: row.get(5)?,
+            seen: !row.get::<_, bool>(6)?,
+            size: row.get(7)?,
+            fetchable: row.get(8)?,
+        })
+    })?;
+    let mut data = Vec::new();
+    for row in rows {
+        data.push(row?);
+    }
+
+    // Newest message per (account, thread), plus whether the thread has unread.
+    let mut threads: Vec<(AccountId, bool, usize)> = Vec::new();
+    let mut index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for (position, row) in data.iter().enumerate() {
+        let key = (row.account.0.clone(), row.thread.0.clone());
+        match index.get(&key) {
+            Some(&slot) => {
+                if !row.seen {
+                    threads[slot].1 = true;
+                }
+            }
+            None => {
+                index.insert(key, threads.len());
+                threads.push((row.account.clone(), !row.seen, position));
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Candidate {
+        unread: bool,
+        date: i64,
+        uid: u32,
+        account: AccountId,
+        candidate: PrefetchCandidate,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (account, unread, newest) in threads {
+        let row = &data[newest];
+        let Some(coords) = &row.coords else { continue };
+        if !row.fetchable || row.size > i64::from(max_bytes) {
+            continue;
+        }
+        // Only the newest message of a thread is a candidate.
+        candidates.push(Candidate {
+            unread,
+            date: row.date,
+            uid: coords.uid.0,
+            account: account.clone(),
+            candidate: PrefetchCandidate {
+                account_id: account,
+                folder_id: row.folder.clone(),
+                message_id: row.message.clone(),
+                uid: coords.uid,
+                uidvalidity: coords.uidvalidity,
+            },
+        });
+    }
+
+    let mut per_account_count: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    candidates.sort_by(|a, b| {
+        a.account
+            .0
+            .cmp(&b.account.0)
+            .then_with(|| b.unread.cmp(&a.unread))
+            .then_with(|| b.date.cmp(&a.date))
+            .then_with(|| b.uid.cmp(&a.uid))
+    });
+    let mut result = Vec::new();
+    for candidate in candidates {
+        let count = per_account_count.entry(candidate.account.0.clone()).or_insert(0);
+        if *count >= per_account {
+            continue;
+        }
+        *count += 1;
+        result.push(candidate.candidate);
+    }
+    Ok(result)
+}
+
+/// Conversation list for one folder: one row per thread using its newest
+/// message for display and aggregates over the copies in that folder.
 pub(crate) fn conversations_on(
     conn: &Connection,
     folder: &FolderId,
@@ -478,7 +671,15 @@ pub(crate) fn conversations_on(
     before_date: Option<i64>,
 ) -> Result<Vec<Conversation>, StoreError> {
     let mut stmt = conn.prepare(
-        "WITH ranked AS (
+        "WITH scoped AS (
+             SELECT m.rowid AS rowid, m.thread_id AS thread_id, m.account_id AS account_id,
+                    m.subject AS subject, m.from_json AS from_json, m.snippet AS snippet,
+                    m.date AS date, m.has_attachments AS has_attachments, m.flags AS flags
+             FROM messages m
+             JOIN message_collections mc ON mc.message_id = m.id
+             WHERE mc.folder_id = ?1
+         ),
+         ranked AS (
              SELECT
                  thread_id, account_id, subject, from_json, snippet, date, has_attachments,
                  COUNT(*) OVER (PARTITION BY thread_id) AS message_count,
@@ -486,10 +687,9 @@ pub(crate) fn conversations_on(
                      OVER (PARTITION BY thread_id) AS unread,
                  MAX(has_attachments) OVER (PARTITION BY thread_id) AS any_attachments,
                  ROW_NUMBER() OVER (
-                     PARTITION BY thread_id ORDER BY date DESC, uid DESC
+                     PARTITION BY thread_id ORDER BY date DESC, rowid DESC
                  ) AS rank
-             FROM messages
-             WHERE folder_id = ?1
+             FROM scoped
          )
          SELECT thread_id, account_id, subject, from_json, snippet, date,
                 message_count, unread, any_attachments
@@ -527,7 +727,15 @@ pub(crate) fn unified_conversations_on(
     limit: u32,
 ) -> Result<Vec<Conversation>, StoreError> {
     let mut stmt = conn.prepare(
-        "WITH ranked AS (
+        "WITH scoped AS (
+             SELECT m.rowid AS rowid, m.account_id AS account_id, m.thread_id AS thread_id,
+                    m.subject AS subject, m.from_json AS from_json, m.snippet AS snippet,
+                    m.date AS date, m.has_attachments AS has_attachments, m.flags AS flags
+             FROM messages m
+             JOIN message_collections mc ON mc.message_id = m.id
+             JOIN folders f ON f.id = mc.folder_id AND f.kind = 'inbox'
+         ),
+         ranked AS (
              SELECT
                  account_id, thread_id, subject, from_json, snippet, date, has_attachments,
                  COUNT(*) OVER (PARTITION BY account_id, thread_id) AS message_count,
@@ -535,10 +743,9 @@ pub(crate) fn unified_conversations_on(
                      OVER (PARTITION BY account_id, thread_id) AS unread,
                  MAX(has_attachments) OVER (PARTITION BY account_id, thread_id) AS any_attachments,
                  ROW_NUMBER() OVER (
-                     PARTITION BY account_id, thread_id ORDER BY date DESC, uid DESC
+                     PARTITION BY account_id, thread_id ORDER BY date DESC, rowid DESC
                  ) AS rank
-             FROM messages
-             WHERE folder_id IN (SELECT id FROM folders WHERE kind = 'inbox')
+             FROM scoped
          )
          SELECT thread_id, account_id, subject, from_json, snippet, date,
                 message_count, unread, any_attachments
@@ -576,7 +783,7 @@ pub(crate) fn recompute_thread_on(conn: &Connection, id: &ThreadId) -> Result<()
             "SELECT account_id, subject, from_json, snippet, date
              FROM messages
              WHERE thread_id = ?1
-             ORDER BY date DESC, uid DESC
+             ORDER BY date DESC, rowid DESC
              LIMIT 1",
             [&id.0],
             |row| {
@@ -646,33 +853,38 @@ fn decode_json<T: serde::de::DeserializeOwned>(
 }
 
 fn message_from_row(row: &Row<'_>) -> Result<StoredMessage, StoreError> {
-    let references_json: String = row.get(7)?;
-    let from_json: String = row.get(10)?;
-    let to_json: String = row.get(11)?;
-    let cc_json: String = row.get(12)?;
-    let flags: i64 = row.get(15)?;
+    let references_json: String = row.get(4)?;
+    let from_json: String = row.get(7)?;
+    let to_json: String = row.get(8)?;
+    let cc_json: String = row.get(9)?;
+    let flags: i64 = row.get(12)?;
+    let folder_id: Option<String> = row.get(15)?;
+    let remote: Option<String> = row.get(16)?;
+    let coords = remote
+        .as_deref()
+        .and_then(|raw| ImapCoords::decode(&RemoteMessageId::new(raw)));
 
     Ok(StoredMessage {
         id: MessageId(row.get(0)?),
         account_id: AccountId(row.get(1)?),
-        folder_id: FolderId(row.get(2)?),
-        uid: Uid(row.get(3)?),
-        uidvalidity: row.get(4)?,
+        folder_id: folder_id.map(FolderId),
+        uid: coords.as_ref().map(|coords| coords.uid),
+        uidvalidity: coords.as_ref().map(|coords| coords.uidvalidity),
         header: MessageHeader {
-            message_id: row.get(5)?,
-            in_reply_to: row.get(6)?,
+            message_id: row.get(2)?,
+            in_reply_to: row.get(3)?,
             references: decode_json(&references_json, "messages.references_json")?,
-            subject: row.get(9)?,
+            subject: row.get(6)?,
             from: decode_json(&from_json, "messages.from_json")?,
             to: decode_json(&to_json, "messages.to_json")?,
             cc: decode_json(&cc_json, "messages.cc_json")?,
-            date: row.get(13)?,
-            size: row.get(14)?,
+            date: row.get(10)?,
+            size: row.get(11)?,
         },
         flags: Flags::from_bits(flags),
-        thread_id: ThreadId(row.get(8)?),
-        snippet: row.get(16)?,
-        has_attachments: row.get(17)?,
+        thread_id: ThreadId(row.get(5)?),
+        snippet: row.get(13)?,
+        has_attachments: row.get(14)?,
     })
 }
 
