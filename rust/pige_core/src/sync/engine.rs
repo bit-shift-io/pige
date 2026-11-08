@@ -124,8 +124,23 @@ pub async fn sync_account(
     Ok(report)
 }
 
+/// The UID range a first-time (or post-reset) sync of a mailbox fetches: the
+/// newest `window` messages below the server's UIDNEXT. When the mailbox has
+/// fewer messages than the window the range starts at UID 1, which lets a
+/// caller tell a complete enumeration from a bounded recent window.
+pub(crate) fn bootstrap_window(uidnext: u32, window: u32) -> (Uid, Uid) {
+    let from = uidnext.saturating_sub(window).max(1);
+    (Uid(from), Uid(uidnext.saturating_sub(1)))
+}
+
+/// The UID range an incremental sync fetches: everything at or above the
+/// recorded high-water mark, up to the new UIDNEXT-1.
+pub(crate) fn delta_window(high_water: u32, uidnext: u32) -> (Uid, Uid) {
+    (Uid(high_water), Uid(uidnext.saturating_sub(1)))
+}
+
 /// Order special folders are synced after Inbox. `None` means "not auto-synced".
-fn sync_order(kind: FolderKind) -> Option<usize> {
+pub(crate) fn sync_order(kind: FolderKind) -> Option<usize> {
     match kind {
         FolderKind::Inbox => Some(0),
         FolderKind::Sent => Some(1),
@@ -187,11 +202,8 @@ pub(crate) async fn sync_folder(
         local.uidnext
     };
     let (from, to) = match prior_uidnext {
-        None => {
-            let from = state.uidnext.saturating_sub(window).max(1);
-            (Uid(from), Uid(state.uidnext.saturating_sub(1)))
-        }
-        Some(high_water) => (Uid(high_water), Uid(state.uidnext.saturating_sub(1))),
+        None => bootstrap_window(state.uidnext, window),
+        Some(high_water) => delta_window(high_water, state.uidnext),
     };
 
     // Cached messages that predate this sync, for flag reconciliation. Their

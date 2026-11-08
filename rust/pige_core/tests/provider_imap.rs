@@ -18,10 +18,12 @@ use pige_core::mail::{
 use pige_core::platform::CredentialStore;
 use pige_core::platform::fake::{FakeCredentials, FakeTransportFactory};
 use pige_core::providers::{
-    ErrorKind, HistoryRequest, MailboxService, OperationContext, ProviderFactory,
-    imap::{ImapProviderFactory, identity},
+    ChangePage, ErrorKind, HistoryRequest, MailChange, MailboxService, MutationAction,
+    MutationOutcome, MutationRequest, OperationContext, OperationId, ProviderFactory,
+    RemoteCollectionId, SyncRequest,
+    imap::{ImapProviderFactory, identity, sync},
 };
-use pige_core::transport::{FakeTransport, FolderState, RemoteFolder, RemoteMessage};
+use pige_core::transport::{Capabilities, FakeTransport, FolderState, RemoteFolder, RemoteMessage};
 
 fn account() -> Account {
     Account {
@@ -525,4 +527,476 @@ async fn read_with_stale_uidvalidity_is_not_found() {
         .await
         .expect("live epoch reads");
     assert_eq!(body.raw.as_deref(), Some(RAW));
+}
+
+// ---------------------------------------------------------------------------
+// Sync and semantic mutations (task F6).
+// ---------------------------------------------------------------------------
+
+/// Decode every upserted record in a page, as `(mailbox, uidvalidity, uid)`.
+fn upserted(page: &ChangePage) -> Vec<(String, u32, u32)> {
+    page.changes
+        .iter()
+        .filter_map(|change| match change {
+            MailChange::UpsertMessage { message, .. } => {
+                let coords = identity::decode_message(&message.remote_id).expect("IMAP id");
+                Some((coords.mailbox, coords.uidvalidity, coords.uid.0))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn removed(page: &ChangePage) -> Vec<(String, u32, u32)> {
+    page.changes
+        .iter()
+        .filter_map(|change| match change {
+            MailChange::RemoveMessage(remote) => {
+                let coords = identity::decode_message(remote).expect("IMAP id");
+                Some((coords.mailbox, coords.uidvalidity, coords.uid.0))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn removed_collections(page: &ChangePage) -> Vec<String> {
+    page.changes
+        .iter()
+        .filter_map(|change| match change {
+            MailChange::RemoveCollection(remote) => Some(remote.0.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn request(
+    action: MutationAction,
+    targets: Vec<pige_core::providers::RemoteMessageId>,
+) -> MutationRequest {
+    MutationRequest {
+        operation: OperationId::from("op-1"),
+        targets,
+        source: None,
+        action,
+    }
+}
+
+#[tokio::test]
+async fn initial_window_is_not_full_snapshot() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    let messages: Vec<RemoteMessage> = (1..=400)
+        .map(|uid| message(uid, &format!("message {uid}")))
+        .collect();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![folder("INBOX", FolderKind::Inbox)],
+            states: HashMap::from([("INBOX".to_string(), state(1, 401))]),
+            messages: HashMap::from([("INBOX".to_string(), messages)]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let mut session = open(transports.clone()).await;
+    let page = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 300,
+            },
+            &context(),
+        )
+        .await
+        .expect("sync page");
+
+    // A bounded recent window must never retire older cached mail.
+    assert!(
+        removed(&page).is_empty(),
+        "a bounded window must not delete older cache: {:?}",
+        removed(&page)
+    );
+
+    let mut uids: Vec<u32> = upserted(&page).into_iter().map(|(_, _, uid)| uid).collect();
+    uids.sort_unstable();
+    assert_eq!(uids.len(), 300, "exactly the bounded window is reported");
+    assert_eq!(uids.first(), Some(&101));
+    assert_eq!(uids.last(), Some(&400));
+
+    let cursor = sync::decode_sync_cursor(&page.checkpoint).expect("sync cursor");
+    let inbox = cursor
+        .mailboxes
+        .iter()
+        .find(|mailbox| mailbox.name == "INBOX")
+        .expect("INBOX progress");
+    assert!(
+        !inbox.snapshot_complete,
+        "a bounded window is not a completed snapshot"
+    );
+}
+
+#[tokio::test]
+async fn epoch_reset_reconciles_only_affected_mailbox() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    let first = FakeTransport {
+        folders: vec![
+            folder("INBOX", FolderKind::Inbox),
+            folder("Sent", FolderKind::Sent),
+        ],
+        states: HashMap::from([
+            ("INBOX".to_string(), state(1, 4)),
+            ("Sent".to_string(), state(5, 8)),
+        ]),
+        messages: HashMap::from([
+            (
+                "INBOX".to_string(),
+                vec![message(1, "a"), message(2, "b"), message(3, "c")],
+            ),
+            ("Sent".to_string(), vec![message(7, "sent")]),
+        ]),
+        ..FakeTransport::default()
+    };
+    transports.add_transport(account.id.clone(), first.clone());
+
+    let mut session = open(transports.clone()).await;
+    let first_page = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("first sync");
+
+    // Rotate only INBOX's UIDVALIDITY epoch; Sent is untouched.
+    let mut second = first.clone();
+    second.messages.insert(
+        "INBOX".to_string(),
+        vec![message(1, "fresh-a"), message(2, "fresh-b")],
+    );
+    second.states.insert("INBOX".to_string(), state(2, 3));
+    transports.add_transport(account.id.clone(), second);
+
+    let mut session = open(transports.clone()).await;
+    let page = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: Some(first_page.checkpoint),
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("second sync");
+
+    // Every removal is the rotated INBOX epoch; nothing touches Sent.
+    let removals = removed(&page);
+    assert_eq!(
+        removals,
+        vec![
+            ("INBOX".to_string(), 1, 1),
+            ("INBOX".to_string(), 1, 2),
+            ("INBOX".to_string(), 1, 3),
+        ],
+        "only the affected mailbox reconciles"
+    );
+    let upserts = upserted(&page);
+    assert!(
+        upserts
+            .iter()
+            .all(|(mailbox, uidvalidity, _)| mailbox == "INBOX" && *uidvalidity == 2),
+        "the untouched mailbox must not be re-synced: {upserts:?}"
+    );
+    assert_eq!(upserts.len(), 2);
+
+    let cursor = sync::decode_sync_cursor(&page.checkpoint).expect("sync cursor");
+    let sent = cursor
+        .mailboxes
+        .iter()
+        .find(|mailbox| mailbox.name == "Sent")
+        .expect("Sent progress");
+    assert_eq!(sent.uidvalidity, 5, "Sent keeps its epoch");
+    assert_eq!(sent.uidnext, 8, "Sent keeps its high-water");
+}
+
+#[tokio::test]
+async fn imap_delete_is_not_api_label_removal() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: false,
+                move_ext: true,
+            },
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                folder("Work", FolderKind::Other),
+            ],
+            states: HashMap::from([
+                ("INBOX".to_string(), state(1, 2)),
+                ("Work".to_string(), state(3, 2)),
+            ]),
+            messages: HashMap::from([
+                ("INBOX".to_string(), vec![message(1, "inbox")]),
+                ("Work".to_string(), vec![message(1, "work")]),
+            ]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let target = identity::message_remote_id("INBOX", 1, Uid(1));
+    let mut session = open(transports.clone()).await;
+
+    // "Remove the Work label" is not a permanent delete. On a plain IMAP server
+    // a folder is the message's only home, so it cannot remove a label without
+    // deleting the message: unsupported, and nothing is sent to the server.
+    let label_removal = session
+        .mutation_service()
+        .unwrap()
+        .apply(
+            request(
+                MutationAction::RemoveLabel(RemoteCollectionId::from("Work")),
+                vec![target.clone()],
+            ),
+            &context(),
+        )
+        .await
+        .expect("label removal");
+    assert_eq!(label_removal.items.len(), 1);
+    assert_eq!(
+        label_removal.items[0].outcome,
+        MutationOutcome::Rejected(pige_core::providers::ProviderError::unsupported(
+            "removing a label on this mail server"
+        )),
+        "label removal must not be a permanent delete"
+    );
+
+    // Permanent delete does expunge the source message.
+    let deleted = session
+        .mutation_service()
+        .unwrap()
+        .apply(
+            request(MutationAction::DeletePermanently, vec![target.clone()]),
+            &context(),
+        )
+        .await
+        .expect("permanent delete");
+    assert_eq!(deleted.items[0].outcome, MutationOutcome::Applied);
+
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert!(
+        transport.copy_calls.is_empty() && transport.move_calls.is_empty(),
+        "removing a label must never copy or move"
+    );
+    assert_eq!(
+        transport.delete_calls,
+        vec![("INBOX".to_string(), vec![Uid(1)])],
+        "only the permanent delete expunged"
+    );
+}
+
+#[tokio::test]
+async fn gmail_imap_archive_removes_source_label_only() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: true,
+                move_ext: false,
+            },
+            folders: vec![folder("INBOX", FolderKind::Inbox)],
+            states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+            messages: HashMap::from([("INBOX".to_string(), vec![message(1, "kept")])]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let target = identity::message_remote_id("INBOX", 1, Uid(1));
+    let mut session = open(transports.clone()).await;
+    let result = session
+        .mutation_service()
+        .unwrap()
+        .apply(request(MutationAction::Archive, vec![target]), &context())
+        .await
+        .expect("archive");
+
+    assert_eq!(result.items[0].outcome, MutationOutcome::Applied);
+    let transport = transports.transport(&account.id).await.expect("transport");
+    // Gmail archive removes the source label (a scoped delete); it does not
+    // copy anywhere and does not MOVE.
+    assert_eq!(
+        transport.delete_calls,
+        vec![("INBOX".to_string(), vec![Uid(1)])]
+    );
+    assert!(transport.copy_calls.is_empty(), "archive does not copy");
+    assert!(transport.move_calls.is_empty(), "archive is not a MOVE");
+}
+
+#[tokio::test]
+async fn copy_delete_fallback_reports_partial_outcome() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            capabilities: Capabilities {
+                gmail: false,
+                move_ext: false,
+            },
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                folder("Archive", FolderKind::Archive),
+            ],
+            states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+            messages: HashMap::from([("INBOX".to_string(), vec![message(1, "moved")])]),
+            // The COPY succeeds but the source delete fails: the message is now
+            // in both mailboxes, so its outcome is genuinely unknown.
+            fail_delete: true,
+            ..FakeTransport::default()
+        },
+    );
+
+    let target = identity::message_remote_id("INBOX", 1, Uid(1));
+    let mut session = open(transports.clone()).await;
+    let result = session
+        .mutation_service()
+        .unwrap()
+        .apply(
+            request(
+                MutationAction::Move(RemoteCollectionId::from("Archive")),
+                vec![target],
+            ),
+            &context(),
+        )
+        .await
+        .expect("move");
+
+    assert_eq!(
+        result.items[0].outcome,
+        MutationOutcome::Unknown,
+        "a partially-applied COPY + delete is not a definite success"
+    );
+
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert_eq!(
+        transport.copy_calls,
+        vec![("INBOX".to_string(), vec![Uid(1)], "Archive".to_string())]
+    );
+    assert_eq!(
+        transport.delete_calls,
+        vec![("INBOX".to_string(), vec![Uid(1)])],
+        "the fallback tried to remove the source"
+    );
+}
+
+#[tokio::test]
+async fn folder_rename_does_not_merge_unrelated_uid_identity() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    let before = FakeTransport {
+        folders: vec![
+            folder("INBOX", FolderKind::Inbox),
+            folder("Sent", FolderKind::Sent),
+        ],
+        states: HashMap::from([
+            ("INBOX".to_string(), state(1, 1)),
+            ("Sent".to_string(), state(9, 8)),
+        ]),
+        messages: HashMap::from([("Sent".to_string(), vec![message(7, "outgoing")])]),
+        ..FakeTransport::default()
+    };
+    transports.add_transport(account.id.clone(), before);
+
+    let mut session = open(transports.clone()).await;
+    let first_page = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("first sync");
+    assert_eq!(
+        upserted(&first_page),
+        vec![("Sent".to_string(), 9, 7)],
+        "the message starts under the Sent identity"
+    );
+
+    // The mailbox is renamed: the same server-side UIDs now live under a new
+    // name, with the same UIDVALIDITY. A UID must never be matched across names.
+    let after = FakeTransport {
+        folders: vec![
+            folder("INBOX", FolderKind::Inbox),
+            folder("Outbox", FolderKind::Sent),
+        ],
+        states: HashMap::from([
+            ("INBOX".to_string(), state(1, 1)),
+            ("Outbox".to_string(), state(9, 8)),
+        ]),
+        messages: HashMap::from([("Outbox".to_string(), vec![message(7, "outgoing")])]),
+        ..FakeTransport::default()
+    };
+    transports.add_transport(account.id.clone(), after);
+
+    let mut session = open(transports.clone()).await;
+    let page = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: Some(first_page.checkpoint),
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("second sync");
+
+    // The vanished mailbox is retired: its collection and every message under
+    // its old identity.
+    assert_eq!(removed_collections(&page), vec!["Sent".to_string()]);
+    assert_eq!(
+        removed(&page),
+        vec![("Sent".to_string(), 9, 7)],
+        "the old identity is retired, not reused"
+    );
+
+    // The new mailbox is bootstrapped under its own name.
+    let upserts = upserted(&page);
+    assert_eq!(upserts, vec![("Outbox".to_string(), 9, 7)]);
+    assert!(
+        !page.changes.iter().any(|change| match change {
+            MailChange::UpsertMessage { message, .. } => {
+                identity::decode_message(&message.remote_id)
+                    .is_some_and(|coords| coords.mailbox == "Sent")
+            }
+            _ => false,
+        }),
+        "no change may re-use the retired Sent identity"
+    );
+
+    // The new identity is genuinely distinct from the old one.
+    assert_ne!(
+        identity::message_remote_id("Outbox", 9, Uid(7)),
+        identity::message_remote_id("Sent", 9, Uid(7)),
+        "a rename must not collapse two identities"
+    );
 }

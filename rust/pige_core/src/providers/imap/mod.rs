@@ -9,6 +9,8 @@
 
 pub mod identity;
 pub mod mailbox;
+pub mod mutations;
+pub mod sync;
 
 use std::sync::Arc;
 
@@ -20,10 +22,12 @@ use crate::auth::secrets::{SecretEnvelope, SecretRepository, StoredCredentials};
 use crate::platform::TransportFactory;
 use crate::providers::error::ProviderError;
 use crate::providers::traits::{ProviderFactory, ProviderSession};
-use crate::providers::types::{OperationContext, ProviderCapabilities};
-use crate::transport::MailTransport;
+use crate::providers::types::{MutationCapabilities, OperationContext, ProviderCapabilities};
+use crate::transport::{Capabilities, MailTransport};
 
 pub use mailbox::ImapMailbox;
+pub use mutations::ImapMutations;
+pub use sync::ImapSync;
 
 /// Opens IMAP mailbox sessions for IMAP/SMTP accounts.
 pub struct ImapProviderFactory {
@@ -64,12 +68,25 @@ impl ImapProviderFactory {
     }
 }
 
-/// Capabilities advertised by the IMAP mailbox adapter. Sync, mutations, and
-/// submission are added by later tasks; nothing is claimed before it exists.
-fn imap_capabilities() -> ProviderCapabilities {
+/// Capabilities advertised by the IMAP adapter, derived from the server's own
+/// capability set. Submission arrives with F9. The label capability is honest:
+/// Gmail folds labels into folders, a plain IMAP server does not.
+fn imap_capabilities(server: Capabilities) -> ProviderCapabilities {
     ProviderCapabilities {
         mailbox: true,
-        ..ProviderCapabilities::default()
+        sync: true,
+        mutations: MutationCapabilities {
+            read: true,
+            star: true,
+            labels: server.gmail,
+            move_messages: true,
+            archive: true,
+            trash: true,
+            permanent_delete: true,
+        },
+        submission: false,
+        contacts: crate::providers::types::ContactCapabilities::default(),
+        server_search: false,
     }
 }
 
@@ -87,14 +104,40 @@ impl ProviderFactory for ImapProviderFactory {
                 "IMAP mailbox access for this backend",
             ));
         }
-        let transport = self.open_transport(account).await?;
+
+        // Each service owns its own connection: a service never borrows another
+        // service's mutable connection. The first connection also probes the
+        // server's capability set, which now drives the advertised mutations.
+        let mut sync_transport = self.open_transport(account).await?;
+        let server = sync_transport
+            .capabilities()
+            .await
+            .map_err(transport_error)?;
         // Re-check after the connection attempt; the account may have been
         // invalidated while it was in flight.
         ctx.ensure_active()?;
 
-        let mut session = ProviderSession::new(imap_capabilities());
-        session.mailbox = Some(Box::new(ImapMailbox::new(transport)));
+        let mailbox_transport = self.open_transport(account).await?;
+        let mutation_transport = self.open_transport(account).await?;
+
+        let mut session = ProviderSession::new(imap_capabilities(server));
+        session.mailbox = Some(Box::new(ImapMailbox::new(mailbox_transport)));
+        session.sync = Some(Box::new(ImapSync::new(sync_transport)));
+        session.mutations = Some(Box::new(ImapMutations::new(mutation_transport, server)));
         Ok(session)
+    }
+}
+
+/// Map a transport failure to a redacted provider error. Authentication
+/// failures become `Reauthenticate`; everything else is transient, with the
+/// wire detail confined to `source_detail`.
+pub(crate) fn transport_error(error: crate::transport::TransportError) -> ProviderError {
+    let message = error.to_string();
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("login") || lowered.contains("auth") || lowered.contains("password") {
+        ProviderError::reauthenticate("the mail server rejected the sign-in")
+    } else {
+        ProviderError::transient("the mail server request failed").with_source_detail(message)
     }
 }
 

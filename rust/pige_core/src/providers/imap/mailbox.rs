@@ -26,7 +26,7 @@ use crate::providers::types::{
 };
 use crate::transport::{FolderState, MailTransport, RemoteFolder, RemoteMessage};
 
-use super::identity;
+use super::{identity, transport_error};
 
 /// Cursor payload version for [`ImapMailbox::history`]. A cursor from another
 /// version is rejected as [`crate::providers::ErrorKind::CursorInvalid`].
@@ -329,17 +329,4 @@ fn decode_history_cursor(
 ) -> Result<ImapHistoryState, ProviderError> {
     serde_json::from_str(&cursor.payload)
         .map_err(|_| ProviderError::cursor_invalid("the history cursor could not be read"))
-}
-
-/// Map a transport failure to a redacted provider error. Authentication
-/// failures become `Reauthenticate`; everything else is transient, with the
-/// wire detail confined to `source_detail`.
-fn transport_error(error: crate::transport::TransportError) -> ProviderError {
-    let message = error.to_string();
-    let lowered = message.to_ascii_lowercase();
-    if lowered.contains("login") || lowered.contains("auth") || lowered.contains("password") {
-        ProviderError::reauthenticate("the mail server rejected the sign-in")
-    } else {
-        ProviderError::transient("the mail server request failed").with_source_detail(message)
-    }
 }

@@ -51,6 +51,9 @@ pub struct FakeTransport {
     /// When true, every mutation (`store_flags`, `move_messages`,
     /// `copy_messages`, `delete_messages`) fails, to exercise rollback.
     pub fail_mutation: bool,
+    /// When true, `delete_messages` fails while other mutations succeed, to
+    /// exercise the partially-applied COPY + delete fallback.
+    pub fail_delete: bool,
 
     /// Test hooks for deterministic backfill race tests: `started` receives a
     /// permit when a header fetch begins, and the fetch waits for a permit on
@@ -273,7 +276,7 @@ impl MailTransport for FakeTransport {
     async fn delete_messages(&mut self, uids: &[Uid]) -> Result<(), TransportError> {
         let folder = self.current_folder()?;
         self.delete_calls.push((folder, uids.to_vec()));
-        if self.fail_mutation {
+        if self.fail_mutation || self.fail_delete {
             return Err(TransportError("mutation failed".to_string()));
         }
         Ok(())
