@@ -39,6 +39,11 @@ pub use remote_ids::{IMAP_SMTP_BACKEND_KEY, ImapCoords, MessageLocation};
 #[doc(hidden)]
 pub use migrations::{clear_migration_fault, inject_migration_fault};
 
+/// Test-only hook that runs inside a change-page transaction to force a
+/// cross-process snapshot conflict. Never set in production.
+#[doc(hidden)]
+pub use memberships::{clear_page_contention_hook, inject_page_contention_hook};
+
 /// A consistent read of the cache used to build one UI snapshot.
 #[derive(Debug, Default)]
 pub struct StoreView {
@@ -83,9 +88,13 @@ pub enum StoreError {
     /// job it belongs to.
     #[error("job checkpoint from generation {generation} is stale")]
     StaleCheckpoint { generation: u64 },
-    /// A change page was based on a job cursor the store has since moved past
-    /// (for example a concurrent mutation or a second process advanced it).
-    /// Applying it could regress newer state, so it is discarded.
+    /// A change page lost the commit race and was discarded: either it was
+    /// based on a job cursor the store has since moved past (a concurrent
+    /// mutation or a second process advanced it) or the commit hit a SQLite
+    /// lock/snapshot conflict from another writer. Applying it could regress
+    /// newer state, so it is discarded; the caller reconciles from the durable
+    /// checkpoint. A genuine failure (disk full, corruption, constraint
+    /// violation) is never reported as `StalePage`.
     #[error("a change page based on an outdated checkpoint was discarded")]
     StalePage,
     /// Another process holds the account's cross-process lease.
@@ -111,6 +120,25 @@ impl StoreError {
             field,
             value: value.into(),
         }
+    }
+
+    /// Whether this is a SQLite lock/snapshot conflict: another connection held
+    /// the write lock (`SQLITE_BUSY`/`SQLITE_LOCKED`), or committed a write
+    /// since this transaction read its checkpoint snapshot
+    /// (`SQLITE_BUSY_SNAPSHOT`).
+    ///
+    /// This is the cross-process form of losing the checkpoint race, so a caller
+    /// may discard the work and reconcile from the durable checkpoint rather
+    /// than abort. Genuine failures (disk full, corruption, constraint
+    /// violations, I/O errors) are deliberately *not* contention.
+    pub fn is_contention(&self) -> bool {
+        let StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) = self else {
+            return false;
+        };
+        matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
     }
 }
 
@@ -262,5 +290,46 @@ impl Store {
 impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Store").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::ffi;
+
+    fn sqlite_error(result_code: i32) -> StoreError {
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(result_code),
+            None,
+        ))
+    }
+
+    #[test]
+    fn contention_is_sqlite_busy_or_locked_only() {
+        // Busy (including the WAL snapshot-conflict extended code) and locked are
+        // the cross-process lost-race outcomes.
+        assert!(sqlite_error(ffi::SQLITE_BUSY).is_contention());
+        assert!(sqlite_error(ffi::SQLITE_BUSY_SNAPSHOT).is_contention());
+        assert!(sqlite_error(ffi::SQLITE_BUSY_RECOVERY).is_contention());
+        assert!(sqlite_error(ffi::SQLITE_LOCKED).is_contention());
+        assert!(sqlite_error(ffi::SQLITE_LOCKED_SHAREDCACHE).is_contention());
+
+        // Genuine failures must never be swallowed as a lost race.
+        assert!(!sqlite_error(ffi::SQLITE_FULL).is_contention());
+        assert!(!sqlite_error(ffi::SQLITE_CORRUPT).is_contention());
+        assert!(!sqlite_error(ffi::SQLITE_CONSTRAINT).is_contention());
+        assert!(!sqlite_error(ffi::SQLITE_IOERR).is_contention());
+        assert!(!sqlite_error(ffi::SQLITE_NOTADB).is_contention());
+
+        // Non-SQLite store errors are not contention either.
+        assert!(!StoreError::StalePage.is_contention());
+        assert!(
+            !StoreError::StaleGeneration {
+                expected: 1,
+                actual: 2
+            }
+            .is_contention()
+        );
     }
 }

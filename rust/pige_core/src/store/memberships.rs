@@ -12,6 +12,8 @@
 //! generation- and cursor-fenced transaction, so a failure leaves neither a
 //! half-applied page nor an advanced cursor.
 
+use std::cell::RefCell;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
@@ -23,6 +25,37 @@ use crate::providers::{
 
 use super::messages::{delete_messages_on, merge_threads_on, messages_for_account_on, upsert_message_on};
 use super::{Store, StoreError};
+
+thread_local! {
+    /// Test-only hook run inside [`Store::apply_change_page`]'s transaction,
+    /// after its generation/checkpoint reads and before its first write. A test
+    /// installs a closure that has a second connection to the same database
+    /// commit a competing write, forcing a real `SQLITE_BUSY_SNAPSHOT` so the
+    /// cross-process contention path can be exercised deterministically. `None`
+    /// in production.
+    static PAGE_CONTENTION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+/// Install the test-only change-page contention hook (test-only).
+#[doc(hidden)]
+pub fn inject_page_contention_hook(hook: impl FnOnce() + 'static) {
+    PAGE_CONTENTION_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Clear the test-only change-page contention hook (test-only).
+#[doc(hidden)]
+pub fn clear_page_contention_hook() {
+    PAGE_CONTENTION_HOOK.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Run and clear any installed contention hook. Called inside `apply_change_page`
+/// after the read snapshot is established, so the hook can invalidate it.
+fn run_page_contention_hook() {
+    if let Some(hook) = PAGE_CONTENTION_HOOK.with(|cell| cell.borrow_mut().take()) {
+        hook();
+    }
+}
 
 impl Store {
     /// The collections (folders or labels) a cached message belongs to.
@@ -79,7 +112,39 @@ impl Store {
     /// is the cursor the page was produced against (`None` for a first page);
     /// a mismatch is [`StoreError::StalePage`], which the caller discards
     /// rather than applying.
+    ///
+    /// A cross-process commit that makes the transaction lose its SQLite
+    /// snapshot, or a lock held by another writer, is likewise reported as
+    /// [`StoreError::StalePage`] rather than a raw SQLite error, so the caller
+    /// discards the page and reconciles from the durable checkpoint instead of
+    /// aborting the account pass. Genuine failures are not masked this way.
     pub fn apply_change_page(
+        &self,
+        ctx: &OperationContext,
+        key: &JobKey,
+        transport: &str,
+        expected_previous: Option<&ProviderCursor>,
+        page: &ChangePage,
+    ) -> Result<(), StoreError> {
+        self.apply_change_page_in(ctx, key, transport, expected_previous, page)
+            .map_err(|error| {
+                // A SQLite lock/snapshot conflict is the cross-process form of
+                // losing the checkpoint race: another writer held the write lock
+                // or committed a write since this transaction read its
+                // checkpoint snapshot, so the page can no longer commit
+                // atomically. Discard it and let the caller reconcile from the
+                // durable checkpoint. Genuine failures (disk full, corruption,
+                // constraint violations) are not contention and still surface as
+                // their own error.
+                if error.is_contention() {
+                    StoreError::StalePage
+                } else {
+                    error
+                }
+            })
+    }
+
+    fn apply_change_page_in(
         &self,
         ctx: &OperationContext,
         key: &JobKey,
@@ -91,6 +156,9 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         super::jobs::check_generation_in(&tx, &ctx.account, ctx.generation)?;
         super::jobs::check_checkpoint_in(&tx, key, expected_previous)?;
+        // The read snapshot is now established; a test may invalidate it here to
+        // simulate a second process committing before this transaction writes.
+        run_page_contention_hook();
 
         let mut threads =
             ThreadAssigner::from_messages(&messages_for_account_on(&tx, &ctx.account)?);

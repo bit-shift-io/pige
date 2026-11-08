@@ -23,6 +23,7 @@ use pige_core::providers::{
     ProviderCapabilities, ProviderCursor, ProviderError, ProviderFactory, ProviderId,
     ProviderSession, RemoteCollectionId, RemoteMessageId, SyncRequest, SyncService,
 };
+use pige_core::store::{clear_page_contention_hook, inject_page_contention_hook};
 use pige_core::sync::SyncError;
 use pige_core::sync::provider::{self, WorkBudget};
 use pige_core::sync::scheduler::{AccountScheduler, SchedulerError};
@@ -796,6 +797,84 @@ async fn removed_account_page_is_discarded() {
             )
             .unwrap()
             .is_none()
+    );
+}
+
+/// Cross-process contention: while a page's transaction holds its read snapshot,
+/// a second connection to the same database commits a competing write, so the
+/// page's deferred transaction fails to upgrade with a real
+/// `SQLITE_BUSY_SNAPSHOT`. That lost race must be discarded gracefully (the pass
+/// ends `Ok`, the checkpoint does not advance, nothing is cached) rather than
+/// aborting the whole account pass with a generic `SyncError::Store`.
+#[tokio::test]
+async fn cross_process_contention_is_a_lost_race_not_an_abort() {
+    let account = imap_account("acc-busy");
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("pige.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    store.upsert_account(&account).unwrap();
+    let key = provider::account_job(&account.id);
+
+    let page = ChangePage {
+        changes: vec![
+            MailChange::UpsertCollection(collection("INBOX", "INBOX", FolderKind::Inbox)),
+            message_change("imap:1", "INBOX", "raced", false, Flags::default()),
+        ],
+        checkpoint: ProviderCursor::new(1, "cp-1"),
+        has_more: false,
+    };
+
+    // The hook runs inside `apply_change_page`, once its read snapshot exists and
+    // before its first write. A second connection commits a competing write
+    // there, invalidating the snapshot so the upgrade fails with
+    // SQLITE_BUSY_SNAPSHOT.
+    //
+    // First, the store boundary reports the typed lost-race outcome, never the
+    // raw SQLite busy error.
+    let writer = Store::open(&db_path).unwrap();
+    inject_page_contention_hook(move || {
+        writer.set_meta("process-b", "committed").unwrap();
+    });
+    let direct =
+        store.apply_change_page(&ctx(&account.id, 1), &key, IMAP_SMTP_PROVIDER, None, &page);
+    clear_page_contention_hook();
+    assert!(
+        matches!(direct, Err(StoreError::StalePage)),
+        "cross-process contention must be StalePage, got {direct:?}"
+    );
+
+    // Then the sync loop must discard it gracefully instead of aborting.
+    let writer = Store::open(&db_path).unwrap();
+    inject_page_contention_hook(move || {
+        writer.set_meta("process-b", "committed-again").unwrap();
+    });
+    let mut session = provider_session(ScriptedSync::pages(vec![(None, page)]), IMAP_SMTP_PROVIDER);
+    let outcome =
+        provider::sync_account(&store, &mut session, &ctx(&account.id, 1), budget(4)).await;
+    clear_page_contention_hook();
+
+    let report = outcome.expect("a lost cross-process race must be discarded, not abort the pass");
+    assert_eq!(report.errors.len(), 0);
+    assert_eq!(
+        store.job_checkpoint(&key).unwrap(),
+        None,
+        "the contended page must not advance the checkpoint"
+    );
+    assert!(
+        store
+            .remote_message_for(
+                &account.id,
+                IMAP_SMTP_PROVIDER,
+                &RemoteMessageId::new("imap:1")
+            )
+            .unwrap()
+            .is_none(),
+        "the contended page must not cache anything"
+    );
+    assert!(
+        store.folders(&account.id).unwrap().is_empty(),
+        "the contended page's collection must not persist"
     );
 }
 
