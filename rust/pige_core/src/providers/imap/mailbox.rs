@@ -24,7 +24,7 @@ use crate::providers::types::{
     HistoryRequest, MessageRecord, OperationContext, RemoteAttachmentId, RemoteMessageId,
     SignatureStatus,
 };
-use crate::transport::{MailTransport, RemoteFolder, RemoteMessage};
+use crate::transport::{FolderState, MailTransport, RemoteFolder, RemoteMessage};
 
 use super::identity;
 
@@ -68,8 +68,9 @@ impl ImapMailbox {
 
     /// SELECT `mailbox` so a subsequent fetch targets the right folder. The
     /// name is passed through unmodified; modified-UTF7 encoding to the wire
-    /// stays in the transport.
-    async fn select_mailbox(&mut self, mailbox: &str) -> Result<(), ProviderError> {
+    /// stays in the transport. Returns the selected folder's state so callers
+    /// can honor its `UIDVALIDITY`.
+    async fn select_mailbox(&mut self, mailbox: &str) -> Result<FolderState, ProviderError> {
         let folder = RemoteFolder {
             name: mailbox.to_string(),
             delimiter: None,
@@ -78,7 +79,6 @@ impl ImapMailbox {
         self.transport
             .select(&folder)
             .await
-            .map(|_| ())
             .map_err(transport_error)
     }
 
@@ -90,7 +90,14 @@ impl ImapMailbox {
     ) -> Result<(String, Vec<u8>), ProviderError> {
         let coords = identity::decode_message(remote)
             .ok_or_else(|| ProviderError::not_found("the message is not available"))?;
-        self.select_mailbox(&coords.mailbox).await?;
+        let folder_state = self.select_mailbox(&coords.mailbox).await?;
+        // The id names a specific UIDVALIDITY epoch. If the mailbox has been
+        // re-enumerated since, the UID now refers to a different message (or
+        // none), so a stale id must be reported missing rather than fetching
+        // whatever currently holds that UID.
+        if folder_state.uidvalidity != coords.uidvalidity {
+            return Err(ProviderError::not_found("the message is not available"));
+        }
         let raw = self
             .transport
             .fetch_body(coords.uid)
@@ -188,23 +195,26 @@ impl MailboxService for ImapMailbox {
             ctx.ensure_active()?;
             let mailbox = state.mailboxes[state.index].clone();
 
-            // Enter the mailbox on the first page that touches it.
-            if state.before_uid.is_none() {
-                let folder = RemoteFolder {
-                    name: mailbox.clone(),
-                    delimiter: None,
-                    kind: FolderKind::Other,
-                };
-                match self.transport.select(&folder).await {
-                    Ok(folder_state) => state.uidvalidity = folder_state.uidvalidity,
-                    Err(_) => {
-                        // A mailbox we cannot select (for example \NoSelect) is
-                        // skipped so one bad folder never wedges the crawl.
-                        state.index += 1;
-                        state.uidvalidity = 0;
-                        continue;
-                    }
+            // (Re-)select the current mailbox on *every* page. The cursor is
+            // durable, so a fresh session (or an interleaved `body`/
+            // `attachment`/`collections` call) may leave a different mailbox
+            // selected; `list_uids` and `fetch_learning_headers` act on the
+            // currently selected folder, so we must re-establish the cursor's.
+            let folder_state = match self.select_mailbox(&mailbox).await {
+                Ok(folder_state) => folder_state,
+                Err(_) => {
+                    // A mailbox we cannot select (for example \NoSelect) is
+                    // skipped so one bad folder never wedges the crawl.
+                    state.index += 1;
+                    state.uidvalidity = 0;
+                    state.before_uid = None;
+                    continue;
                 }
+            };
+            // Enter the mailbox on the first page that touches it: record the
+            // epoch that names every id yielded from this mailbox.
+            if state.before_uid.is_none() {
+                state.uidvalidity = folder_state.uidvalidity;
             }
 
             let mut uids = self.transport.list_uids().await.map_err(transport_error)?;

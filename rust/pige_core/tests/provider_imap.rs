@@ -18,7 +18,7 @@ use pige_core::mail::{
 use pige_core::platform::CredentialStore;
 use pige_core::platform::fake::{FakeCredentials, FakeTransportFactory};
 use pige_core::providers::{
-    HistoryRequest, MailboxService, OperationContext, ProviderFactory,
+    ErrorKind, HistoryRequest, MailboxService, OperationContext, ProviderFactory,
     imap::{ImapProviderFactory, identity},
 };
 use pige_core::transport::{FakeTransport, FolderState, RemoteFolder, RemoteMessage};
@@ -380,4 +380,149 @@ aGVsbG8=\r\n\
     // handlers, so the adapter did not bypass the sanitizer pipeline.
     let document = parse_html(html, false);
     assert_eq!(document.visible_text(), "Hello world");
+}
+
+#[tokio::test]
+async fn history_resume_reselects_the_cursors_mailbox() {
+    // A durable cursor that stops mid-mailbox. A fresh session resumes it while
+    // a *different* mailbox is selected (as an interleaved body/attachment
+    // read would leave it); the resume must re-SELECT the cursor's mailbox
+    // before enumerating, or `list_uids` reads the wrong folder.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                folder("Other", FolderKind::Other),
+            ],
+            states: HashMap::from([
+                ("INBOX".to_string(), state(7, 4)),
+                ("Other".to_string(), state(9, 51)),
+            ]),
+            messages: HashMap::from([
+                (
+                    "INBOX".to_string(),
+                    vec![message(1, "one"), message(2, "two"), message(3, "three")],
+                ),
+                ("Other".to_string(), vec![message(50, "other")]),
+            ]),
+            bodies: HashMap::from([(
+                "Other".to_string(),
+                HashMap::from([(
+                    Uid(50),
+                    b"From: a@example.com\r\nSubject: other\r\n\r\nbody".to_vec(),
+                )]),
+            )]),
+            ..FakeTransport::default()
+        },
+    );
+
+    // First page of an INBOX crawl with page_size 1 leaves a mid-mailbox
+    // checkpoint: `before_uid` is set (UID 2 remains unread).
+    let mut session = open(transports.clone()).await;
+    let first = session
+        .mailbox_service()
+        .unwrap()
+        .history(
+            HistoryRequest {
+                cursor: None,
+                page_size: 1,
+            },
+            &context(),
+        )
+        .await
+        .expect("first page");
+    assert_eq!(first.messages.len(), 1);
+    let frontier = identity::decode_message(&first.messages[0].remote_id).expect("IMAP id");
+    assert_eq!(frontier.mailbox, "INBOX");
+    assert_eq!(frontier.uid, Uid(3));
+    assert!(first.has_more, "the crawl continues");
+    let cursor = first.checkpoint.clone();
+
+    // A fresh session whose selected mailbox is now something else.
+    let mut fresh = open(transports.clone()).await;
+    fresh
+        .mailbox_service()
+        .unwrap()
+        .body(
+            &identity::message_remote_id("Other", 9, Uid(50)),
+            &context(),
+        )
+        .await
+        .expect("read from Other");
+    {
+        let transport = transports.transport(&account.id).await.expect("transport");
+        assert_eq!(transport.current.as_deref(), Some("Other"));
+    }
+
+    let resumed = fresh
+        .mailbox_service()
+        .unwrap()
+        .history(
+            HistoryRequest {
+                cursor: Some(cursor),
+                page_size: 1,
+            },
+            &context(),
+        )
+        .await
+        .expect("resume page");
+
+    assert_eq!(resumed.messages.len(), 1);
+    let next = identity::decode_message(&resumed.messages[0].remote_id).expect("IMAP id");
+    assert_eq!(
+        next.mailbox, "INBOX",
+        "a resumed page must read the cursor's mailbox, not the selected one"
+    );
+    assert_eq!(next.uid, Uid(2), "the next newest INBOX UID");
+
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert_eq!(
+        transport.select_calls.last().map(String::as_str),
+        Some("INBOX"),
+        "the resume re-selected the cursor's mailbox"
+    );
+}
+
+#[tokio::test]
+async fn read_with_stale_uidvalidity_is_not_found() {
+    // After an epoch rotation the same UID names a different message. A stale
+    // remote id must resolve to NotFound, never to whatever now holds that UID.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    const MAILBOX: &str = "INBOX";
+    const RAW: &[u8] = b"From: a@example.com\r\nSubject: hi\r\n\r\nbody";
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![folder(MAILBOX, FolderKind::Inbox)],
+            states: HashMap::from([(MAILBOX.to_string(), state(7, 2))]),
+            messages: HashMap::from([(MAILBOX.to_string(), vec![message(1, "hi")])]),
+            bodies: HashMap::from([(MAILBOX.to_string(), HashMap::from([(Uid(1), RAW.to_vec())]))]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let mut session = open(transports.clone()).await;
+
+    let stale = identity::message_remote_id(MAILBOX, 99, Uid(1));
+    let error = session
+        .mailbox_service()
+        .unwrap()
+        .body(&stale, &context())
+        .await
+        .expect_err("a stale epoch must not resolve");
+    assert_eq!(error.kind, ErrorKind::NotFound);
+
+    // The same UID under the live epoch still reads.
+    let live = identity::message_remote_id(MAILBOX, 7, Uid(1));
+    let body = session
+        .mailbox_service()
+        .unwrap()
+        .body(&live, &context())
+        .await
+        .expect("live epoch reads");
+    assert_eq!(body.raw.as_deref(), Some(RAW));
 }
