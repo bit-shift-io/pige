@@ -39,6 +39,40 @@ impl ImapTransport {
             .as_ref()
             .is_some_and(|caps| caps.has_str(name))
     }
+
+    /// Fetch `(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])` for an IMAP sequence
+    /// set and parse each header. Shared by the range-based sync fetch and the
+    /// UID-set history fetch so both stay identical. One malformed header is
+    /// skipped rather than aborting the whole batch.
+    async fn fetch_header_set(&mut self, set: &str) -> Result<Vec<RemoteMessage>, TransportError> {
+        let stream = self
+            .session
+            .uid_fetch(set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])")
+            .await
+            .map_err(transport_err)?;
+        futures::pin_mut!(stream);
+
+        let mut messages = Vec::new();
+        while let Some(fetch) = stream.try_next().await.map_err(transport_err)? {
+            let Some(uid) = fetch.uid else { continue };
+            let Some(header_bytes) = fetch.header() else {
+                continue;
+            };
+            // One malformed header must not abort the whole batch.
+            let Ok(mut header) = crate::mail::parse_header_block(header_bytes) else {
+                continue;
+            };
+            let size = fetch.size.unwrap_or(0);
+            header.size = size;
+            messages.push(RemoteMessage {
+                uid: Uid(uid),
+                header,
+                flags: flags_from_fetch(&fetch),
+                size,
+            });
+        }
+        Ok(messages)
+    }
 }
 
 /// Connect to `account`'s IMAP server using password authentication and the
@@ -151,33 +185,28 @@ impl MailTransport for ImapTransport {
         range: UidRange,
     ) -> Result<Vec<RemoteMessage>, TransportError> {
         let set = format!("{}:{}", range.from.0, range.to.0);
-        let stream = self
-            .session
-            .uid_fetch(set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])")
-            .await
-            .map_err(transport_err)?;
-        futures::pin_mut!(stream);
+        self.fetch_header_set(&set).await
+    }
 
-        let mut messages = Vec::new();
-        while let Some(fetch) = stream.try_next().await.map_err(transport_err)? {
-            let Some(uid) = fetch.uid else { continue };
-            let Some(header_bytes) = fetch.header() else {
-                continue;
-            };
-            // One malformed header must not abort the whole batch.
-            let Ok(mut header) = crate::mail::parse_header_block(header_bytes) else {
-                continue;
-            };
-            let size = fetch.size.unwrap_or(0);
-            header.size = size;
-            messages.push(RemoteMessage {
-                uid: Uid(uid),
-                header,
-                flags: flags_from_fetch(&fetch),
-                size,
-            });
+    async fn list_uids(&mut self) -> Result<Vec<Uid>, TransportError> {
+        let uids = self.session.uid_search("ALL").await.map_err(transport_err)?;
+        let mut uids: Vec<Uid> = uids.into_iter().map(Uid).collect();
+        // UIDs are sparse; sort for a deterministic, ascending view. Never
+        // densify the set.
+        uids.sort_unstable();
+        Ok(uids)
+    }
+
+    async fn fetch_learning_headers(
+        &mut self,
+        uids: &[Uid],
+    ) -> Result<Vec<RemoteMessage>, TransportError> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(messages)
+        // Explicit UID set, not a dense range: a mailbox with UIDs
+        // `1, 900, 50000` fetches exactly those three.
+        self.fetch_header_set(&uid_set(uids)).await
     }
 
     async fn fetch_texts(

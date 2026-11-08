@@ -81,6 +81,8 @@ fn message(
             from: vec![Address::new(Some(from_name.to_string()), from_email)],
             to: vec![Address::new(None, "inbox@example.com")],
             cc: Vec::new(),
+            reply_to: Vec::new(),
+            bcc: Vec::new(),
             date,
             size: 64,
         },

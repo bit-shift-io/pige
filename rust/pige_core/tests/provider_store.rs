@@ -71,6 +71,8 @@ fn header(rfc_id: Option<&str>, subject: &str) -> MessageHeader {
         from: vec![pige_core::Address::new(None, "sender@example.com")],
         to: Vec::new(),
         cc: Vec::new(),
+    reply_to: Vec::new(),
+    bcc: Vec::new(),
         date: 1_700_000_000,
         size: 128,
     }

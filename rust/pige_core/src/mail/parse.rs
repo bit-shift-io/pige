@@ -59,9 +59,29 @@ pub fn parse_header_block(bytes: &[u8]) -> Result<MessageHeader, ParseError> {
         from: addresses(message.from()),
         to: addresses(message.to()),
         cc: addresses(message.cc()),
+        reply_to: addresses(message.reply_to()),
+        // Bcc is only present when the server exposes it (for example a sent
+        // message the user authored); received mail normally omits it and no
+        // address is invented.
+        bcc: addresses(message.bcc()),
         date: message.date().map_or(0, |date| date.to_timestamp()),
         size: 0,
     })
+}
+
+/// Extract the decoded HTML and plain-text bodies from a raw RFC 5322 message.
+///
+/// This is the single MIME entry point for both the reader cache
+/// ([`crate::api`]) and the provider adapters, so a body is only ever decoded
+/// one way. The returned HTML is raw: callers route it through the allowlist
+/// sanitizer ([`crate::html::parse_html`]) before rendering or indexing.
+pub fn body_parts(raw: &[u8]) -> (Option<String>, Option<String>) {
+    let Some(parsed) = MessageParser::new().parse(raw) else {
+        return (None, None);
+    };
+    let html = parsed.html_bodies().next().map(|body| body.into_owned());
+    let plain_text = parsed.text_bodies().next().map(|body| body.into_owned());
+    (html, plain_text)
 }
 
 /// Maximum number of characters kept in a list preview.

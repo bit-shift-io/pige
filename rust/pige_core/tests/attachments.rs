@@ -185,6 +185,8 @@ fn message(folder: &Folder, thread: &str) -> StoredMessage {
             from: Vec::new(),
             to: Vec::new(),
             cc: Vec::new(),
+            reply_to: Vec::new(),
+            bcc: Vec::new(),
             date: 1_700_000_000,
             size: WITH_ATTACHMENT.len() as u32,
         },

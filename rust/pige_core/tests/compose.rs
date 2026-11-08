@@ -50,6 +50,8 @@ fn header() -> MessageHeader {
         )],
         to: vec![Address::new(None, "ada@example.com")],
         cc: Vec::new(),
+    reply_to: Vec::new(),
+    bcc: Vec::new(),
         date: 1_772_960_400,
         size: 512,
     }

@@ -613,6 +613,17 @@ impl MailTransport for UnavailableImap {
         Err(imap_unavailable())
     }
 
+    async fn list_uids(&mut self) -> Result<Vec<Uid>, TransportError> {
+        Err(imap_unavailable())
+    }
+
+    async fn fetch_learning_headers(
+        &mut self,
+        _uids: &[Uid],
+    ) -> Result<Vec<RemoteMessage>, TransportError> {
+        Err(imap_unavailable())
+    }
+
     async fn fetch_texts(
         &mut self,
         _uids: &[Uid],

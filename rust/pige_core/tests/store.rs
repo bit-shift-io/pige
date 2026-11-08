@@ -68,6 +68,8 @@ fn message(folder: &Folder, uid: u32, uidvalidity: u32, date: i64) -> StoredMess
                 email: "charles@example.com".to_string(),
             }],
             cc: Vec::new(),
+            reply_to: Vec::new(),
+            bcc: Vec::new(),
             date,
             size: 512,
         },

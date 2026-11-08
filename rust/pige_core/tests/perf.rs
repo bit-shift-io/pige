@@ -98,6 +98,8 @@ fn seed(store: &Store) {
                 )],
                 to: vec![Address::new(None, "inbox@example.com")],
                 cc: Vec::new(),
+                reply_to: Vec::new(),
+                bcc: Vec::new(),
                 date: 1_700_000_000 + i64::from(index),
                 size: 512,
             },

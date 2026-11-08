@@ -92,6 +92,20 @@ pub trait MailTransport: Send {
         &mut self,
         range: UidRange,
     ) -> Result<Vec<RemoteMessage>, TransportError>;
+    /// Every UID in the currently selected mailbox, ascending.
+    ///
+    /// A protocol-only enumeration used by header-history learning. UIDs are
+    /// sparse and non-contiguous, so callers must never assume a dense range:
+    /// the returned set is the authoritative list. Servers that cannot return
+    /// the whole set may page an equivalent internally, but the visible
+    /// contract is the complete, sparse set.
+    async fn list_uids(&mut self) -> Result<Vec<Uid>, TransportError>;
+    /// Fetch only headers (and flags/size) for the given UIDs, used by
+    /// header-history learning. Bodies and attachment parts are never fetched.
+    async fn fetch_learning_headers(
+        &mut self,
+        uids: &[Uid],
+    ) -> Result<Vec<RemoteMessage>, TransportError>;
     /// Fetch the first `max_bytes` of each message's text, used to fill snippets.
     async fn fetch_texts(
         &mut self,

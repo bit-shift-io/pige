@@ -283,6 +283,17 @@ impl MailTransport for FakeTransportHandle {
         self.0.lock().await.fetch_headers(range).await
     }
 
+    async fn list_uids(&mut self) -> std::result::Result<Vec<crate::mail::Uid>, TransportError> {
+        self.0.lock().await.list_uids().await
+    }
+
+    async fn fetch_learning_headers(
+        &mut self,
+        uids: &[crate::mail::Uid],
+    ) -> std::result::Result<Vec<RemoteMessage>, TransportError> {
+        self.0.lock().await.fetch_learning_headers(uids).await
+    }
+
     async fn fetch_texts(
         &mut self,
         uids: &[crate::mail::Uid],

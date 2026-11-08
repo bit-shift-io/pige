@@ -79,6 +79,8 @@ fn msg(uid: u32, subject: &str, from: &str) -> RemoteMessage {
             from: vec![Address::new(None, from)],
             to: Vec::new(),
             cc: Vec::new(),
+            reply_to: Vec::new(),
+            bcc: Vec::new(),
             date: i64::from(uid),
             size: 100,
         },

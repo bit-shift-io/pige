@@ -250,6 +250,12 @@ pub struct MessageRecord {
 }
 
 /// One incremental change produced by a sync page.
+///
+/// The `UpsertMessage` variant carries a whole [`MessageRecord`], so the enum is
+/// larger than its other variants. This shape is the cross-plan contract and a
+/// sync page is not a hot path, so it is deliberately left unboxed (as
+/// [`crate::auth::AuthProgress`] is).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MailChange {
     UpsertCollection(CollectionRecord),

@@ -895,6 +895,11 @@ fn message_from_row(row: &Row<'_>) -> Result<StoredMessage, StoreError> {
             from: decode_json(&from_json, "messages.from_json")?,
             to: decode_json(&to_json, "messages.to_json")?,
             cc: decode_json(&cc_json, "messages.cc_json")?,
+            // `Reply-To`/`Bcc` are learned from provider headers; the cache does
+            // not persist columns for them yet, so a stored row reads them back
+            // empty rather than inventing addresses.
+            reply_to: Vec::new(),
+            bcc: Vec::new(),
             date: row.get(10)?,
             size: row.get(11)?,
         },

@@ -37,6 +37,8 @@ pub struct FakeTransport {
 
     pub select_calls: Vec<String>,
     pub fetch_headers_calls: Vec<(String, UidRange)>,
+    pub list_uids_calls: Vec<String>,
+    pub fetch_learning_headers_calls: Vec<(String, Vec<Uid>)>,
     pub fetch_flags_calls: Vec<(String, Vec<Uid>)>,
     pub fetch_texts_calls: Vec<(String, Vec<Uid>, usize)>,
     pub fetch_body_calls: Vec<(String, Uid)>,
@@ -71,6 +73,8 @@ impl FakeTransport {
     pub fn clear_calls(&mut self) {
         self.select_calls.clear();
         self.fetch_headers_calls.clear();
+        self.list_uids_calls.clear();
+        self.fetch_learning_headers_calls.clear();
         self.fetch_flags_calls.clear();
         self.fetch_texts_calls.clear();
         self.fetch_body_calls.clear();
@@ -144,6 +148,38 @@ impl MailTransport for FakeTransport {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn list_uids(&mut self) -> Result<Vec<Uid>, TransportError> {
+        let folder = self.current_folder()?;
+        self.list_uids_calls.push(folder.clone());
+        // The scripted messages' UIDs are the authoritative sparse set.
+        let mut uids: Vec<Uid> = self
+            .messages
+            .get(&folder)
+            .map(|messages| messages.iter().map(|message| message.uid).collect())
+            .unwrap_or_default();
+        uids.sort_unstable();
+        Ok(uids)
+    }
+
+    async fn fetch_learning_headers(
+        &mut self,
+        uids: &[Uid],
+    ) -> Result<Vec<RemoteMessage>, TransportError> {
+        let folder = self.current_folder()?;
+        self.fetch_learning_headers_calls
+            .push((folder.clone(), uids.to_vec()));
+        // Fetch exactly the requested (possibly sparse) UIDs, in the order asked.
+        Ok(uids
+            .iter()
+            .filter_map(|uid| {
+                self.messages
+                    .get(&folder)
+                    .and_then(|messages| messages.iter().find(|message| message.uid == *uid))
+                    .cloned()
+            })
+            .collect())
     }
 
     async fn fetch_texts(

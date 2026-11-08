@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod fake;
+pub mod imap;
 pub mod registry;
 pub mod traits;
 pub mod types;

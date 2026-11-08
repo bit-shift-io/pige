@@ -140,6 +140,8 @@ fn seed_account_data(store: &Store, owner: &AccountId, tag: &str) {
             from: vec![Address::new(None, format!("{tag}@example.com"))],
             to: Vec::new(),
             cc: Vec::new(),
+            reply_to: Vec::new(),
+            bcc: Vec::new(),
             date: 1,
             size: 64,
         },

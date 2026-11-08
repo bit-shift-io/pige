@@ -18,6 +18,13 @@ pub struct MessageHeader {
     pub from: Vec<Address>,
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
+    /// `Reply-To` addresses, when the sender set them.
+    #[serde(default)]
+    pub reply_to: Vec<Address>,
+    /// `Bcc` addresses, only when the server actually exposes them (a Sent
+    /// copy the user authored, for example). Never invented for received mail.
+    #[serde(default)]
+    pub bcc: Vec<Address>,
     /// Unix seconds, UTC.
     pub date: i64,
     pub size: u32,

@@ -2506,13 +2506,11 @@ fn cache_fetched_body(store: &Store, message_id: &MessageId, raw: &[u8]) -> Opti
 }
 
 /// Extract the HTML and plain-text bodies from a raw RFC 5322 message.
+///
+/// Delegates to the shared MIME entry point so the reader cache and provider
+/// adapters decode bodies identically.
 fn extract_body_parts(raw: &[u8]) -> (Option<String>, Option<String>) {
-    let Some(parsed) = mail_parser::MessageParser::new().parse(raw) else {
-        return (None, None);
-    };
-    let html = parsed.html_bodies().next().map(|body| body.into_owned());
-    let plain_text = parsed.text_bodies().next().map(|body| body.into_owned());
-    (html, plain_text)
+    crate::mail::body_parts(raw)
 }
 
 /// Build a [`MailDocument`] from a cached body, preferring HTML.
