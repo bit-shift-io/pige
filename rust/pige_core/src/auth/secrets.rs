@@ -51,9 +51,26 @@ pub struct GoogleSessionSecret {
 /// unlocks every address key; the login password is deliberately never stored.
 #[derive(Clone)]
 pub struct ProtonSessionSecret {
+    /// Proton session UID (`x-pm-uid`); not secret, but required to refresh.
+    pub uid: Option<String>,
     pub access_token: Option<SecretString>,
     pub refresh_token: Option<SecretString>,
     pub skp: Option<SecretString>,
+}
+
+impl fmt::Debug for ProtonSessionSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtonSessionSecret")
+            .field("uid", &self.uid.as_ref().map(|_| "<present>"))
+            .field("access_token", &self.access_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("skp", &self.skp.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The credential a provider session protects.
@@ -161,6 +178,7 @@ impl StoredCredentials {
                 scopes: secret.scopes.clone(),
             },
             Self::Proton(secret) => WireCredentials::Proton {
+                uid: secret.uid.clone(),
                 access_token: expose(&secret.access_token),
                 refresh_token: expose(&secret.refresh_token),
                 skp: expose(&secret.skp),
@@ -183,10 +201,12 @@ impl StoredCredentials {
                 scopes,
             }),
             WireCredentials::Proton {
+                uid,
                 access_token,
                 refresh_token,
                 skp,
             } => Self::Proton(ProtonSessionSecret {
+                uid,
                 access_token: access_token.map(SecretString::from),
                 refresh_token: refresh_token.map(SecretString::from),
                 skp: skp.map(SecretString::from),
@@ -225,6 +245,7 @@ impl fmt::Debug for StoredCredentials {
                 .finish(),
             Self::Proton(secret) => formatter
                 .debug_struct("Proton")
+                .field("uid", &secret.uid.as_ref().map(|_| "<present>"))
                 .field("access_token", &secret.access_token.as_ref().map(|_| "<redacted>"))
                 .field(
                     "refresh_token",
@@ -666,6 +687,8 @@ enum WireCredentials {
         scopes: Vec<String>,
     },
     Proton {
+        #[serde(default)]
+        uid: Option<String>,
         #[serde(default)]
         access_token: Option<String>,
         #[serde(default)]

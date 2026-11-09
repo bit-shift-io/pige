@@ -13,6 +13,8 @@
 //! [`SecretString`]: secrecy::SecretString
 
 pub mod fake;
+#[cfg(feature = "provider-proton")]
+pub mod proton;
 pub mod secrets;
 pub mod session;
 pub mod types;

@@ -655,6 +655,7 @@ fn auth_debug_redacts_all_secret_variants() {
         ),
         (
             SecretEnvelope::proton(ProtonSessionSecret {
+                uid: Some("proton-uid".to_string()),
                 access_token: Some(SecretString::from("proton-access")),
                 refresh_token: Some(SecretString::from("proton-refresh")),
                 skp: Some(SecretString::from("proton-skp")),

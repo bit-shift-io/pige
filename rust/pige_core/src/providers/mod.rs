@@ -11,6 +11,8 @@ pub mod fake;
 #[cfg(feature = "provider-google")]
 pub mod google;
 pub mod imap;
+#[cfg(feature = "provider-proton")]
+pub mod proton;
 pub mod registry;
 pub mod traits;
 pub mod types;
