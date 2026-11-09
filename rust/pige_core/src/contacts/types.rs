@@ -10,7 +10,39 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::account::AccountId;
 use crate::mail::Address;
+
+/// A bounded, local-only recipient lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientQuery {
+    pub sending_account: AccountId,
+    pub text: String,
+    pub limit: u16,
+}
+
+/// Why an address is suggested. The order is also the order sources are
+/// reported in, independent of ranking priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SuggestionSource {
+    SavedContact,
+    OtherContact,
+    Outgoing,
+    Incoming,
+    Selected,
+}
+
+/// One deduplicated autocomplete result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientSuggestion {
+    /// The original deliverable address; lookup may case-fold for matching but
+    /// never rewrites this value.
+    pub address: Address,
+    pub sources: Vec<SuggestionSource>,
+    /// Every account that independently observed this exact address, with the
+    /// sending account first when it has a row.
+    pub accounts: Vec<AccountId>,
+}
 
 /// Canonical identity of an email address.
 ///

@@ -6,10 +6,13 @@
 
 pub mod learn;
 pub mod normalize;
+pub mod rank;
 pub mod types;
 
 pub use learn::{observe_cached_message, observe_message, observe_outgoing};
 pub use normalize::{normalize_address, normalize_email};
+pub use rank::{MAX_QUERY_CHARS, MAX_SUGGESTIONS, RecipientCandidate};
 pub use types::{
-    AddressError, AddressKey, EvidenceId, HeaderRole, LearningOrigin, Observation, ObservationTrust,
+    AddressError, AddressKey, EvidenceId, HeaderRole, LearningOrigin, Observation,
+    ObservationTrust, RecipientQuery, RecipientSuggestion, SuggestionSource,
 };

@@ -8,6 +8,7 @@
 
 pub mod accounts;
 pub mod body;
+pub mod contacts;
 pub mod events;
 pub mod mailbox;
 pub mod mutations;
@@ -55,6 +56,7 @@ use mailbox::{INTERACTIVE_TIMEOUT, SYNC_TIMEOUT, open_session, scheduler_message
 /// account indefinitely.
 const SYNC_PAGES: u32 = 8;
 
+pub use crate::contacts::{RecipientQuery, RecipientSuggestion, SuggestionSource};
 pub use crate::settings::{Settings, ThemeMode};
 pub use accounts::{
     answer_auth, begin_auth, can_switch_backend, cancel_auth, finish_auth, switch_backend,
@@ -63,6 +65,7 @@ pub use accounts::{
 pub use accounts::{
     clear_switch_crash, inject_switch_crash_after_config, inject_switch_crash_after_secret,
 };
+pub use contacts::{record_recipient_selection, suggest_recipients};
 pub use events::{CoreEvent, back_pressed, subscribe};
 pub use mutations::{
     RECONNECT_ERROR, archive_available, archive_thread, delete_permanently, move_thread, set_read,
@@ -1388,8 +1391,9 @@ pub async fn set_account_color(id: &AccountId, color: &str) -> Result<ModelSnaps
 }
 
 /// Remember a sender address as blocked. This only records the choice in the
-/// configuration document; no inbox filtering reads it yet. The address is
-/// trimmed and lowercased so duplicates with different casing collapse.
+/// configuration document; local recipient suggestions exclude it, but no inbox
+/// filtering reads it yet. The address is trimmed and lowercased so duplicate
+/// blocked senders with different casing collapse.
 pub fn block_sender(address: &str) -> Result<(), String> {
     let address = address.trim().to_lowercase();
     if address.is_empty() || !address.contains('@') {

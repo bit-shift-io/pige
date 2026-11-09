@@ -9,13 +9,18 @@
 //! a remote message, evicting cache content, or clearing a folder must leave the
 //! learned correspondent intact. Only deleting the account cascades it away.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{OptionalExtension, params, params_from_iter};
 
 use crate::account::AccountId;
 use crate::contacts::learn;
 use crate::contacts::normalize::normalize_address;
+use crate::contacts::rank::{
+    MAX_FREQUENCY, OTHER_CONTACT_KIND, RecipientCandidate, recipient_search_sql,
+    recipient_search_tokens,
+};
 use crate::contacts::types::{
     AddressKey, EvidenceId, HeaderRole, LearningOrigin, Observation, ObservationTrust,
 };
@@ -98,6 +103,37 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Record one deliberate recipient choice made in compose.
+    ///
+    /// This is deliberately a stable evidence id per address: repeated picks
+    /// refresh `last_seen` but cannot inflate frequency, while arbitrary typing
+    /// never reaches this method. The user-authored display name (if any) is
+    /// learned as deliberate evidence.
+    pub fn record_selection(
+        &self,
+        ctx: &OperationContext,
+        address: &Address,
+    ) -> Result<(), StoreError> {
+        let key = normalize_address(address)
+            .map_err(|error| StoreError::corrupt("contacts.address", error.to_string()))?;
+        let observation = Observation {
+            key: key.clone(),
+            address: address.clone(),
+            role: HeaderRole::To,
+            last_seen: now_unix(),
+            outgoing: true,
+            trust: ObservationTrust::Deliberate,
+        };
+        let evidence = EvidenceId(format!("selection:{}", key.0));
+        self.record_observations(
+            ctx,
+            &evidence,
+            LearningOrigin::Selection,
+            None,
+            &[observation],
+        )
     }
 
     /// Persist a history page's observations and advance the history checkpoint
@@ -299,6 +335,453 @@ impl Store {
         }
         Ok(roles)
     }
+
+    /// Search the indexed recipient projection. Matches every query token as a
+    /// case-folded prefix against the token table, then joins the ranking
+    /// projection. Only `cap` rows are read; no evidence rows are touched.
+    pub fn recipient_candidates(
+        &self,
+        sending_account: &AccountId,
+        folded_query: &str,
+        tokens: &[String],
+        cap: usize,
+    ) -> Result<Vec<RecipientCandidate>, StoreError> {
+        if tokens.is_empty() || cap == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = recipient_search_sql(tokens.len());
+        let values = recipient_query_values(sending_account, folded_query, tokens, cap);
+        let conn = self.connection();
+        let mut statement = conn.prepare(&sql)?;
+        let mut rows = statement.query(params_from_iter(values))?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next()? {
+            let email: String = row.get(2)?;
+            let display_name: Option<String> = row.get(3)?;
+            let last_seen: i64 = row.get(10)?;
+            let frequency: i64 = row.get(11)?;
+            candidates.push(RecipientCandidate {
+                account: AccountId(row.get(0)?),
+                key: AddressKey(row.get(1)?),
+                address: Address::new(display_name, email),
+                saved: row.get::<_, i64>(4)? != 0,
+                other: row.get::<_, i64>(5)? != 0,
+                outgoing: row.get::<_, i64>(6)? != 0,
+                selected: row.get::<_, i64>(7)? != 0,
+                incoming: row.get::<_, i64>(8)? != 0,
+                low_trust_only: row.get::<_, i64>(9)? != 0,
+                last_seen,
+                frequency: frequency.max(0) as u32,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// `EXPLAIN QUERY PLAN` for the real recipient lookup. Exposed for the
+    /// 100k-address fixture test; it uses exactly the production SQL and values.
+    #[doc(hidden)]
+    pub fn explain_recipient_search(
+        &self,
+        sending_account: &AccountId,
+        folded_query: &str,
+        tokens: &[String],
+        cap: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!("EXPLAIN QUERY PLAN {}", recipient_search_sql(tokens.len()));
+        let values = recipient_query_values(sending_account, folded_query, tokens, cap);
+        let conn = self.connection();
+        let mut statement = conn.prepare(&sql)?;
+        let mut rows = statement.query(params_from_iter(values))?;
+        let mut plan = Vec::new();
+        while let Some(row) = rows.next()? {
+            plan.push(row.get::<_, String>(3)?);
+        }
+        Ok(plan)
+    }
+
+    /// Rebuild both derived recipient tables from their durable sources. Used
+    /// after migration and by repair tooling; ordinary writes refresh only the
+    /// affected address key.
+    pub fn rebuild_recipient_index(&self) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        rebuild_recipient_index_in(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn recipient_query_values(
+    sending_account: &AccountId,
+    folded_query: &str,
+    tokens: &[String],
+    cap: usize,
+) -> Vec<Value> {
+    let mut values = Vec::with_capacity(tokens.len() * 2 + 4);
+    for token in tokens {
+        values.push(Value::Text(token.clone()));
+        values.push(Value::Text(crate::contacts::rank::prefix_upper_bound(
+            token,
+        )));
+    }
+    values.push(Value::Text(folded_query.to_string()));
+    values.push(Value::Text(folded_query.to_string()));
+    values.push(Value::Text(sending_account.0.clone()));
+    values.push(Value::Integer(cap as i64));
+    values
+}
+
+/// Contact rows visible for one account/address, split by source kind.
+#[derive(Debug, Default)]
+struct ContactSignals {
+    saved: bool,
+    other: bool,
+    saved_name: Option<String>,
+    saved_email: Option<String>,
+    other_name: Option<String>,
+    other_email: Option<String>,
+}
+
+/// Deliberate/incoming provenance for one account/address.
+#[derive(Debug, Default)]
+struct EvidenceSignals {
+    selected: bool,
+    outgoing: bool,
+    incoming: bool,
+}
+
+fn learned_address_on(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    key: &AddressKey,
+) -> Result<Option<LearnedAddress>, StoreError> {
+    conn.query_row(
+        "SELECT address_key, email, display_name, trust, outgoing, last_seen, evidence_count
+         FROM contact_addresses
+         WHERE account_id = ?1 AND address_key = ?2",
+        params![account.0, key.0],
+        learned_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn contact_signals_on(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    key: &AddressKey,
+) -> Result<ContactSignals, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT ce.email, ce.display_name, COALESCE(cs.kind, 'saved')
+         FROM contact_emails ce
+         LEFT JOIN contact_sources cs
+           ON cs.account_id = ce.account_id AND cs.source_id = ce.source_id
+         WHERE ce.account_id = ?1 AND ce.address_key = ?2
+         ORDER BY ce.source_id, ce.remote_contact_id, ce.email",
+    )?;
+    let mut rows = statement.query(params![account.0, key.0])?;
+    let mut signals = ContactSignals::default();
+    while let Some(row) = rows.next()? {
+        let email: String = row.get(0)?;
+        let name: Option<String> = row.get(1)?;
+        let kind: String = row.get(2)?;
+        if kind.eq_ignore_ascii_case(OTHER_CONTACT_KIND) {
+            signals.other = true;
+            if signals.other_email.is_none() {
+                signals.other_email = Some(email);
+            }
+            if signals.other_name.is_none()
+                && let Some(name) = name.filter(|name| !name.trim().is_empty())
+            {
+                signals.other_name = Some(name);
+            }
+        } else {
+            signals.saved = true;
+            if signals.saved_email.is_none() {
+                signals.saved_email = Some(email);
+            }
+            if signals.saved_name.is_none()
+                && let Some(name) = name.filter(|name| !name.trim().is_empty())
+            {
+                signals.saved_name = Some(name);
+            }
+        }
+    }
+    Ok(signals)
+}
+
+fn evidence_signals_on(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    key: &AddressKey,
+) -> Result<EvidenceSignals, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT ce.origin, ea.trust
+         FROM evidence_addresses ea
+         JOIN correspondence_evidence ce
+           ON ce.account_id = ea.account_id AND ce.evidence_id = ea.evidence_id
+         WHERE ea.account_id = ?1 AND ea.address_key = ?2",
+    )?;
+    let mut rows = statement.query(params![account.0, key.0])?;
+    let mut signals = EvidenceSignals::default();
+    while let Some(row) = rows.next()? {
+        let origin: String = row.get(0)?;
+        let trust: String = row.get(1)?;
+        match origin.as_str() {
+            "selection" => signals.selected = true,
+            "accepted_send" => signals.outgoing = true,
+            "existing_cache" | "history" | "live_arrival"
+                if trust != ObservationTrust::SpamOrTrash.as_str() =>
+            {
+                signals.incoming = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(signals)
+}
+
+/// Recompute one address's projection row and token set from its durable
+/// contact and evidence rows. Called inside the caller's write transaction.
+pub(crate) fn refresh_recipient_index_in(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    key: &AddressKey,
+) -> Result<(), StoreError> {
+    let learned = learned_address_on(conn, account, key)?;
+    let contact = contact_signals_on(conn, account, key)?;
+    let evidence = evidence_signals_on(conn, account, key)?;
+    write_recipient_index_in(conn, account, key, learned.as_ref(), &contact, &evidence)
+}
+
+fn write_recipient_index_in(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    key: &AddressKey,
+    learned: Option<&LearnedAddress>,
+    contact: &ContactSignals,
+    evidence: &EvidenceSignals,
+) -> Result<(), StoreError> {
+    if learned.is_none() && !contact.saved && !contact.other {
+        delete_recipient_index_in(conn, account, key)?;
+        return Ok(());
+    }
+
+    let email = contact
+        .saved_email
+        .clone()
+        .or_else(|| contact.other_email.clone())
+        .or_else(|| learned.map(|learned| learned.address.email.clone()));
+    let Some(email) = email else {
+        delete_recipient_index_in(conn, account, key)?;
+        return Ok(());
+    };
+    let display_name = contact
+        .saved_name
+        .clone()
+        .or_else(|| contact.other_name.clone())
+        .or_else(|| {
+            learned.and_then(|learned| {
+                learned
+                    .address
+                    .name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+            })
+        });
+
+    let saved = contact.saved;
+    let other = contact.other;
+    let selected = evidence.selected;
+    let outgoing = evidence.outgoing;
+    let incoming = evidence.incoming
+        || learned.is_some_and(|learned| learned.trust == ObservationTrust::Ordinary);
+    let trusted = saved || other || selected || outgoing;
+    let low_trust_only =
+        !trusted && learned.is_some_and(|learned| learned.trust == ObservationTrust::SpamOrTrash);
+    let last_seen = learned.map(|learned| learned.last_seen).unwrap_or(0);
+    let frequency = learned
+        .map(|learned| learned.evidence_count.min(MAX_FREQUENCY))
+        .unwrap_or(0);
+
+    conn.prepare_cached(
+        "INSERT INTO recipient_index
+             (account_id, address_key, email, display_name, email_folded, name_folded,
+              saved_contact, other_contact, outgoing, selected, incoming, low_trust_only,
+              last_seen, frequency)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(account_id, address_key) DO UPDATE SET
+             email = excluded.email,
+             display_name = excluded.display_name,
+             email_folded = excluded.email_folded,
+             name_folded = excluded.name_folded,
+             saved_contact = excluded.saved_contact,
+             other_contact = excluded.other_contact,
+             outgoing = excluded.outgoing,
+             selected = excluded.selected,
+             incoming = excluded.incoming,
+             low_trust_only = excluded.low_trust_only,
+             last_seen = excluded.last_seen,
+             frequency = excluded.frequency",
+    )?
+    .execute(params![
+        account.0,
+        key.0,
+        email,
+        display_name,
+        email.trim().to_lowercase(),
+        display_name.as_deref().unwrap_or("").trim().to_lowercase(),
+        bool_int(saved),
+        bool_int(other),
+        bool_int(outgoing),
+        bool_int(selected),
+        bool_int(incoming),
+        bool_int(low_trust_only),
+        last_seen,
+        i64::from(frequency),
+    ])?;
+
+    conn.prepare_cached("DELETE FROM recipient_tokens WHERE account_id = ?1 AND address_key = ?2")?
+        .execute(params![account.0, key.0])?;
+    if !low_trust_only {
+        let search = Address::new(display_name, email);
+        for token in recipient_search_tokens(&search) {
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO recipient_tokens (account_id, address_key, token)
+                 VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![account.0, key.0, token])?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_recipient_index_in(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    key: &AddressKey,
+) -> Result<(), StoreError> {
+    conn.prepare_cached("DELETE FROM recipient_index WHERE account_id = ?1 AND address_key = ?2")?
+        .execute(params![account.0, key.0])?;
+    conn.prepare_cached("DELETE FROM recipient_tokens WHERE account_id = ?1 AND address_key = ?2")?
+        .execute(params![account.0, key.0])?;
+    Ok(())
+}
+
+pub(crate) fn rebuild_recipient_index_in(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+    conn.execute("DELETE FROM recipient_tokens", [])?;
+    conn.execute("DELETE FROM recipient_index", [])?;
+
+    let mut entries: BTreeMap<
+        (String, String),
+        (Option<LearnedAddress>, ContactSignals, EvidenceSignals),
+    > = BTreeMap::new();
+
+    {
+        let mut statement = conn.prepare(
+            "SELECT account_id, address_key, email, display_name, trust, outgoing,
+                    last_seen, evidence_count
+             FROM contact_addresses",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let account: String = row.get(0)?;
+            let address_key: String = row.get(1)?;
+            let display_name: Option<String> = row.get(3)?;
+            let trust: String = row.get(4)?;
+            let outgoing: i64 = row.get(5)?;
+            let last_seen: i64 = row.get(6)?;
+            let evidence_count: i64 = row.get(7)?;
+            let learned = LearnedAddress {
+                key: AddressKey(address_key.clone()),
+                address: Address::new(display_name, row.get::<_, String>(2)?),
+                evidence_count: evidence_count.max(0) as u32,
+                outgoing: outgoing != 0,
+                trust: ObservationTrust::from_db(&trust).unwrap_or(ObservationTrust::Ordinary),
+                last_seen,
+            };
+            entries.entry((account, address_key)).or_default().0 = Some(learned);
+        }
+    }
+
+    {
+        let mut statement = conn.prepare(
+            "SELECT ce.account_id, ce.address_key, ce.email, ce.display_name,
+                    COALESCE(cs.kind, 'saved')
+             FROM contact_emails ce
+             LEFT JOIN contact_sources cs
+               ON cs.account_id = ce.account_id AND cs.source_id = ce.source_id
+             ORDER BY ce.account_id, ce.address_key, ce.source_id, ce.remote_contact_id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let account: String = row.get(0)?;
+            let address_key: String = row.get(1)?;
+            let email: String = row.get(2)?;
+            let name: Option<String> = row.get(3)?;
+            let kind: String = row.get(4)?;
+            let signals = &mut entries.entry((account, address_key)).or_default().1;
+            if kind.eq_ignore_ascii_case(OTHER_CONTACT_KIND) {
+                signals.other = true;
+                if signals.other_email.is_none() {
+                    signals.other_email = Some(email);
+                }
+                if signals.other_name.is_none()
+                    && let Some(name) = name.filter(|name| !name.trim().is_empty())
+                {
+                    signals.other_name = Some(name);
+                }
+            } else {
+                signals.saved = true;
+                if signals.saved_email.is_none() {
+                    signals.saved_email = Some(email);
+                }
+                if signals.saved_name.is_none()
+                    && let Some(name) = name.filter(|name| !name.trim().is_empty())
+                {
+                    signals.saved_name = Some(name);
+                }
+            }
+        }
+    }
+
+    {
+        let mut statement = conn.prepare(
+            "SELECT ea.account_id, ea.address_key,
+                    MAX(CASE WHEN ce.origin = 'selection' THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN ce.origin = 'accepted_send' THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN ce.origin IN ('existing_cache', 'history', 'live_arrival')
+                              AND ea.trust <> 'spam_or_trash' THEN 1 ELSE 0 END)
+             FROM evidence_addresses ea
+             JOIN correspondence_evidence ce
+               ON ce.account_id = ea.account_id AND ce.evidence_id = ea.evidence_id
+             GROUP BY ea.account_id, ea.address_key",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let account: String = row.get(0)?;
+            let address_key: String = row.get(1)?;
+            let signals = &mut entries.entry((account, address_key)).or_default().2;
+            signals.selected = row.get::<_, i64>(2)? != 0;
+            signals.outgoing = row.get::<_, i64>(3)? != 0;
+            signals.incoming = row.get::<_, i64>(4)? != 0;
+        }
+    }
+
+    for ((account, key), (learned, contact, evidence)) in entries {
+        write_recipient_index_in(
+            conn,
+            &AccountId(account),
+            &AddressKey(key),
+            learned.as_ref(),
+            &contact,
+            &evidence,
+        )?;
+    }
+    Ok(())
 }
 
 /// Record observations inside a caller-owned transaction. The caller is
@@ -566,6 +1049,7 @@ fn recompute_contact_address_in(
             "DELETE FROM contact_addresses WHERE account_id = ?1 AND address_key = ?2",
             params![account.0, key.0],
         )?;
+        refresh_recipient_index_in(tx, account, key)?;
         return Ok(());
     };
 
@@ -592,10 +1076,11 @@ fn recompute_contact_address_in(
             evidence.len() as i64,
         ],
     )?;
+    refresh_recipient_index_in(tx, account, key)?;
     Ok(())
 }
 
-fn learned_from_row(row: &rusqlite::Row<'_>) -> Result<LearnedAddress, StoreError> {
+fn learned_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnedAddress> {
     let key: String = row.get(0)?;
     let email: String = row.get(1)?;
     let display_name: Option<String> = row.get(2)?;

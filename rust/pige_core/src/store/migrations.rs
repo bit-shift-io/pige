@@ -4,6 +4,7 @@
 
 mod v10;
 mod v11;
+mod v12;
 mod v2;
 mod v3;
 mod v4;
@@ -64,7 +65,8 @@ impl Store {
     /// the outbox into a provider-neutral durable submission with structured
     /// parts, operation identity, prepared artifacts, and receipts; v10 adds the
     /// recoverable backend-switch intent; v11 adds source contacts and the
-    /// replay-safe correspondent evidence ledger.
+    /// replay-safe correspondent evidence ledger; v12 adds the indexed recipient
+    /// search projection and contact-source kind.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -154,6 +156,10 @@ impl Store {
         if version < 11 && target >= 11 {
             v11::apply(&tx)?;
             version = 11;
+        }
+        if version < 12 && target >= 12 {
+            v12::apply(&tx)?;
+            version = 12;
         }
 
         // The rebuild must not leave a dangling reference behind; check before

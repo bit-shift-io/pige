@@ -30,8 +30,8 @@ pub struct ConfigDocument {
     pub version: u32,
     pub accounts: Vec<Account>,
     pub settings: Settings,
-    /// Bare sender addresses the user has blocked. Informational for now: no
-    /// inbox filtering reads this yet, it only records the choice.
+    /// Bare sender addresses the user has blocked. Excluded from local
+    /// recipient suggestions; no inbox filtering reads this yet.
     pub blocked_senders: Vec<String>,
 }
 
