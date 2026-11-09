@@ -11,9 +11,11 @@
 //! * `Events`: replay event pages from that anchor. `More = 1` keeps the stage
 //!   open and never commits the returned id as a completed cursor.
 //! * `Complete`: the durable event id. The next pass fetches the delta since it.
-//! * `Reconcile`: the server asked for a reset (`Refresh`) or the delta cursor
-//!   expired. The adapter re-enumerates the recent window without emitting
-//!   deletions, so the cache is repaired rather than erased.
+//! * `Reconcile`: the server asked for a reset (`Refresh`), the delta cursor
+//!   expired, or an event payload was too partial to apply. The adapter
+//!   re-enumerates the whole scoped window and retires only records absent from
+//!   that *completed* generation, so a short event-retention gap cannot keep a
+//!   deleted message cached forever.
 //!
 //! `is_new_arrival` is true only for a `Create` event observed in a genuine
 //! delta page, never for snapshot/history/reconciliation or for mail replayed
@@ -57,12 +59,35 @@ enum ProtonCursor {
         /// before it is considered covered.
         #[serde(default)]
         churned: bool,
+        /// Pinned listing page size; offsets are page-size-dependent and a
+        /// changed size must not silently shift every boundary.
+        #[serde(default)]
+        page_size: u32,
+        /// Ids from the last completed sweep. Once a new sweep completes, ids
+        /// in this set that were not observed are retired.
+        #[serde(default)]
+        known: Vec<String>,
+        /// Ids observed so far in this sweep (union across every collection).
+        #[serde(default)]
+        seen: Vec<String>,
     },
     /// Event replay (`catch_up` means the bootstrap anchor is still being
     /// replayed, so additions are historical, not live notifications).
-    Events { event_id: String, catch_up: bool },
+    Events {
+        event_id: String,
+        catch_up: bool,
+        /// Ids from the last completed sweep, retained so a reset-driven
+        /// reconciliation can retire records that disappeared during an event
+        /// retention gap.
+        #[serde(default)]
+        known: Vec<String>,
+    },
     /// A fully consumed event stream.
-    Complete { event_id: String },
+    Complete {
+        event_id: String,
+        #[serde(default)]
+        known: Vec<String>,
+    },
     /// Post-reset reconciliation sweep.
     Reconcile {
         anchor: String,
@@ -73,7 +98,28 @@ enum ProtonCursor {
         tail: Vec<String>,
         #[serde(default)]
         churned: bool,
+        #[serde(default)]
+        page_size: u32,
+        #[serde(default)]
+        known: Vec<String>,
+        #[serde(default)]
+        seen: Vec<String>,
     },
+}
+
+/// Mutable state of one snapshot/reconciliation sweep. Kept out of the cursor
+/// enum so the paging logic does not have to unpack and rebuild a dozen fields.
+#[derive(Debug, Clone)]
+struct SweepState {
+    anchor: String,
+    observed: String,
+    collection: usize,
+    page: u32,
+    tail: Vec<String>,
+    churned: bool,
+    page_size: u32,
+    known: Vec<String>,
+    seen: Vec<String>,
 }
 
 /// Proton sync service.
@@ -102,70 +148,85 @@ impl ProtonSync {
         // mailbox does not spend a round trip on an empty bootstrap step.
         self.snapshot_page(
             http,
-            anchor.clone(),
-            anchor,
-            0,
-            0,
-            Vec::new(),
+            SweepState {
+                anchor: anchor.clone(),
+                observed: anchor,
+                collection: 0,
+                page: 0,
+                tail: Vec::new(),
+                churned: false,
+                page_size: initial_limit.clamp(1, PROTON_MAX_PAGE),
+                known: Vec::new(),
+                seen: Vec::new(),
+            },
             false,
-            initial_limit,
-            false,
+            ctx,
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn snapshot_page(
         &mut self,
         http: ProtonHttp,
-        anchor: String,
-        observed: String,
-        collection: usize,
-        page: u32,
-        tail: Vec<String>,
-        churned: bool,
-        initial_limit: u32,
+        sweep: SweepState,
         reconcile: bool,
+        ctx: &OperationContext,
     ) -> Result<ChangePage, ProviderError> {
-        let page_size = initial_limit.clamp(1, PROTON_MAX_PAGE);
         let labels = fetch_labels(&http).await?;
-        let counts = fetch_counts(&http).await;
+        let counts = fetch_counts(&http).await?;
         let mut changes = collection_changes(&labels, &counts);
         let syncable = normalize::syncable_collections(&labels);
 
-        let Some(collection_id) = syncable.get(collection).cloned() else {
+        let Some(collection_id) = syncable.get(sweep.collection).cloned() else {
+            // The planned collection set shrank under us (a label disappeared
+            // between pages). Finish without retiring anything: this was not a
+            // completed sweep over the scope it started with.
             return Ok(ChangePage {
                 changes,
                 checkpoint: encode_cursor(&ProtonCursor::Events {
-                    event_id: anchor,
+                    event_id: sweep.anchor,
                     catch_up: true,
+                    known: sweep.seen,
                 })?,
                 has_more: true,
             });
         };
 
-        let latest = latest_event(&http).await?;
-        let churn = latest != observed;
-        let churned = churned || churn;
+        let latest_before = latest_event(&http).await?;
+        let churn = latest_before != sweep.observed;
+        let churned = sweep.churned || churn;
         // Offset pages are unstable: a deletion above the cursor shifts an
         // unseen message backwards into the page already consumed. Re-read the
-        // previous page and deduplicate by the account-wide opaque id.
-        let first_page = if churn && page > 0 { page - 1 } else { page };
+        // previous page and deduplicate by the account-wide opaque id. The
+        // overlap also runs while a moved anchor has not yet gone clean.
+        let first_page = if (churn || sweep.churned) && sweep.page > 0 {
+            sweep.page - 1
+        } else {
+            sweep.page
+        };
         let mut total = 0u32;
         let mut ids = std::collections::HashSet::new();
         let mut last_page_ids: Vec<String> = Vec::new();
-        for number in first_page..=page {
+        let mut seen: std::collections::HashSet<String> = sweep.seen.iter().cloned().collect();
+        for number in first_page..=sweep.page {
+            // A fenced/cancelled context must not fetch or emit another page.
+            ctx.ensure_active()?;
             let (reported_total, page_messages) =
-                list_messages_in(&http, &collection_id, number, page_size).await?;
+                list_messages_in(&http, &collection_id, number, sweep.page_size).await?;
             total = total.max(reported_total);
-            if number == page {
+            if number == sweep.page {
                 last_page_ids = page_messages
                     .iter()
                     .map(|message| message.id.clone())
                     .collect();
             }
             for message in page_messages {
-                if !ids.insert(message.id.clone()) || tail.iter().any(|id| id == &message.id) {
+                // Track every record the listing returned, including records
+                // suppressed from this page by the overlap `tail`, so a
+                // completed sweep never retires something it actually saw.
+                seen.insert(message.id.clone());
+                if !ids.insert(message.id.clone()) || sweep.tail.iter().any(|id| id == &message.id)
+                {
                     continue;
                 }
                 changes.push(MailChange::UpsertMessage {
@@ -176,51 +237,78 @@ impl ProtonSync {
             }
         }
 
-        let next_page = page.saturating_add(1);
-        let at_end = u64::from(next_page) * u64::from(page_size) >= u64::from(total);
+        // Re-read the anchor *after* the listing. A deletion between the
+        // pre-listing read and the final page can shift the boundary record
+        // into a page already consumed, so completion must never rely only on
+        // the anchor sampled before the page.
+        let latest_after = latest_event(&http).await?;
+        let moved = latest_after != latest_before;
+        let churned = churned || moved;
+
+        let next_page = sweep.page.saturating_add(1);
+        let at_end = u64::from(next_page) * u64::from(sweep.page_size) >= u64::from(total);
         // A collection whose listing moved under a page gets one clean pass
         // before the bounded window is considered covered.
         let restart = at_end && churned;
         let (next_collection, next_number) = if restart {
-            (collection, 0)
+            (sweep.collection, 0)
         } else if at_end {
-            (collection + 1, 0)
+            (sweep.collection + 1, 0)
         } else {
-            (collection, next_page)
+            (sweep.collection, next_page)
         };
+        let mut seen: Vec<String> = seen.into_iter().collect();
+        seen.sort_unstable();
         let next = if next_collection >= syncable.len() {
+            // The scope is fully enumerated and the anchor held for this pass.
+            // Retire records that were known after the previous completed
+            // sweep but did not appear anywhere in this one. This is the only
+            // place a snapshot emits removals; one bounded page never does.
+            for id in &sweep.known {
+                if !seen.iter().any(|seen| seen == id) {
+                    changes.push(MailChange::RemoveMessage(RemoteMessageId::new(id.clone())));
+                }
+            }
             ProtonCursor::Events {
-                event_id: anchor,
+                event_id: sweep.anchor,
                 // Mail created while the bounded snapshot ran is historical
                 // import, not a live notification.
                 catch_up: true,
+                known: seen,
             }
         } else {
-            let next_tail = if restart || next_collection != collection {
+            let next_tail = if restart || next_collection != sweep.collection {
                 Vec::new()
             } else {
                 last_page_ids
             };
             if reconcile {
                 ProtonCursor::Reconcile {
-                    anchor,
-                    observed: latest,
+                    anchor: sweep.anchor,
+                    observed: latest_after,
                     collection: next_collection,
                     page: next_number,
                     tail: next_tail,
                     churned: churned && !restart,
+                    page_size: sweep.page_size,
+                    known: sweep.known,
+                    seen,
                 }
             } else {
                 ProtonCursor::Snapshot {
-                    anchor,
-                    observed: latest,
+                    anchor: sweep.anchor,
+                    observed: latest_after,
                     collection: next_collection,
                     page: next_number,
                     tail: next_tail,
                     churned: churned && !restart,
+                    page_size: sweep.page_size,
+                    known: sweep.known,
+                    seen,
                 }
             }
         };
+        ctx.ensure_active()?;
         Ok(ChangePage {
             changes,
             checkpoint: encode_cursor(&next)?,
@@ -232,6 +320,8 @@ impl ProtonSync {
         &mut self,
         event_id: String,
         catch_up: bool,
+        known: Vec<String>,
+        page_size: u32,
         ctx: &OperationContext,
     ) -> Result<ChangePage, ProviderError> {
         let http = self.client.request_http(ctx).await?;
@@ -240,25 +330,39 @@ impl ProtonSync {
             // An event id older than the server's retention window is a reset,
             // not a fatal sync failure.
             Err(error) if matches!(error.kind, ErrorKind::NotFound | ErrorKind::CursorInvalid) => {
-                return self.reset_page(&http).await;
+                return self
+                    .reset_page(&http, Vec::new(), known, page_size, ctx)
+                    .await;
             }
             Err(error) => return Err(error),
         };
         if batch.refresh {
-            return self.reset_page(&http).await;
+            return self
+                .reset_page(&http, Vec::new(), known, page_size, ctx)
+                .await;
         }
 
-        let changes = event_changes(&batch.messages, !catch_up);
+        let (changes, partial) = event_changes(&batch.messages, !catch_up);
+        if partial {
+            // A partial event payload cannot be upserted as a whole record
+            // without erasing unmentioned headers or membership. Repair it now
+            // with a bounded reconciliation instead of waiting for an unrelated
+            // server reset.
+            return self.reset_page(&http, changes, known, page_size, ctx).await;
+        }
         let next = if batch.more {
             ProtonCursor::Events {
                 event_id: batch.event_id,
                 catch_up,
+                known,
             }
         } else {
             ProtonCursor::Complete {
                 event_id: batch.event_id,
+                known,
             }
         };
+        ctx.ensure_active()?;
         Ok(ChangePage {
             changes,
             checkpoint: encode_cursor(&next)?,
@@ -266,15 +370,26 @@ impl ProtonSync {
         })
     }
 
-    /// Start a reconciliation after a server-side event reset. Never erase the
-    /// local cache: capture a fresh anchor and repair the recent window. The
-    /// sweep emits no removals, so cached messages survive.
-    async fn reset_page(&self, http: &ProtonHttp) -> Result<ChangePage, ProviderError> {
+    /// Start a reconciliation after a server-side event reset or a payload the
+    /// adapter cannot apply safely. Capture a fresh anchor and re-enumerate the
+    /// recent window; absent records are retired only when that scoped sweep
+    /// completes, so cached messages survive a short event retention gap.
+    async fn reset_page(
+        &self,
+        http: &ProtonHttp,
+        mut changes: Vec<MailChange>,
+        known: Vec<String>,
+        page_size: u32,
+        ctx: &OperationContext,
+    ) -> Result<ChangePage, ProviderError> {
+        ctx.ensure_active()?;
         let anchor = latest_event(http).await?;
         let labels = fetch_labels(http).await?;
-        let counts = fetch_counts(http).await;
+        let counts = fetch_counts(http).await?;
+        changes.extend(collection_changes(&labels, &counts));
+        ctx.ensure_active()?;
         Ok(ChangePage {
-            changes: collection_changes(&labels, &counts),
+            changes,
             checkpoint: encode_cursor(&ProtonCursor::Reconcile {
                 observed: anchor.clone(),
                 anchor,
@@ -282,36 +397,21 @@ impl ProtonSync {
                 page: 0,
                 tail: Vec::new(),
                 churned: false,
+                page_size: page_size.clamp(1, PROTON_MAX_PAGE),
+                known,
+                seen: Vec::new(),
             })?,
             has_more: true,
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn reconcile_page(
         &mut self,
-        anchor: String,
-        observed: String,
-        collection: usize,
-        page: u32,
-        tail: Vec<String>,
-        churned: bool,
-        initial_limit: u32,
+        sweep: SweepState,
         ctx: &OperationContext,
     ) -> Result<ChangePage, ProviderError> {
         let http = self.client.request_http(ctx).await?;
-        self.snapshot_page(
-            http,
-            anchor,
-            observed,
-            collection,
-            page,
-            tail,
-            churned,
-            initial_limit,
-            true,
-        )
-        .await
+        self.snapshot_page(http, sweep, true, ctx).await
     }
 }
 
@@ -329,10 +429,10 @@ impl SyncService for ProtonSync {
                 anchor: String::new(),
             },
         };
+        let requested_page_size = request.initial_limit.clamp(1, PROTON_MAX_PAGE);
         match cursor {
             ProtonCursor::Bootstrap { anchor } => {
-                self.bootstrap_page(anchor, request.initial_limit, ctx)
-                    .await
+                self.bootstrap_page(anchor, requested_page_size, ctx).await
             }
             ProtonCursor::Snapshot {
                 anchor,
@@ -341,27 +441,45 @@ impl SyncService for ProtonSync {
                 page,
                 tail,
                 churned,
+                page_size,
+                known,
+                seen,
             } => {
                 let http = self.client.request_http(ctx).await?;
                 self.snapshot_page(
                     http,
-                    anchor,
-                    observed,
-                    collection,
-                    page,
-                    tail,
-                    churned,
-                    request.initial_limit,
+                    SweepState {
+                        anchor,
+                        observed,
+                        collection,
+                        page,
+                        tail,
+                        churned,
+                        page_size: if page_size == 0 {
+                            requested_page_size
+                        } else {
+                            page_size.clamp(1, PROTON_MAX_PAGE)
+                        },
+                        known,
+                        seen,
+                    },
                     false,
+                    ctx,
                 )
                 .await
             }
-            ProtonCursor::Events { event_id, catch_up } => {
-                self.event_page(event_id, catch_up, ctx).await
+            ProtonCursor::Events {
+                event_id,
+                catch_up,
+                known,
+            } => {
+                self.event_page(event_id, catch_up, known, requested_page_size, ctx)
+                    .await
             }
-            ProtonCursor::Complete { event_id } => {
+            ProtonCursor::Complete { event_id, known } => {
                 // A delta after the bootstrap is live mail.
-                self.event_page(event_id, false, ctx).await
+                self.event_page(event_id, false, known, requested_page_size, ctx)
+                    .await
             }
             ProtonCursor::Reconcile {
                 anchor,
@@ -370,15 +488,26 @@ impl SyncService for ProtonSync {
                 page,
                 tail,
                 churned,
+                page_size,
+                known,
+                seen,
             } => {
                 self.reconcile_page(
-                    anchor,
-                    observed,
-                    collection,
-                    page,
-                    tail,
-                    churned,
-                    request.initial_limit,
+                    SweepState {
+                        anchor,
+                        observed,
+                        collection,
+                        page,
+                        tail,
+                        churned,
+                        page_size: if page_size == 0 {
+                            requested_page_size
+                        } else {
+                            page_size.clamp(1, PROTON_MAX_PAGE)
+                        },
+                        known,
+                        seen,
+                    },
                     ctx,
                 )
                 .await
@@ -554,8 +683,13 @@ async fn list_messages_in(
     http.finish(api::messages::list_messages(http, &query).await)
 }
 
-fn event_changes(messages: &[MessageEvent], live: bool) -> Vec<MailChange> {
+/// Normalize one event batch. The boolean is true when the batch contained a
+/// payload that is not safe to upsert as a whole record; the caller then starts
+/// a bounded reconciliation instead of silently dropping the change until some
+/// unrelated server reset.
+fn event_changes(messages: &[MessageEvent], live: bool) -> (Vec<MailChange>, bool) {
     let mut changes = Vec::new();
+    let mut partial = false;
     for event in messages {
         match event.action {
             action::DELETE => changes.push(MailChange::RemoveMessage(RemoteMessageId::new(
@@ -563,16 +697,15 @@ fn event_changes(messages: &[MessageEvent], live: bool) -> Vec<MailChange> {
             ))),
             action::CREATE | action::UPDATE | action::UPDATE_FLAGS => {
                 let Some(message) = event.message.as_ref() else {
-                    // Listing metadata is the only safe header source. A
-                    // missing payload is repaired by the next reconciliation
-                    // sweep; it is never fetched as a body here.
+                    // Listing metadata is the only safe header source; a
+                    // missing payload is never fetched as a body here.
+                    partial = true;
                     continue;
                 };
                 if !is_complete_metadata(message) {
                     // Never turn a partial flag/update payload into a full
                     // record that erases unmentioned headers or membership.
-                    // Leaving it for the reconciliation sweep preserves the
-                    // cached record until a complete observation arrives.
+                    partial = true;
                     continue;
                 }
                 changes.push(MailChange::UpsertMessage {
@@ -583,7 +716,7 @@ fn event_changes(messages: &[MessageEvent], live: bool) -> Vec<MailChange> {
             _ => {}
         }
     }
-    changes
+    (changes, partial)
 }
 
 /// Proton's event payload is a full metadata object. A payload that omits the

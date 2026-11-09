@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{
-    BodyContent, CollectionRecord, HistoryCoverage, HistoryPage, HistoryRequest, MailboxService,
-    MessageRecord, OperationContext, ProviderCursor, ProviderError, RemoteAttachmentId,
-    RemoteMessageId,
+    BodyContent, CollectionRecord, ErrorKind, HistoryCoverage, HistoryPage, HistoryRequest,
+    MailboxService, MessageRecord, OperationContext, ProviderCursor, ProviderError,
+    RemoteAttachmentId, RemoteMessageId,
 };
 
 use proton_core::api;
@@ -53,7 +53,7 @@ impl MailboxService for ProtonMailbox {
         ctx.ensure_active()?;
         let http = self.client.request_http(ctx).await?;
         let labels = fetch_labels(&http).await?;
-        let counts = fetch_counts(&http).await;
+        let counts = fetch_counts(&http).await?;
         let mut collections = collection_records(&labels, &counts);
         collections.sort_by(|left, right| {
             collection_order(&left.remote_id)
@@ -92,20 +92,30 @@ impl MailboxService for ProtonMailbox {
         ctx: &OperationContext,
     ) -> Result<HistoryPage, ProviderError> {
         ctx.ensure_active()?;
-        let page_size = request.page_size.clamp(HISTORY_MIN_PAGE, PROTON_MAX_PAGE);
+        let requested_page_size = request.page_size.clamp(HISTORY_MIN_PAGE, PROTON_MAX_PAGE);
         let mut state = match &request.cursor {
             Some(cursor) => decode_history_cursor(cursor)?,
             None => HistoryCursor {
                 v: HISTORY_CURSOR_VERSION,
                 page: 0,
                 scanned: 0,
+                pass_scanned: 0,
                 total_hint: None,
                 anchor: String::new(),
                 tail: Vec::new(),
                 complete: false,
                 churned: false,
+                page_size: requested_page_size,
             },
         };
+        // Offset pages are page-size-dependent: changing the size on resume
+        // shifts every boundary with no event-anchor signal. Pin the size in
+        // the cursor; a cursor written by an older build (0) adopts this
+        // request's size once.
+        if state.page_size == 0 {
+            state.page_size = requested_page_size;
+        }
+        let page_size = state.page_size.clamp(HISTORY_MIN_PAGE, PROTON_MAX_PAGE);
         let http = self.client.request_http(ctx).await?;
 
         if state.anchor.is_empty() {
@@ -131,6 +141,7 @@ impl MailboxService for ProtonMailbox {
             state.complete = false;
             state.page = 0;
             state.scanned = 0;
+            state.pass_scanned = 0;
             state.total_hint = None;
             state.tail.clear();
             state.churned = false;
@@ -141,14 +152,21 @@ impl MailboxService for ProtonMailbox {
         let page = state.page;
         // Offset listing can shift an unseen record backwards into the page we
         // just consumed. Re-reading that page (plus the current one) and
-        // deduplicating against the previous page's ids closes that gap.
-        let first_page = if churn && page > 0 { page - 1 } else { page };
+        // deduplicating against the previous page's ids closes that gap. The
+        // same overlap runs while a churned pass has not yet gone clean.
+        let first_page = if (churn || state.churned) && page > 0 {
+            page - 1
+        } else {
+            page
+        };
         let mut total = state.total_hint.unwrap_or(0);
         let mut ids: HashSet<String> = HashSet::new();
         let mut messages: Vec<MessageRecord> = Vec::new();
         let mut last_page_ids: Vec<String> = Vec::new();
 
         for number in first_page..=page {
+            // A fenced/cancelled context must not fetch or emit another page.
+            ctx.ensure_active()?;
             let (reported_total, page_messages) = list_page(&http, number, page_size).await?;
             total = total.max(reported_total as u64);
             let is_current = number == page;
@@ -171,7 +189,11 @@ impl MailboxService for ProtonMailbox {
                 messages.push(normalize::message_record(&message));
             }
         }
-        state.scanned += messages.len() as u64;
+        // `scanned` counts the current pass, never the sum of restart attempts:
+        // a churn restart begins a fresh pass, and the reported value is the
+        // maximum any pass reached so it cannot move backwards.
+        state.pass_scanned = state.pass_scanned.saturating_add(messages.len() as u64);
+        state.scanned = state.scanned.max(state.pass_scanned);
         state.total_hint = Some(total);
         state.page = page.saturating_add(1);
         state.tail = last_page_ids;
@@ -186,12 +208,20 @@ impl MailboxService for ProtonMailbox {
         let at_end = state.page as u64 * u64::from(page_size) >= total;
         let mut has_more = !at_end;
         if at_end {
+            // Re-read the anchor *after* the listing. A deletion between the
+            // pre-listing read and the final page can shift the boundary
+            // record into the page already consumed, so completion is never
+            // based only on the anchor sampled before the page.
+            ctx.ensure_active()?;
             let latest_after = latest_event(&http).await?;
             if latest_after != state.anchor || state.churned {
                 // The listing moved under the pass (or may have). Re-run from
                 // the first page with the new anchor; durable learning is
                 // keyed by native id, so the replay is safe and deduplicated.
+                // A fresh pass starts a fresh scanned counter; the reported
+                // coverage stays the maximum already reached.
                 state.page = 0;
+                state.pass_scanned = 0;
                 state.total_hint = None;
                 state.tail.clear();
                 state.anchor = latest_after;
@@ -204,6 +234,7 @@ impl MailboxService for ProtonMailbox {
             }
         }
 
+        ctx.ensure_active()?;
         Ok(HistoryPage {
             messages,
             checkpoint: encode_history_cursor(&state)?,
@@ -240,15 +271,27 @@ pub(crate) async fn fetch_labels(http: &ProtonHttp) -> Result<Vec<Label>, Provid
     Ok(labels)
 }
 
-/// Per-label total/unread counts. Decorative metadata: a failed count refresh
-/// never fails a collection listing that already succeeded.
-pub(crate) async fn fetch_counts(http: &ProtonHttp) -> HashMap<String, (i64, i64)> {
+/// Per-label total/unread counts. Decorative metadata: a transient failure
+/// never fails a collection listing that already succeeded. Cancellation and
+/// fatal authentication/authorization errors are still real failures and are
+/// propagated so a fenced context cannot keep working.
+pub(crate) async fn fetch_counts(
+    http: &ProtonHttp,
+) -> Result<HashMap<String, (i64, i64)>, ProviderError> {
     match http.finish(api::messages::counts(http).await) {
-        Ok(counts) => counts
+        Ok(counts) => Ok(counts
             .into_iter()
             .map(|count| (count.label_id, (count.total, count.unread)))
-            .collect(),
-        Err(_) => HashMap::new(),
+            .collect()),
+        Err(error)
+            if !matches!(
+                error.kind,
+                ErrorKind::Cancelled | ErrorKind::Reauthenticate | ErrorKind::Forbidden
+            ) =>
+        {
+            Ok(HashMap::new())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -317,7 +360,11 @@ pub(crate) async fn list_page(
 struct HistoryCursor {
     v: u32,
     page: u32,
+    /// Highest number of records any pass of this generation has reached.
     scanned: u64,
+    /// Records emitted by the current pass; reset when a churned pass restarts.
+    #[serde(default)]
+    pass_scanned: u64,
     total_hint: Option<u64>,
     /// Event id captured at crawl start (or after a detected reset). A moved
     /// anchor means the offset listing may have shifted.
@@ -330,6 +377,10 @@ struct HistoryCursor {
     /// before coverage is reported complete.
     #[serde(default)]
     churned: bool,
+    /// Pinned listing page size. Offset boundaries depend on it, so it must not
+    /// change between pages of one crawl.
+    #[serde(default)]
+    page_size: u32,
 }
 
 fn encode_history_cursor(state: &HistoryCursor) -> Result<ProviderCursor, ProviderError> {

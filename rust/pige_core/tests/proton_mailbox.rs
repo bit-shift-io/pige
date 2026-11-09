@@ -35,7 +35,8 @@ use pige_core::providers::proton::{
 use pige_core::providers::{
     ChangePage, ErrorKind, HistoryRequest, MailChange, MailboxService, MessageRecord,
     MutationAction, MutationOutcome, MutationRequest, MutationService, OperationContext,
-    OperationId, ProviderError, RemoteCollectionId, RemoteMessageId, SyncRequest, SyncService,
+    OperationId, ProviderCursor, ProviderError, RemoteCollectionId, RemoteMessageId, SyncRequest,
+    SyncService,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,8 @@ impl RecordedRequest {
     }
 }
 
+type PageHook = Box<dyn FnOnce(&mut MockState) + Send>;
+
 #[derive(Default)]
 struct MockState {
     access: String,
@@ -70,6 +73,11 @@ struct MockState {
     event_batches: HashMap<String, Value>,
     /// Message ids the mutation endpoints reject with a typed 422.
     reject_ids: HashSet<String>,
+    /// Test hook run immediately before the given listing page is served, so a
+    /// test can mutate the account between the anchor read and the page fetch.
+    page_hook: Option<(usize, PageHook)>,
+    /// Listing pages that answer with a transient 503.
+    fail_pages: HashSet<usize>,
     requests: Vec<RecordedRequest>,
 }
 
@@ -155,6 +163,22 @@ impl ProtonMock {
         self.state.lock().expect("mock state").requests.clone()
     }
 
+    /// Run `hook` just before `page` of the account-wide listing is served.
+    fn set_page_hook(&self, page: usize, hook: impl FnOnce(&mut MockState) + Send + 'static) {
+        self.update(|state| state.page_hook = Some((page, Box::new(hook))));
+    }
+
+    /// Make one listing page fail transiently.
+    fn fail_page(&self, page: usize) {
+        self.update(|state| {
+            state.fail_pages.insert(page);
+        });
+    }
+
+    fn clear_failed_pages(&self) {
+        self.update(|state| state.fail_pages.clear());
+    }
+
     fn endpoints(&self) -> ProtonEndpoints {
         ProtonEndpoints::new_insecure_for_tests(self.server.uri()).expect("mock endpoint")
     }
@@ -227,6 +251,17 @@ fn respond(state: &mut MockState, request: &Request) -> ResponseTemplate {
         let page_size = query("PageSize")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(150);
+        if let Some((hook_page, hook)) = state.page_hook.take() {
+            if hook_page == page {
+                hook(state);
+            } else {
+                state.page_hook = Some((hook_page, hook));
+            }
+        }
+        if state.fail_pages.contains(&page) {
+            return ResponseTemplate::new(503)
+                .set_body_json(json!({ "Code": 500, "Error": "unavailable" }));
+        }
         let mut matching: Vec<Value> = state
             .messages
             .iter()
@@ -440,7 +475,16 @@ async fn drive_sync(
     initial_limit: u32,
     max_pages: usize,
 ) -> Vec<ChangePage> {
-    let mut cursor = None;
+    drive_sync_from(sync, ctx, None, initial_limit, max_pages).await
+}
+
+async fn drive_sync_from(
+    sync: &mut ProtonSync,
+    ctx: &OperationContext,
+    mut cursor: Option<ProviderCursor>,
+    initial_limit: u32,
+    max_pages: usize,
+) -> Vec<ChangePage> {
     let mut pages = Vec::new();
     for _ in 0..max_pages {
         let page = sync
@@ -1349,4 +1393,327 @@ async fn snapshot_paging_churn_does_not_skip_messages() {
             "snapshot churn skipped boot-{index}; seen {seen:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn snapshot_final_page_churn_does_not_skip_messages() {
+    let mut state = default_state();
+    for index in 0..4 {
+        state.put_message(message(
+            &format!("boot-{index}"),
+            &format!("conv-{index}"),
+            &format!("Boot {index}"),
+            &["0"],
+            "sender@example.com",
+            &format!("boot{index}@example.com"),
+            1_700_000_000 - index as i64,
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let ctx = context();
+    let mut sync = ProtonSync::new(mock.client(Arc::new(StaticTokens)));
+
+    let first = sync
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 2,
+            },
+            &ctx,
+        )
+        .await
+        .expect("first snapshot page");
+    let mut seen: HashSet<String> = upserts(std::slice::from_ref(&first))
+        .into_iter()
+        .map(|(record, _)| record.remote_id.as_str().to_string())
+        .collect();
+
+    // The deletion lands between the second call's anchor read and its final
+    // page fetch. A naive post-page cursor advance would move boot-2 backwards
+    // into the already-consumed page 0 and skip it forever.
+    mock.set_page_hook(1, |state| {
+        state.messages.retain(|message| message["ID"] != "boot-0");
+        state.latest_event = "event-final-page-churn".to_string();
+    });
+
+    let mut cursor = Some(first.checkpoint);
+    let mut pages = 1;
+    while let Some(next_cursor) = cursor {
+        pages += 1;
+        assert!(pages < 20, "snapshot paging must terminate");
+        let page = sync
+            .next_page(
+                SyncRequest {
+                    cursor: Some(next_cursor),
+                    initial_limit: 2,
+                },
+                &ctx,
+            )
+            .await
+            .expect("snapshot page");
+        for (record, _) in upserts(std::slice::from_ref(&page)) {
+            seen.insert(record.remote_id.as_str().to_string());
+        }
+        cursor = page.has_more.then_some(page.checkpoint);
+    }
+
+    for index in 1..4 {
+        assert!(
+            seen.contains(&format!("boot-{index}")),
+            "final-page churn skipped boot-{index}; seen {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn completed_reconcile_retires_absent_messages_after_event_gap() {
+    let mut state = default_state();
+    for (id, time) in [("retire-me", 1_700_000_100), ("keep-me", 1_700_000_000)] {
+        state.put_message(message(
+            id,
+            &format!("conv-{id}"),
+            id,
+            &["0"],
+            "sender@example.com",
+            "alice@example.com",
+            time,
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let ctx = context();
+    let mut sync = ProtonSync::new(mock.client(Arc::new(StaticTokens)));
+
+    let first = drive_sync(&mut sync, &ctx, 10, 40).await;
+    let checkpoint = first.last().expect("pages").checkpoint.clone();
+    assert_eq!(cursor_stage(&checkpoint).expect("stage"), "complete");
+
+    // The deletion and event retention gap happen while no delta can be read:
+    // the next event request forces a reset. The completed reconciliation must
+    // retire the message the server no longer lists.
+    mock.update(|state| {
+        state
+            .messages
+            .retain(|message| message["ID"] != "retire-me");
+        state.latest_event = "event-gap".to_string();
+        state.event(
+            "event-0",
+            json!({
+                "EventID": "event-gap",
+                "More": 0,
+                "Refresh": 1,
+                "Messages": [],
+                "MessageCounts": [],
+            }),
+        );
+    });
+
+    let after = drive_sync_from(&mut sync, &ctx, Some(checkpoint), 10, 40).await;
+    assert_eq!(
+        removed(&after),
+        vec![RemoteMessageId::new("retire-me")],
+        "a completed sweep must retire a record deleted during the retention gap"
+    );
+    assert!(
+        upserts(&after)
+            .iter()
+            .any(|(record, new)| record.remote_id.as_str() == "keep-me" && !*new),
+        "the surviving message is re-upserted historically"
+    );
+    assert!(
+        !upserts(&after)
+            .iter()
+            .any(|(record, _)| record.remote_id.as_str() == "retire-me"),
+        "an absent record must never be re-upserted as present"
+    );
+}
+
+#[tokio::test]
+async fn failed_history_page_does_not_advance_or_skip() {
+    let mut state = default_state();
+    for index in 0..5 {
+        state.put_message(message(
+            &format!("history-{index}"),
+            &format!("conv-{index}"),
+            &format!("History {index}"),
+            &["0"],
+            "sender@example.com",
+            &format!("history{index}@example.com"),
+            1_700_000_000 - index as i64,
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let ctx = context();
+    let mut mailbox = ProtonMailbox::new(mock.client(Arc::new(StaticTokens)));
+
+    let first = mailbox
+        .history(
+            HistoryRequest {
+                cursor: None,
+                page_size: 2,
+            },
+            &ctx,
+        )
+        .await
+        .expect("first page");
+    let mut seen: HashSet<String> = first
+        .messages
+        .iter()
+        .map(|record| record.remote_id.as_str().to_string())
+        .collect();
+    let resume = first.checkpoint;
+
+    mock.fail_page(1);
+    let error = mailbox
+        .history(
+            HistoryRequest {
+                cursor: Some(resume.clone()),
+                page_size: 2,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("a failed page must not commit a checkpoint");
+    assert_eq!(error.kind, ErrorKind::Transient);
+    mock.clear_failed_pages();
+
+    let mut cursor = Some(resume);
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 10, "history must terminate after the retry");
+        let page = mailbox
+            .history(
+                HistoryRequest {
+                    cursor: cursor.clone(),
+                    page_size: 2,
+                },
+                &ctx,
+            )
+            .await
+            .expect("retried page");
+        for record in &page.messages {
+            seen.insert(record.remote_id.as_str().to_string());
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = Some(page.checkpoint);
+    }
+    for index in 0..5 {
+        assert!(
+            seen.contains(&format!("history-{index}")),
+            "a failed page skipped history-{index}; seen {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_page_size_is_pinned_in_the_cursor() {
+    let mut state = default_state();
+    for index in 0..5 {
+        state.put_message(message(
+            &format!("pinned-{index}"),
+            &format!("conv-{index}"),
+            &format!("Pinned {index}"),
+            &["0"],
+            "sender@example.com",
+            &format!("pinned{index}@example.com"),
+            1_700_000_000 - index as i64,
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let ctx = context();
+    let mut mailbox = ProtonMailbox::new(mock.client(Arc::new(StaticTokens)));
+
+    let first = mailbox
+        .history(
+            HistoryRequest {
+                cursor: None,
+                page_size: 2,
+            },
+            &ctx,
+        )
+        .await
+        .expect("first page");
+    // A caller changing its budget mid-crawl must not shift offsets.
+    let second = mailbox
+        .history(
+            HistoryRequest {
+                cursor: Some(first.checkpoint),
+                page_size: 5,
+            },
+            &ctx,
+        )
+        .await
+        .expect("second page");
+    assert_eq!(second.messages.len(), 2, "the pinned size still pages two");
+    let requests = mock.requests();
+    let pinned_requests: Vec<Option<&str>> = requests
+        .iter()
+        .filter(|request| request.path == "/mail/v4/messages")
+        .map(|request| request.query_value("PageSize"))
+        .collect();
+    assert_eq!(
+        pinned_requests,
+        vec![Some("2"), Some("2")],
+        "every page must use the pinned size"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_page_size_is_pinned_in_the_cursor() {
+    let mut state = default_state();
+    for index in 0..4 {
+        state.put_message(message(
+            &format!("pinned-{index}"),
+            &format!("conv-{index}"),
+            &format!("Pinned {index}"),
+            &["0"],
+            "sender@example.com",
+            &format!("pinned{index}@example.com"),
+            1_700_000_000 - index as i64,
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let ctx = context();
+    let mut sync = ProtonSync::new(mock.client(Arc::new(StaticTokens)));
+
+    let first = sync
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 2,
+            },
+            &ctx,
+        )
+        .await
+        .expect("first snapshot page");
+    let second = sync
+        .next_page(
+            SyncRequest {
+                cursor: Some(first.checkpoint),
+                initial_limit: 5,
+            },
+            &ctx,
+        )
+        .await
+        .expect("second snapshot page");
+    assert_eq!(
+        upserts(std::slice::from_ref(&second)).len(),
+        2,
+        "the pinned size still pages two"
+    );
+    let requests = mock.requests();
+    let inbox_sizes: Vec<Option<&str>> = requests
+        .iter()
+        .filter(|request| {
+            request.path == "/mail/v4/messages" && request.query_value("LabelID") == Some("0")
+        })
+        .map(|request| request.query_value("PageSize"))
+        .collect();
+    assert_eq!(
+        inbox_sizes,
+        vec![Some("2"), Some("2")],
+        "a changed initial_limit must not shift snapshot offsets"
+    );
 }

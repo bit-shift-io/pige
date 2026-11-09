@@ -173,6 +173,35 @@ async fn refresh_is_single_flight() {
 }
 
 #[tokio::test]
+async fn cached_token_source_invalidate_forces_a_real_refresh() {
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let refresher = Arc::new(FakeTokenRefresher::new("fresh-token"));
+    let source = CachedTokenSource::new(refresher.clone(), Duration::from_secs(3600));
+    let ctx = harness
+        .sessions
+        .context(&account, Duration::from_secs(30))
+        .expect("context");
+
+    let first = source.access_token(&ctx).await.expect("first token");
+    assert_eq!(first.expose_secret(), "fresh-token");
+    assert_eq!(refresher.calls(), 1);
+
+    let cached = source.access_token(&ctx).await.expect("cached token");
+    assert_eq!(cached.expose_secret(), "fresh-token");
+    assert_eq!(refresher.calls(), 1, "an unexpired token is reused");
+
+    source.invalidate().await;
+    let refreshed = source.access_token(&ctx).await.expect("refreshed token");
+    assert_eq!(refreshed.expose_secret(), "fresh-token");
+    assert_eq!(
+        refresher.calls(),
+        2,
+        "invalidate must drop the cache and force a real refresh"
+    );
+}
+
+#[tokio::test]
 async fn removed_account_rejects_rotated_secret() {
     let harness = Harness::new();
     let account = AccountId::new();
