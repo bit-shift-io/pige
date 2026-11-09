@@ -6,6 +6,7 @@
 //! suppression rules, and the bounded/indexed query surface. No real addresses
 //! are used; all fixtures are `example.com`.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pige_core::Store;
@@ -13,6 +14,7 @@ use pige_core::account::{Account, AccountId, MailBackend, Security, ServerConfig
 use pige_core::api::{
     self, Config, DB_FILE_NAME, RecipientQuery, RecipientSuggestion, SuggestionSource,
 };
+use pige_core::contacts::rank::rank_candidates;
 use pige_core::contacts::{
     EvidenceId, HeaderRole, LearningOrigin, Observation, ObservationTrust, normalize_address,
 };
@@ -883,45 +885,12 @@ fn v11_database_backfills_the_projection_on_upgrade() {
 #[test]
 fn hundred_thousand_address_fixture_uses_projection_indexes() {
     let dir = TempDir::new().unwrap();
-    let store = Store::open(dir.path().join("pige.db")).unwrap();
+    let db_path = dir.path().join("pige.db");
+    let store = Store::open(&db_path).unwrap();
     store.migrate().unwrap();
     let account = account("account-a", "self@example.com");
     store.upsert_account(&account).unwrap();
-
-    // Seed the durable contact rows directly so the fixture stays fast; the
-    // production rebuild then populates the search projection in one pass.
-    {
-        let conn = Connection::open(dir.path().join("pige.db")).unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
-        tx.execute(
-            "INSERT INTO contact_sources (account_id, source_id, display_name, kind)
-             VALUES (?1, 'fixture', 'Fixture', 'saved')",
-            [&account.id.0],
-        )
-        .unwrap();
-        {
-            let mut insert = tx
-                .prepare(
-                    "INSERT INTO contact_emails
-                         (account_id, source_id, remote_contact_id, address_key, email, display_name)
-                     VALUES (?1, 'fixture', ?2, ?3, ?4, ?5)",
-                )
-                .unwrap();
-            for index in 0..100_000 {
-                let email = format!("person{index:06}@example.com");
-                insert
-                    .execute(rusqlite::params![
-                        account.id.0,
-                        format!("remote-{index}"),
-                        format!("person{index:06}@example.com"),
-                        email,
-                        format!("Person {index:06}"),
-                    ])
-                    .unwrap();
-            }
-        }
-        tx.commit().unwrap();
-    }
+    seed_hundred_thousand_addresses(&db_path, &account);
 
     store.rebuild_recipient_index().unwrap();
 
@@ -960,4 +929,238 @@ fn hundred_thousand_address_fixture_uses_projection_indexes() {
         !plan.contains("correspondence_evidence") && !plan.contains("evidence_addresses"),
         "a keystroke must never scan the evidence ledger: {plan}"
     );
+}
+
+#[test]
+fn hundred_thousand_address_short_prefix_is_bounded() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("pige.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    let account = account("account-a", "self@example.com");
+    store.upsert_account(&account).unwrap();
+    seed_hundred_thousand_addresses(&db_path, &account);
+    store.rebuild_recipient_index().unwrap();
+
+    // Every fixture address starts with `p`, so this prefix matches all 100k
+    // rows. The lookup must read an indexed top-N, not materialize the range.
+    let cap = 20usize;
+    let tokens = vec!["p".to_string()];
+    let steps = store
+        .recipient_search_vm_steps(&account.id, "p", &tokens, cap)
+        .unwrap();
+    assert!(
+        steps < 5_000,
+        "a one-character prefix must be bounded work, but consumed {steps} VM steps"
+    );
+
+    let candidates = store
+        .recipient_candidates(&account.id, "p", &tokens, cap)
+        .unwrap();
+    assert_eq!(
+        candidates.len(),
+        cap,
+        "the bounded page still fills the cap"
+    );
+    let ranked = rank_candidates(
+        candidates,
+        &account.id,
+        "p",
+        &HashSet::new(),
+        &HashSet::new(),
+        cap,
+    );
+    let emails: Vec<&str> = ranked
+        .iter()
+        .map(|suggestion| suggestion.address.email.as_str())
+        .collect();
+    assert_eq!(
+        emails,
+        (0..cap)
+            .map(|index| format!("person{index:06}@example.com"))
+            .collect::<Vec<_>>(),
+        "the indexed top-N keeps the correct deterministic rank order"
+    );
+
+    let plan_lines = store
+        .explain_recipient_search(&account.id, "p", &tokens, cap)
+        .unwrap();
+    let plan = plan_lines.join("\n");
+    assert!(
+        plan.contains("recipient_index_account_rank"),
+        "the top-N must be driven by the rank index: {plan}"
+    );
+    assert!(
+        !plan.contains("SCAN recipient_index"),
+        "a short prefix must not scan the whole projection: {plan}"
+    );
+    assert!(
+        plan_lines
+            .iter()
+            .filter(|line| line.starts_with("account-a prefix:"))
+            .all(|line| !line.contains("USE TEMP B-TREE FOR ORDER BY")),
+        "the prefix branch must not sort the whole range: {plan}"
+    );
+    assert!(
+        !plan.contains("correspondence_evidence") && !plan.contains("evidence_addresses"),
+        "a keystroke must never scan the evidence ledger: {plan}"
+    );
+}
+
+fn seed_hundred_thousand_addresses(db_path: &std::path::Path, account: &Account) {
+    // Seed the durable contact rows directly so the fixture stays fast; the
+    // production rebuild then populates the search projection in one pass.
+    let conn = Connection::open(db_path).unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    tx.execute(
+        "INSERT INTO contact_sources (account_id, source_id, display_name, kind)
+         VALUES (?1, 'fixture', 'Fixture', 'saved')",
+        [&account.id.0],
+    )
+    .unwrap();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO contact_emails
+                     (account_id, source_id, remote_contact_id, address_key, email, display_name)
+                 VALUES (?1, 'fixture', ?2, ?3, ?4, ?5)",
+            )
+            .unwrap();
+        for index in 0..100_000 {
+            let email = format!("person{index:06}@example.com");
+            insert
+                .execute(rusqlite::params![
+                    account.id.0,
+                    format!("remote-{index}"),
+                    format!("person{index:06}@example.com"),
+                    email,
+                    format!("Person {index:06}"),
+                ])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn every_query_token_is_required() {
+    let _guard = api_lock();
+    let account = account("account-a", "self@example.com");
+    let harness = Harness::new(std::slice::from_ref(&account));
+    let store = harness.store();
+
+    // The first contact matches all nine query words; the second matches only
+    // the first eight. A silently truncated token list would suggest both.
+    contact(
+        &store,
+        &account.id,
+        "saved-source",
+        "saved",
+        "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India",
+        "nine@example.com",
+    );
+    contact(
+        &store,
+        &account.id,
+        "saved-source",
+        "saved",
+        "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel",
+        "eight@example.com",
+    );
+
+    let query = "alpha bravo charlie delta echo foxtrot golf hotel india";
+    assert_eq!(
+        emails(&harness.suggest(&account.id, query, 10)),
+        vec!["nine@example.com"],
+        "the ninth token must be part of the match, not silently ignored"
+    );
+}
+
+#[test]
+fn unknown_sending_account_returns_no_suggestions() {
+    let _guard = api_lock();
+    let account = account("account-a", "self@example.com");
+    let harness = Harness::new(std::slice::from_ref(&account));
+    let store = harness.store();
+    incoming(
+        &store,
+        &account.id,
+        "message:alice",
+        "alice@example.com",
+        Some("Alice"),
+        100,
+    );
+
+    let unknown = api::suggest_recipients(RecipientQuery {
+        sending_account: AccountId("not-configured".to_string()),
+        text: "ali".to_string(),
+        limit: 10,
+    })
+    .unwrap();
+    assert!(
+        unknown.is_empty(),
+        "an unknown sending account must not receive another account's suggestions"
+    );
+
+    // The configured account still works.
+    assert_eq!(
+        emails(&harness.suggest(&account.id, "ali", 10)),
+        vec!["alice@example.com"]
+    );
+}
+
+#[test]
+fn v12_database_gains_the_rank_index_on_upgrade() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("pige.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate_to(12).unwrap();
+    let account = account("account-a", "self@example.com");
+    store.upsert_account(&account).unwrap();
+
+    // Recreate the pre-v13 v12 shape: no `tier` column and no rank indexes.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("ALTER TABLE recipient_index DROP COLUMN tier;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO recipient_index
+                 (account_id, address_key, email, display_name, email_folded, name_folded,
+                  saved_contact, other_contact, outgoing, selected, incoming, low_trust_only,
+                  last_seen, frequency)
+             VALUES (?1, 'alice@example.com', 'alice@example.com', 'Alice',
+                     'alice@example.com', 'alice', 1, 0, 0, 0, 0, 0, 100, 1)",
+            [&account.id.0],
+        )
+        .unwrap();
+    }
+
+    store.migrate().unwrap();
+    assert_eq!(
+        store.schema_version().unwrap(),
+        pige_core::SCHEMA_VERSION,
+        "the database upgrades to the current schema"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let tier: i64 = conn
+        .query_row(
+            "SELECT tier FROM recipient_index WHERE address_key = 'alice@example.com'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tier, 1,
+        "existing saved rows are backfilled with their tier"
+    );
+    let rank_index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'recipient_index_account_rank'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rank_index, 1, "the bounded rank index is created");
 }

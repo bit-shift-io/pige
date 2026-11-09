@@ -5,6 +5,7 @@
 mod v10;
 mod v11;
 mod v12;
+mod v13;
 mod v2;
 mod v3;
 mod v4;
@@ -66,7 +67,8 @@ impl Store {
     /// parts, operation identity, prepared artifacts, and receipts; v10 adds the
     /// recoverable backend-switch intent; v11 adds source contacts and the
     /// replay-safe correspondent evidence ledger; v12 adds the indexed recipient
-    /// search projection and contact-source kind.
+    /// search projection and contact-source kind; v13 adds the rank index that
+    /// bounds short-prefix lookups to an indexed top-N.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -160,6 +162,10 @@ impl Store {
         if version < 12 && target >= 12 {
             v12::apply(&tx)?;
             version = 12;
+        }
+        if version < 13 && target >= 13 {
+            v13::apply(&tx)?;
+            version = 13;
         }
 
         // The rebuild must not leave a dangling reference behind; check before

@@ -43,6 +43,7 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
              low_trust_only INTEGER NOT NULL DEFAULT 0,
              last_seen INTEGER NOT NULL DEFAULT 0,
              frequency INTEGER NOT NULL DEFAULT 0,
+             tier INTEGER NOT NULL DEFAULT 3,
              PRIMARY KEY (account_id, address_key)
          );
 

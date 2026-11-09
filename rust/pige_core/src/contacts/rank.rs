@@ -25,9 +25,6 @@ use super::types::{AddressKey, RecipientSuggestion, SuggestionSource};
 pub const MAX_SUGGESTIONS: usize = 20;
 /// Public query text is truncated to this many Unicode scalar values.
 pub const MAX_QUERY_CHARS: usize = 256;
-/// A query with more tokens than this is answered from the first few; the rest
-/// are ignored rather than growing the SQL statement without bound.
-pub const MAX_QUERY_TOKENS: usize = 8;
 /// Frequency is bounded so an old, noisy correspondent cannot dominate forever.
 pub const MAX_FREQUENCY: u32 = 100;
 
@@ -69,6 +66,11 @@ pub fn folded_query(text: &str) -> String {
 }
 
 /// Split user input into case-folded prefix tokens.
+///
+/// Every token is kept: a query is only answered with suggestions that match the
+/// full input. The SQL statement stays bounded because the public entry point
+/// truncates query text to [`MAX_QUERY_CHARS`] first, so at most ~128 one-character
+/// tokens (each taking two bind parameters) can reach the query builder.
 pub fn query_tokens(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut tokens = Vec::new();
@@ -85,9 +87,6 @@ pub fn query_tokens(text: &str) -> Vec<String> {
             continue;
         }
         tokens.push(token);
-        if tokens.len() == MAX_QUERY_TOKENS {
-            break;
-        }
     }
     tokens
 }
@@ -122,52 +121,80 @@ pub fn prefix_upper_bound(prefix: &str) -> String {
     upper
 }
 
-/// The SQL shared by the real lookup and its query-plan test.
-pub(crate) fn recipient_search_sql(token_count: usize) -> String {
-    let selects = (0..token_count)
+/// The SQL for one account's bounded candidate page, shared by the real lookup
+/// and its query-plan test.
+///
+/// The lookup is driven by `recipient_index_account_rank`, whose key is
+/// `(account_id, tier, last_seen DESC, frequency DESC, address_key)`. After
+/// fixing `account_id`, the `ORDER BY` is satisfied by that index, so SQLite
+/// stops as soon as `LIMIT` candidates that also satisfy the token predicates
+/// have been read. A one-character prefix therefore cannot materialize or sort
+/// the whole token range.
+///
+/// `exact` selects the branch that also matches the whole query against the
+/// folded email/name; the other branch excludes those rows. Each branch is
+/// capped independently so the union always contains the account's true top
+/// candidates for both groups.
+///
+/// Bind parameters: `?1` account id, `?2` folded query, then two parameters per
+/// token (`?3` lower, `?4` upper, ...), then the cap.
+pub(crate) fn recipient_account_search_sql(token_count: usize, exact: bool) -> String {
+    let token_predicates = (0..token_count)
         .map(|slot| {
             format!(
-                "SELECT account_id, address_key, {slot} AS slot \
-                 FROM recipient_tokens WHERE token >= ?{lower} AND token < ?{upper}",
-                lower = slot * 2 + 1,
-                upper = slot * 2 + 2,
+                "AND EXISTS (SELECT 1 FROM recipient_tokens \
+                 WHERE recipient_tokens.account_id = r.account_id \
+                   AND recipient_tokens.address_key = r.address_key \
+                   AND recipient_tokens.token >= ?{lower} \
+                   AND recipient_tokens.token < ?{upper})",
+                lower = 3 + slot * 2,
+                upper = 4 + slot * 2,
             )
         })
         .collect::<Vec<_>>()
-        .join(" UNION ");
-    let query = token_count * 2 + 1;
-    let sending = query + 2;
-    let cap = sending + 1;
-    format!(
-        "WITH matches AS (
-             SELECT account_id, address_key FROM ({selects})
-             GROUP BY account_id, address_key
-             HAVING COUNT(DISTINCT slot) = {token_count}
-         )
-         SELECT r.account_id, r.address_key, r.email, r.display_name,
-                r.saved_contact, r.other_contact, r.outgoing, r.selected,
-                r.incoming, r.low_trust_only, r.last_seen, r.frequency,
-                CASE WHEN r.email_folded = ?{query} OR r.name_folded = ?{query_again}
-                     THEN 1 ELSE 0 END AS exact,
-                CASE WHEN r.account_id = ?{sending} THEN 1 ELSE 0 END AS current
-         FROM recipient_index r
-         JOIN matches m
-           ON m.account_id = r.account_id AND m.address_key = r.address_key
-         WHERE r.low_trust_only = 0
-         ORDER BY
-             CASE WHEN r.outgoing = 1 OR r.selected = 1 THEN 0
-                  WHEN r.saved_contact = 1 THEN 1
-                  WHEN r.other_contact = 1 THEN 2
-                  ELSE 3 END ASC,
-             exact DESC,
-             current DESC,
-             r.last_seen DESC,
-             r.frequency DESC,
-             r.address_key ASC,
-             r.account_id ASC
-         LIMIT ?{cap}",
-        query_again = query + 1,
-    )
+        .join(" ");
+    let cap = 3 + token_count * 2;
+
+    if exact {
+        // Equality lookups on the two folded-key indexes; the outer sort only
+        // touches the (normally tiny) exact-match set.
+        let select = |column: &str, index: &str| {
+            format!(
+                "SELECT r.account_id, r.address_key, r.email, r.display_name,
+                        r.saved_contact, r.other_contact, r.outgoing, r.selected,
+                        r.incoming, r.low_trust_only, r.last_seen, r.frequency, r.tier
+                 FROM recipient_index r INDEXED BY {index}
+                 WHERE r.account_id = ?1
+                   AND r.low_trust_only = 0
+                   AND r.{column} = ?2
+                   {token_predicates}"
+            )
+        };
+        format!(
+            "SELECT * FROM (
+                 {email_branch}
+                 UNION
+                 {name_branch}
+             )
+             ORDER BY tier ASC, last_seen DESC, frequency DESC, address_key ASC
+             LIMIT ?{cap}",
+            email_branch = select("email_folded", "recipient_index_email_folded"),
+            name_branch = select("name_folded", "recipient_index_name_folded"),
+        )
+    } else {
+        format!(
+            "SELECT r.account_id, r.address_key, r.email, r.display_name,
+                    r.saved_contact, r.other_contact, r.outgoing, r.selected,
+                    r.incoming, r.low_trust_only, r.last_seen, r.frequency
+             FROM recipient_index r INDEXED BY recipient_index_account_rank
+             WHERE r.account_id = ?1
+               AND r.low_trust_only = 0
+               AND NOT (r.email_folded = ?2 OR r.name_folded = ?2)
+               {token_predicates}
+             ORDER BY r.tier ASC, r.last_seen DESC, r.frequency DESC, r.address_key ASC
+             LIMIT ?{cap}"
+        )
+    }
 }
 
 /// Merge per-account rows into one suggestion per exact address, suppress

@@ -37,6 +37,16 @@ pub fn suggest_recipients(query: RecipientQuery) -> Result<Vec<RecipientSuggesti
     let state = guard
         .as_ref()
         .ok_or_else(|| "pige api is not initialized".to_string())?;
+    // An unknown sending account has no compose context; never return another
+    // account's suggestions for it.
+    if !state
+        .config_doc
+        .accounts
+        .iter()
+        .any(|configured| configured.id == query.sending_account)
+    {
+        return Ok(Vec::new());
+    }
 
     let cap = limit
         .saturating_mul(CANDIDATE_MULTIPLIER)

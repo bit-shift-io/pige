@@ -12,13 +12,13 @@
 use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::types::Value;
-use rusqlite::{OptionalExtension, params, params_from_iter};
+use rusqlite::{OptionalExtension, StatementStatus, params, params_from_iter};
 
 use crate::account::AccountId;
 use crate::contacts::learn;
 use crate::contacts::normalize::normalize_address;
 use crate::contacts::rank::{
-    MAX_FREQUENCY, OTHER_CONTACT_KIND, RecipientCandidate, recipient_search_sql,
+    MAX_FREQUENCY, OTHER_CONTACT_KIND, RecipientCandidate, recipient_account_search_sql,
     recipient_search_tokens,
 };
 use crate::contacts::types::{
@@ -336,9 +336,16 @@ impl Store {
         Ok(roles)
     }
 
-    /// Search the indexed recipient projection. Matches every query token as a
-    /// case-folded prefix against the token table, then joins the ranking
-    /// projection. Only `cap` rows are read; no evidence rows are touched.
+    /// Search the indexed recipient projection for every account.
+    ///
+    /// Each account contributes two independently capped pages: exact
+    /// folded-name/address matches and the remaining prefix matches. Both are
+    /// driven by `recipient_index_account_rank`, so a broad prefix stops after
+    /// `cap` rows instead of materializing and sorting the whole token range.
+    /// Within one account the query-dependent exact/current tie-breakers are
+    /// constant, so the union of the per-account pages is a superset of the true
+    /// global top candidates; the caller applies the final deterministic order.
+    /// No evidence rows are touched.
     pub fn recipient_candidates(
         &self,
         sending_account: &AccountId,
@@ -346,35 +353,56 @@ impl Store {
         tokens: &[String],
         cap: usize,
     ) -> Result<Vec<RecipientCandidate>, StoreError> {
+        Ok(self
+            .recipient_candidates_with_steps(sending_account, folded_query, tokens, cap)?
+            .0)
+    }
+
+    /// SQLite VM steps consumed by the candidate lookup. Test-only hook used by
+    /// the 100k-address fixture to prove a short prefix is bounded work.
+    #[doc(hidden)]
+    pub fn recipient_search_vm_steps(
+        &self,
+        sending_account: &AccountId,
+        folded_query: &str,
+        tokens: &[String],
+        cap: usize,
+    ) -> Result<i64, StoreError> {
+        Ok(self
+            .recipient_candidates_with_steps(sending_account, folded_query, tokens, cap)?
+            .1)
+    }
+
+    fn recipient_candidates_with_steps(
+        &self,
+        _sending_account: &AccountId,
+        folded_query: &str,
+        tokens: &[String],
+        cap: usize,
+    ) -> Result<(Vec<RecipientCandidate>, i64), StoreError> {
         if tokens.is_empty() || cap == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
-        let sql = recipient_search_sql(tokens.len());
-        let values = recipient_query_values(sending_account, folded_query, tokens, cap);
         let conn = self.connection();
-        let mut statement = conn.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(values))?;
+        let accounts = store_account_ids(&conn)?;
+
         let mut candidates = Vec::new();
-        while let Some(row) = rows.next()? {
-            let email: String = row.get(2)?;
-            let display_name: Option<String> = row.get(3)?;
-            let last_seen: i64 = row.get(10)?;
-            let frequency: i64 = row.get(11)?;
-            candidates.push(RecipientCandidate {
-                account: AccountId(row.get(0)?),
-                key: AddressKey(row.get(1)?),
-                address: Address::new(display_name, email),
-                saved: row.get::<_, i64>(4)? != 0,
-                other: row.get::<_, i64>(5)? != 0,
-                outgoing: row.get::<_, i64>(6)? != 0,
-                selected: row.get::<_, i64>(7)? != 0,
-                incoming: row.get::<_, i64>(8)? != 0,
-                low_trust_only: row.get::<_, i64>(9)? != 0,
-                last_seen,
-                frequency: frequency.max(0) as u32,
-            });
+        let mut steps = 0i64;
+        for account in accounts {
+            for exact in [true, false] {
+                let sql = recipient_account_search_sql(tokens.len(), exact);
+                let values = recipient_query_values(&account, folded_query, tokens, cap);
+                let mut statement = conn.prepare(&sql)?;
+                {
+                    let mut rows = statement.query(params_from_iter(values))?;
+                    while let Some(row) = rows.next()? {
+                        candidates.push(candidate_from_row(row)?);
+                    }
+                }
+                steps += i64::from(statement.get_status(StatementStatus::VmStep));
+            }
         }
-        Ok(candidates)
+        Ok((candidates, steps))
     }
 
     /// `EXPLAIN QUERY PLAN` for the real recipient lookup. Exposed for the
@@ -382,7 +410,7 @@ impl Store {
     #[doc(hidden)]
     pub fn explain_recipient_search(
         &self,
-        sending_account: &AccountId,
+        _sending_account: &AccountId,
         folded_query: &str,
         tokens: &[String],
         cap: usize,
@@ -390,14 +418,22 @@ impl Store {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!("EXPLAIN QUERY PLAN {}", recipient_search_sql(tokens.len()));
-        let values = recipient_query_values(sending_account, folded_query, tokens, cap);
         let conn = self.connection();
-        let mut statement = conn.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(values))?;
         let mut plan = Vec::new();
-        while let Some(row) = rows.next()? {
-            plan.push(row.get::<_, String>(3)?);
+        for account in store_account_ids(&conn)? {
+            for exact in [true, false] {
+                let label = if exact { "exact" } else { "prefix" };
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    recipient_account_search_sql(tokens.len(), exact)
+                );
+                let values = recipient_query_values(&account, folded_query, tokens, cap);
+                let mut statement = conn.prepare(&sql)?;
+                let mut rows = statement.query(params_from_iter(values))?;
+                while let Some(row) = rows.next()? {
+                    plan.push(format!("{account} {label}: {}", row.get::<_, String>(3)?));
+                }
+            }
         }
         Ok(plan)
     }
@@ -414,22 +450,51 @@ impl Store {
     }
 }
 
+fn store_account_ids(conn: &rusqlite::Connection) -> Result<Vec<String>, StoreError> {
+    let mut statement = conn.prepare("SELECT id FROM accounts ORDER BY id")?;
+    let mut rows = statement.query([])?;
+    let mut accounts = Vec::new();
+    while let Some(row) = rows.next()? {
+        accounts.push(row.get(0)?);
+    }
+    Ok(accounts)
+}
+
+fn candidate_from_row(row: &rusqlite::Row<'_>) -> Result<RecipientCandidate, StoreError> {
+    let email: String = row.get(2)?;
+    let display_name: Option<String> = row.get(3)?;
+    let last_seen: i64 = row.get(10)?;
+    let frequency: i64 = row.get(11)?;
+    Ok(RecipientCandidate {
+        account: AccountId(row.get(0)?),
+        key: AddressKey(row.get(1)?),
+        address: Address::new(display_name, email),
+        saved: row.get::<_, i64>(4)? != 0,
+        other: row.get::<_, i64>(5)? != 0,
+        outgoing: row.get::<_, i64>(6)? != 0,
+        selected: row.get::<_, i64>(7)? != 0,
+        incoming: row.get::<_, i64>(8)? != 0,
+        low_trust_only: row.get::<_, i64>(9)? != 0,
+        last_seen,
+        frequency: frequency.max(0) as u32,
+    })
+}
+
 fn recipient_query_values(
-    sending_account: &AccountId,
+    account: &str,
     folded_query: &str,
     tokens: &[String],
     cap: usize,
 ) -> Vec<Value> {
-    let mut values = Vec::with_capacity(tokens.len() * 2 + 4);
+    let mut values = Vec::with_capacity(tokens.len() * 2 + 3);
+    values.push(Value::Text(account.to_string()));
+    values.push(Value::Text(folded_query.to_string()));
     for token in tokens {
         values.push(Value::Text(token.clone()));
         values.push(Value::Text(crate::contacts::rank::prefix_upper_bound(
             token,
         )));
     }
-    values.push(Value::Text(folded_query.to_string()));
-    values.push(Value::Text(folded_query.to_string()));
-    values.push(Value::Text(sending_account.0.clone()));
     values.push(Value::Integer(cap as i64));
     values
 }
@@ -606,13 +671,22 @@ fn write_recipient_index_in(
     let frequency = learned
         .map(|learned| learned.evidence_count.min(MAX_FREQUENCY))
         .unwrap_or(0);
+    let tier = if outgoing || selected {
+        0
+    } else if saved {
+        1
+    } else if other {
+        2
+    } else {
+        3
+    };
 
     conn.prepare_cached(
         "INSERT INTO recipient_index
              (account_id, address_key, email, display_name, email_folded, name_folded,
               saved_contact, other_contact, outgoing, selected, incoming, low_trust_only,
-              last_seen, frequency)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+              last_seen, frequency, tier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(account_id, address_key) DO UPDATE SET
              email = excluded.email,
              display_name = excluded.display_name,
@@ -625,7 +699,8 @@ fn write_recipient_index_in(
              incoming = excluded.incoming,
              low_trust_only = excluded.low_trust_only,
              last_seen = excluded.last_seen,
-             frequency = excluded.frequency",
+             frequency = excluded.frequency,
+             tier = excluded.tier",
     )?
     .execute(params![
         account.0,
@@ -642,6 +717,7 @@ fn write_recipient_index_in(
         bool_int(low_trust_only),
         last_seen,
         i64::from(frequency),
+        i64::from(tier),
     ])?;
 
     conn.prepare_cached("DELETE FROM recipient_tokens WHERE account_id = ?1 AND address_key = ?2")?
