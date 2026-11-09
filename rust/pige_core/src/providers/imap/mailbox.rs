@@ -189,6 +189,7 @@ impl MailboxService for ImapMailbox {
         let mut messages = Vec::new();
         let mut produced = false;
         let mut more_in_mailbox = false;
+        let mut rebaselined = false;
 
         while state.index < state.mailboxes.len() {
             // A long run of unselectable mailboxes must still honor a cancel.
@@ -211,11 +212,23 @@ impl MailboxService for ImapMailbox {
                     continue;
                 }
             };
-            // Enter the mailbox on the first page that touches it: record the
-            // epoch that names every id yielded from this mailbox.
-            if state.before_uid.is_none() {
+
+            // Compare the live epoch with the cursor's on every page. A UID
+            // only names a message inside its UIDVALIDITY epoch: after a reset
+            // the same UID may be gone or may name a different message, so the
+            // old `before_uid` bound must never be reused. Restart this
+            // mailbox from its newest UID under the new epoch and return a
+            // non-complete page so the caller commits the rebaselined cursor
+            // before any further paging (and can safely replay it).
+            if state.uidvalidity != 0 && state.uidvalidity != folder_state.uidvalidity {
                 state.uidvalidity = folder_state.uidvalidity;
+                state.before_uid = None;
+                rebaselined = true;
+                break;
             }
+            // Entering a mailbox records the epoch that names every id yielded
+            // from it.
+            state.uidvalidity = folder_state.uidvalidity;
 
             let mut uids = self.transport.list_uids().await.map_err(transport_error)?;
             // Newest first, from real UID metadata. Sparse UIDs are kept as-is.
@@ -256,7 +269,8 @@ impl MailboxService for ImapMailbox {
             break;
         }
 
-        let has_more = produced && (more_in_mailbox || state.index + 1 < state.mailboxes.len());
+        let has_more =
+            rebaselined || (produced && (more_in_mailbox || state.index + 1 < state.mailboxes.len()));
         let checkpoint = encode_history_cursor(&state)?;
 
         Ok(HistoryPage {

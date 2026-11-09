@@ -35,6 +35,8 @@ pub const HISTORY_PAGE_SIZE: u32 = 100;
 pub const HISTORY_MAX_PAGES: u32 = 5;
 /// Wall-clock budget for one background slice.
 pub const HISTORY_SLICE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock budget for one user-initiated foreground slice.
+pub const HISTORY_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Account jobs that may learn history concurrently in this process.
 pub const HISTORY_MAX_CONCURRENT_JOBS: usize = 2;
 /// A rate-limit response without an explicit delay is retried after this long.
@@ -71,7 +73,7 @@ pub fn foreground_budget() -> WorkBudget {
     WorkBudget::with_timeout(
         HISTORY_PAGE_SIZE,
         HISTORY_FOREGROUND_PAGES,
-        Duration::from_secs(30),
+        HISTORY_FOREGROUND_TIMEOUT,
     )
 }
 
@@ -158,7 +160,10 @@ pub fn learning_progress(
         scanned: state.progress.scanned,
         total_hint: state.progress.total_hint,
         complete: state.progress.complete,
-        paused: !state.progress.complete,
+        // `paused` is the durable "stopped with more remaining" flag, not just
+        // the complement of `complete`: an in-flight/not-yet-started crawl is
+        // not paused, and a completed crawl is neither paused nor incomplete.
+        paused: state.progress.paused && !state.progress.complete,
     })
 }
 
@@ -192,6 +197,21 @@ async fn learn(
     if state.retry_after_ms != 0 {
         store.clear_history_retry_after(ctx).map_err(store_error)?;
     }
+
+    // Mark the crawl active so a concurrent `learning_progress` read can tell
+    // an in-flight slice from one that stopped with work remaining. The store
+    // never lets this write undo a concurrent completion.
+    store
+        .record_history_progress(
+            ctx,
+            HistoryProgress {
+                scanned: state.progress.scanned,
+                total_hint: state.progress.total_hint,
+                complete: false,
+                paused: false,
+            },
+        )
+        .map_err(store_error)?;
 
     let deadline = budget.deadline.min(ctx.deadline);
     let page_size = budget.page_size.max(1);
@@ -312,11 +332,15 @@ async fn learn(
 
         pages += 1;
         pending_reset = false;
-        if page.coverage.scanned > 0 {
-            scanned = page.coverage.scanned;
+        // A cursor reset (or adapter rebaseline) may restart the provider's
+        // own counter at zero. Progress is cumulative for the UI and must never
+        // move backwards, so keep the larger observation.
+        let observed = if page.coverage.scanned > 0 {
+            page.coverage.scanned
         } else {
-            scanned = scanned.max(page.messages.len() as u64);
-        }
+            page.messages.len() as u64
+        };
+        scanned = scanned.max(observed);
         total_hint = page.coverage.total_hint.or(total_hint);
 
         // End-of-enumeration is the adapter's statement, never a page-size or

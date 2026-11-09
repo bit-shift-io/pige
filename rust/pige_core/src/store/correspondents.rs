@@ -328,6 +328,8 @@ impl Store {
     }
 
     /// Persist one slice's progress under the account's generation fence.
+    /// Progress is monotonic: `scanned` never decreases, and once a crawl is
+    /// complete a late tail write cannot transiently mark it incomplete again.
     /// A history retry delay is independent of this write and is preserved.
     pub fn record_history_progress(
         &self,
@@ -344,10 +346,21 @@ impl Store {
              VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(account_id) DO UPDATE SET
                  updated_at = excluded.updated_at,
-                 history_scanned = excluded.history_scanned,
-                 history_total_hint = excluded.history_total_hint,
-                 history_complete = excluded.history_complete,
-                 history_paused = excluded.history_paused",
+                 history_scanned = MAX(contact_learning_state.history_scanned,
+                                       excluded.history_scanned),
+                 history_total_hint = COALESCE(excluded.history_total_hint,
+                                               contact_learning_state.history_total_hint),
+                 -- A late tail write (budget/gate exit) must never undo a
+                 -- concurrent completion. Completion is monotonic until the
+                 -- learning row itself is cleared.
+                 history_complete = CASE
+                     WHEN contact_learning_state.history_complete <> 0 THEN 1
+                     ELSE excluded.history_complete
+                 END,
+                 history_paused = CASE
+                     WHEN contact_learning_state.history_complete <> 0 THEN 0
+                     ELSE excluded.history_paused
+                 END",
             params![
                 ctx.account.0,
                 now_unix(),

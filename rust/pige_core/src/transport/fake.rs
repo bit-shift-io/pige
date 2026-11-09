@@ -39,6 +39,15 @@ pub struct FakeTransport {
     /// Folder names whose `append` returns an error.
     pub fail_append: HashSet<String>,
 
+    /// After this many `fetch_learning_headers` calls, replace `messages` and
+    /// `states` with [`Self::rotated_messages`] and [`Self::rotated_states`].
+    /// This models an IMAP `UIDVALIDITY` reset between two history pages.
+    pub rotate_after_history_fetches: Option<usize>,
+    /// Replacement messages applied by the one-shot rotation above.
+    pub rotated_messages: HashMap<String, Vec<RemoteMessage>>,
+    /// Replacement folder states applied by the one-shot rotation above.
+    pub rotated_states: HashMap<String, FolderState>,
+
     pub select_calls: Vec<String>,
     pub fetch_headers_calls: Vec<(String, UidRange)>,
     pub list_uids_calls: Vec<String>,
@@ -74,6 +83,8 @@ pub struct FakeTransport {
 
     /// Internal: the folder most recently selected, if any.
     pub current: Option<String>,
+    /// Internal: number of completed history header fetches.
+    pub history_fetches: usize,
 }
 
 impl FakeTransport {
@@ -180,7 +191,7 @@ impl MailTransport for FakeTransport {
         self.fetch_learning_headers_calls
             .push((folder.clone(), uids.to_vec()));
         // Fetch exactly the requested (possibly sparse) UIDs, in the order asked.
-        Ok(uids
+        let fetched = uids
             .iter()
             .filter_map(|uid| {
                 self.messages
@@ -188,7 +199,17 @@ impl MailTransport for FakeTransport {
                     .and_then(|messages| messages.iter().find(|message| message.uid == *uid))
                     .cloned()
             })
-            .collect())
+            .collect();
+
+        // One-shot epoch rotation: the page above was produced under the old
+        // UIDVALIDITY, and the very next `select`/`list_uids` sees the new one.
+        self.history_fetches += 1;
+        if self.rotate_after_history_fetches == Some(self.history_fetches) {
+            self.messages.extend(std::mem::take(&mut self.rotated_messages));
+            self.states.extend(std::mem::take(&mut self.rotated_states));
+            self.rotate_after_history_fetches = None;
+        }
+        Ok(fetched)
     }
 
     async fn fetch_texts(

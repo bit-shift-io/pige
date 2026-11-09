@@ -804,6 +804,53 @@ pub fn learning_progress(account: &AccountId) -> Result<LearningProgress, String
         .map_err(|error| format!("read learning progress: {error}"))
 }
 
+/// Opportunistically learn more header history for one account while the app is
+/// open.
+///
+/// This is the foreground counterpart to the small slice that runs after each
+/// sync. It uses [`foreground_budget`](crate::sync::history::foreground_budget),
+/// so it stops after a bounded number of pages (or the foreground deadline) and
+/// the next call resumes from the durable checkpoint. It never inserts history
+/// into the visible cache and never emits a new-mail notification. A caller
+/// that cannot get one of the process-wide account slots returns the durable
+/// progress without doing provider work.
+pub async fn learn_history_now(account: &AccountId) -> Result<LearningProgress, String> {
+    let (config, store, sessions, scheduler, account) = {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        let account = state
+            .config_doc
+            .accounts
+            .iter()
+            .find(|configured| &configured.id == account)
+            .cloned()
+            .ok_or_else(|| format!("unknown account {account}"))?;
+        (
+            state.config.clone(),
+            state.store.clone(),
+            state.sessions.clone(),
+            state.scheduler.clone(),
+            account,
+        )
+    };
+
+    let ctx = sessions
+        .context(&account.id, crate::sync::history::HISTORY_FOREGROUND_TIMEOUT)
+        .map_err(|error| format!("{}: {}", account.label, error.safe_message))?;
+    crate::sync::history::learn_account_slice(
+        &store,
+        &config.providers,
+        &account,
+        &ctx,
+        crate::sync::history::foreground_budget(),
+        &scheduler,
+    )
+    .await
+    .map_err(|error| format!("{}: {}", account.label, error.safe_message))
+}
+
 /// The persisted user settings, from the configuration document.
 pub fn settings() -> Settings {
     let guard = lock_state();

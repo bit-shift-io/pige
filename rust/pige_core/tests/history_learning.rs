@@ -19,15 +19,21 @@ use pige_core::mail::{Address, Flags, MessageHeader};
 use pige_core::providers::{
     BodyContent, ChangePage, ErrorKind, HistoryCoverage, HistoryPage, HistoryRequest,
     IMAP_SMTP_PROVIDER, JobKey, JobKind, MailChange, MailboxService, MessageRecord,
-    OperationContext, ProviderCursor, ProviderError, RemoteAttachmentId, RemoteMessageId,
+    OperationContext, ProviderCapabilities, ProviderCursor, ProviderError, ProviderFactory,
+    ProviderSession, RemoteAttachmentId, RemoteMessageId,
 };
+use pige_core::store::HistoryProgress;
 use pige_core::sync::history::{
-    LearningProgress, background_budget, learn_slice, learn_slice_paged,
+    LearningProgress, background_budget, foreground_budget, learn_account_slice, learn_slice,
+    learn_slice_paged, learning_progress,
 };
 use pige_core::sync::provider::WorkBudget;
 use pige_core::sync::scheduler::AccountScheduler;
 use tempfile::TempDir;
 use tokio::sync::Notify;
+
+/// Serializes the tests that deliberately hold the process-wide history slots.
+static SLOT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -290,6 +296,50 @@ impl MailboxService for ScriptedMailbox {
     }
 }
 
+/// A provider factory that hands out one scripted mailbox per account, exactly
+/// like a real `open` would.
+struct ScriptedFactory {
+    mailboxes: tokio::sync::Mutex<HashMap<AccountId, ScriptedMailbox>>,
+}
+
+impl ScriptedFactory {
+    fn new(entries: Vec<(AccountId, ScriptedMailbox)>) -> Self {
+        Self {
+            mailboxes: tokio::sync::Mutex::new(entries.into_iter().collect()),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderFactory for ScriptedFactory {
+    async fn open(
+        &self,
+        account: &Account,
+        _ctx: &OperationContext,
+    ) -> Result<ProviderSession, ProviderError> {
+        let mailbox = self
+            .mailboxes
+            .lock()
+            .await
+            .remove(&account.id)
+            .ok_or_else(|| ProviderError::not_found("no scripted mailbox for this account"))?;
+        let mut session = ProviderSession::new(ProviderCapabilities {
+            mailbox: true,
+            ..ProviderCapabilities::default()
+        });
+        session.mailbox = Some(Box::new(mailbox));
+        Ok(session)
+    }
+}
+
+fn account_named(id: &str) -> Account {
+    let mut account = account();
+    account.id = AccountId(id.to_string());
+    account.email = format!("{id}@example.com");
+    account.label = id.to_string();
+    account
+}
+
 async fn run_to_completion(
     store: &Store,
     mailbox: &mut ScriptedMailbox,
@@ -305,6 +355,71 @@ async fn run_to_completion(
         assert!(progress.paused, "an incomplete slice must report paused");
     }
     panic!("history did not finish in 40 slices");
+}
+
+/// Scripted adapter pages that model a mid-crawl UID epoch reset: an old-epoch
+/// page, an empty non-complete rebaseline page, then the new-epoch page.
+struct EpochMailbox {
+    pages: Vec<HistoryPage>,
+    calls: usize,
+}
+
+#[async_trait]
+impl MailboxService for EpochMailbox {
+    async fn collections(
+        &mut self,
+        _ctx: &OperationContext,
+    ) -> Result<Vec<pige_core::providers::CollectionRecord>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    async fn body(
+        &mut self,
+        _id: &RemoteMessageId,
+        _ctx: &OperationContext,
+    ) -> Result<BodyContent, ProviderError> {
+        Err(ProviderError::unsupported("body"))
+    }
+
+    async fn attachment(
+        &mut self,
+        _message: &RemoteMessageId,
+        _id: &RemoteAttachmentId,
+        _ctx: &OperationContext,
+    ) -> Result<Vec<u8>, ProviderError> {
+        Err(ProviderError::unsupported("attachment"))
+    }
+
+    async fn history(
+        &mut self,
+        _request: HistoryRequest,
+        _ctx: &OperationContext,
+    ) -> Result<HistoryPage, ProviderError> {
+        let page = self
+            .pages
+            .get(self.calls)
+            .cloned()
+            .ok_or_else(|| ProviderError::transient("pages exhausted"))?;
+        self.calls += 1;
+        Ok(page)
+    }
+}
+
+fn history_page(
+    messages: Vec<MessageRecord>,
+    checkpoint: &str,
+    has_more: bool,
+    scanned: u64,
+) -> HistoryPage {
+    HistoryPage {
+        messages,
+        checkpoint: ProviderCursor::new(1, checkpoint),
+        has_more,
+        coverage: HistoryCoverage {
+            scanned,
+            total_hint: Some(3),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +594,60 @@ async fn expired_cursor_replays_safely() {
         store.learned_addresses(&account.id).unwrap().len(),
         251,
         "replaying the first page must not duplicate evidence"
+    );
+}
+
+#[tokio::test]
+async fn uid_epoch_change_replays_without_duplicate_evidence() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+
+    // Old epoch: alice (A) and bob (B).
+    let old_a = record(0, "alice@example.com", 10);
+    let old_b = record(1, "bob@example.com", 9);
+    // New epoch: the identical logical message A under a different native id
+    // (UIDVALIDITY is part of the id) plus a genuinely new message for carol.
+    let mut new_a = old_a.clone();
+    new_a.remote_id = RemoteMessageId::new("INBOX:2:15");
+    let new_c = record(2, "carol@example.com", 5);
+    let mut mailbox = EpochMailbox {
+        pages: vec![
+            history_page(vec![old_a, old_b], "epoch1:2", true, 2),
+            // Adapter detected the changed epoch: non-complete rebaseline.
+            history_page(Vec::new(), "epoch2:0", true, 2),
+            history_page(vec![new_a, new_c], "epoch2:2", false, 2),
+        ],
+        calls: 0,
+    };
+
+    let mut progress = LearningProgress::default();
+    for _ in 0..10 {
+        progress = learn_slice(&store, &mut mailbox, &context, background_budget())
+            .await
+            .expect("slice");
+        if progress.complete {
+            break;
+        }
+        assert!(progress.paused, "an incomplete slice must report paused");
+    }
+
+    assert!(progress.complete, "history must continue past the rebaseline page");
+    assert_eq!(
+        evidence_count(&store, &account.id, "alice@example.com"),
+        1,
+        "the same logical message under a changed epoch must not double its evidence"
+    );
+    assert_eq!(evidence_count(&store, &account.id, "bob@example.com"), 1);
+    assert_eq!(
+        evidence_count(&store, &account.id, "carol@example.com"),
+        1,
+        "the new epoch's new message must be learned"
+    );
+    assert_eq!(
+        store.learned_addresses(&account.id).unwrap().len(),
+        4,
+        "alice, bob, carol, and the shared sender"
     );
 }
 
@@ -690,6 +859,270 @@ async fn partial_page_does_not_mark_complete() {
             .payload,
         "e1:25"
     );
+}
+
+#[tokio::test]
+async fn learning_progress_reflects_active_and_paused() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+    let store = Arc::new(store);
+
+    let initial = learning_progress(&store, &account.id).unwrap();
+    assert!(!initial.complete);
+    assert!(
+        !initial.paused,
+        "a not-yet-started crawl must not read as paused"
+    );
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mailbox = ScriptedMailbox::new(unique_messages(1_205)).gate(PageGate {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+
+    let history = {
+        let store = store.clone();
+        let context = context.clone();
+        tokio::spawn(async move {
+            let mut mailbox = mailbox;
+            learn_slice(&store, &mut mailbox, &context, background_budget()).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("history must enter its first page");
+
+    let active = learning_progress(&store, &account.id).unwrap();
+    assert!(!active.complete);
+    assert!(
+        !active.paused,
+        "an in-flight slice must be distinguishable from a stopped one"
+    );
+
+    release.notify_one();
+    let paused = tokio::time::timeout(Duration::from_secs(5), history)
+        .await
+        .expect("slice must finish its budget")
+        .unwrap()
+        .unwrap();
+    assert!(!paused.complete);
+    assert!(paused.paused);
+    let durable = learning_progress(&store, &account.id).unwrap();
+    assert!(durable.paused, "a budget exit must persist paused");
+    assert_eq!(durable.scanned, 500);
+
+    let mut remaining = ScriptedMailbox::new(unique_messages(1_205));
+    let done = run_to_completion(&store, &mut remaining, &context).await;
+    assert!(done.complete);
+    let finished = learning_progress(&store, &account.id).unwrap();
+    assert!(finished.complete);
+    assert!(!finished.paused, "a complete crawl is not paused");
+}
+
+#[tokio::test]
+async fn tail_progress_does_not_regress_completion_or_scanned() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+
+    store
+        .record_history_progress(
+            &context,
+            HistoryProgress {
+                scanned: 250,
+                total_hint: Some(250),
+                complete: true,
+                paused: false,
+            },
+        )
+        .unwrap();
+    // A late StalePage/budget tail write carries older, incomplete progress.
+    store
+        .record_history_progress(
+            &context,
+            HistoryProgress {
+                scanned: 100,
+                total_hint: None,
+                complete: false,
+                paused: true,
+            },
+        )
+        .unwrap();
+
+    let state = store.history_state(&account.id).unwrap();
+    assert!(state.progress.complete, "completion must not be clobbered");
+    assert!(!state.progress.paused);
+    assert_eq!(state.progress.scanned, 250, "scanned must be monotonic");
+    assert_eq!(state.progress.total_hint, Some(250));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_account_slice_is_bounded_and_resumable() {
+    let _serial = SLOT_TEST_LOCK.lock().await;
+    let (_dir, store) = open_store();
+    let account = account_named("foreground");
+    store.upsert_account(&account).unwrap();
+    let context = ctx(&account.id);
+
+    let mailbox = ScriptedMailbox::new(messages_to(2_605, "bulk@example.com"));
+    let first_log = mailbox.log();
+    let factory: Arc<dyn ProviderFactory> =
+        Arc::new(ScriptedFactory::new(vec![(account.id.clone(), mailbox)]));
+    let scheduler = AccountScheduler::new();
+
+    let first = learn_account_slice(
+        &store,
+        &factory,
+        &account,
+        &context,
+        foreground_budget(),
+        &scheduler,
+    )
+    .await
+    .unwrap();
+    assert!(!first.complete);
+    assert!(first.paused);
+    assert_eq!(
+        first.scanned, 2_500,
+        "foreground stops after its bounded page count"
+    );
+    assert_eq!(
+        first_log.lock().unwrap().requests.len(),
+        25,
+        "the foreground budget is at most 25 pages"
+    );
+
+    let mailbox = ScriptedMailbox::new(messages_to(2_605, "bulk@example.com"));
+    let resumed_log = mailbox.log();
+    let factory: Arc<dyn ProviderFactory> =
+        Arc::new(ScriptedFactory::new(vec![(account.id.clone(), mailbox)]));
+    let second = learn_account_slice(
+        &store,
+        &factory,
+        &account,
+        &context,
+        foreground_budget(),
+        &scheduler,
+    )
+    .await
+    .unwrap();
+
+    assert!(second.complete);
+    assert_eq!(second.scanned, 2_605);
+    assert_eq!(
+        resumed_log.lock().unwrap().requests[0]
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.payload.clone()),
+        Some("e1:2500".to_string()),
+        "the next foreground call must resume, not restart"
+    );
+    assert_eq!(
+        evidence_count(&store, &account.id, "bulk@example.com"),
+        2_605
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreground_slices_respect_two_account_cap() {
+    let _serial = SLOT_TEST_LOCK.lock().await;
+    let (_dir, store) = open_store();
+    let store = Arc::new(store);
+    let first = account_named("cap-one");
+    let second = account_named("cap-two");
+    let third = account_named("cap-three");
+    for account in [&first, &second, &third] {
+        store.upsert_account(account).unwrap();
+    }
+
+    let entered_one = Arc::new(Notify::new());
+    let release_one = Arc::new(Notify::new());
+    let entered_two = Arc::new(Notify::new());
+    let release_two = Arc::new(Notify::new());
+    let mailbox_one =
+        ScriptedMailbox::new(unique_messages(150)).gate(PageGate {
+            entered: entered_one.clone(),
+            release: release_one.clone(),
+        });
+    let mailbox_two =
+        ScriptedMailbox::new(unique_messages(150)).gate(PageGate {
+            entered: entered_two.clone(),
+            release: release_two.clone(),
+        });
+    let mailbox_three = ScriptedMailbox::new(unique_messages(150));
+    let third_log = mailbox_three.log();
+
+    let factory: Arc<dyn ProviderFactory> = Arc::new(ScriptedFactory::new(vec![
+        (first.id.clone(), mailbox_one),
+        (second.id.clone(), mailbox_two),
+        (third.id.clone(), mailbox_three),
+    ]));
+    let scheduler = Arc::new(AccountScheduler::new());
+
+    let run = |account: Account, context: OperationContext| {
+        let store = store.clone();
+        let factory = factory.clone();
+        let scheduler = scheduler.clone();
+        tokio::spawn(async move {
+            learn_account_slice(
+                &store,
+                &factory,
+                &account,
+                &context,
+                foreground_budget(),
+                &scheduler,
+            )
+            .await
+        })
+    };
+
+    let one = run(first.clone(), ctx(&first.id));
+    let two = run(second.clone(), ctx(&second.id));
+    tokio::time::timeout(Duration::from_secs(5), entered_one.notified())
+        .await
+        .expect("first account must hold a slot");
+    tokio::time::timeout(Duration::from_secs(5), entered_two.notified())
+        .await
+        .expect("second account must hold a slot");
+
+    // Both process-wide slots are held. A third account must not open provider
+    // work; it reports durable progress and is retried later.
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(5),
+        learn_account_slice(
+            &store,
+            &factory,
+            &third,
+            &ctx(&third.id),
+            foreground_budget(),
+            &scheduler,
+        ),
+    )
+    .await
+    .expect("a blocked account must return immediately")
+    .unwrap();
+    assert!(!blocked.complete);
+    assert!(
+        third_log.lock().unwrap().requests.is_empty(),
+        "the two-account cap must prevent a third provider request"
+    );
+
+    release_one.notify_one();
+    release_two.notify_one();
+    let one = tokio::time::timeout(Duration::from_secs(5), one)
+        .await
+        .expect("first slice must finish")
+        .unwrap()
+        .unwrap();
+    let two = tokio::time::timeout(Duration::from_secs(5), two)
+        .await
+        .expect("second slice must finish")
+        .unwrap()
+        .unwrap();
+    assert!(one.complete);
+    assert!(two.complete);
 }
 
 #[tokio::test]

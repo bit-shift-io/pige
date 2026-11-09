@@ -229,6 +229,127 @@ async fn uid_epoch_is_part_of_identity() {
 }
 
 #[tokio::test]
+async fn uidvalidity_change_mid_crawl_rebaselines_without_skipping_or_merging() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+
+    // Epoch 1: UIDs 10..6, newest first. UID 10 and 9 are the logical messages
+    // that the new epoch will renumber.
+    let mut old_ten = message(10, "old ten");
+    old_ten.header.message_id = Some("<old-ten@example.com>".to_string());
+    let mut old_nine = message(9, "old nine");
+    old_nine.header.message_id = Some("<old-nine@example.com>".to_string());
+
+    // Epoch 2: a larger UID (20) appears, the old logical messages move to 15
+    // and 5, and UID 10 now names a *different* message. Reusing the old
+    // `before_uid` of 9 would skip 20/15/10; reusing the old epoch would merge
+    // the new UID 10 with epoch 1's UID 10.
+    let mut new_twenty = message(20, "new twenty");
+    new_twenty.header.message_id = Some("<new-twenty@example.com>".to_string());
+    let mut same_ten = old_ten.clone();
+    same_ten.uid = Uid(15);
+    let mut different_ten = message(10, "different ten");
+    different_ten.header.message_id = Some("<different-ten@example.com>".to_string());
+    let mut same_nine = old_nine.clone();
+    same_nine.uid = Uid(5);
+
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![folder("INBOX", FolderKind::Inbox)],
+            states: HashMap::from([("INBOX".to_string(), state(1, 11))]),
+            messages: HashMap::from([(
+                "INBOX".to_string(),
+                vec![
+                    old_ten,
+                    old_nine,
+                    message(8, "old eight"),
+                    message(7, "old seven"),
+                    message(6, "old six"),
+                ],
+            )]),
+            // Rotate once, after the first page was fetched under epoch 1.
+            rotate_after_history_fetches: Some(1),
+            rotated_states: HashMap::from([("INBOX".to_string(), state(2, 21))]),
+            rotated_messages: HashMap::from([(
+                "INBOX".to_string(),
+                vec![new_twenty, same_ten, different_ten, same_nine],
+            )]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let mut session = open(transports.clone()).await;
+    let service = session.mailbox_service().unwrap();
+    let mut cursor = None;
+    let mut pages = Vec::new();
+    let mut records = Vec::new();
+    for _ in 0..16 {
+        let page = service
+            .history(
+                HistoryRequest {
+                    cursor,
+                    page_size: 2,
+                },
+                &context(),
+            )
+            .await
+            .expect("history page");
+        pages.push((page.messages.len(), page.has_more));
+        for record in &page.messages {
+            let coords = identity::decode_message(&record.remote_id).expect("IMAP id");
+            records.push((
+                coords.uidvalidity,
+                coords.uid.0,
+                record.header.message_id.clone(),
+            ));
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = Some(page.checkpoint.clone());
+    }
+
+    assert_eq!(pages[0], (2, true));
+    assert!(
+        pages.iter().any(|(len, more)| *len == 0 && *more),
+        "an epoch change must return a non-complete rebaseline page, got {pages:?}"
+    );
+
+    let old_epoch: Vec<u32> = records
+        .iter()
+        .filter(|(epoch, _, _)| *epoch == 1)
+        .map(|(_, uid, _)| *uid)
+        .collect();
+    assert_eq!(old_epoch, vec![10, 9]);
+    let new_epoch: Vec<u32> = records
+        .iter()
+        .filter(|(epoch, _, _)| *epoch == 2)
+        .map(|(_, uid, _)| *uid)
+        .collect();
+    assert_eq!(
+        new_epoch,
+        vec![20, 15, 10, 5],
+        "no message under the new epoch may be skipped"
+    );
+
+    let new_ten = records
+        .iter()
+        .find(|(epoch, uid, _)| *epoch == 2 && *uid == 10)
+        .expect("new epoch UID 10");
+    assert_eq!(
+        new_ten.2.as_deref(),
+        Some("<different-ten@example.com>"),
+        "the new epoch's UID 10 is a distinct message"
+    );
+    assert_ne!(
+        identity::message_remote_id("INBOX", 1, Uid(10)),
+        identity::message_remote_id("INBOX", 2, Uid(10)),
+        "a rotated epoch must never reuse the old remote id"
+    );
+}
+
+#[tokio::test]
 async fn sparse_uids_do_not_truncate_history() {
     // UIDs 1, 900, 50000: a dense-range assumption would lose the gaps.
     let transports = Arc::new(FakeTransportFactory::default());

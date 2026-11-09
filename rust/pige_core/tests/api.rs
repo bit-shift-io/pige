@@ -318,6 +318,58 @@ async fn sync_does_not_notify_when_notifications_are_off() {
 }
 
 #[tokio::test]
+async fn foreground_learning_reports_progress_without_notifications() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let id = added.accounts[0].id.clone();
+    let messages = (1..=250)
+        .map(|uid| remote_message(uid, &format!("history {uid}"), "sender@example.com"))
+        .collect();
+    harness
+        .factory
+        .add_transport(id.clone(), inbox_transport(messages));
+
+    let initial = api::learning_progress(&id).expect("initial progress");
+    assert!(!initial.complete);
+    assert!(!initial.paused);
+
+    let mut events = api::subscribe();
+    let progress = api::learn_history_now(&id)
+        .await
+        .expect("foreground learning");
+    assert!(progress.complete);
+    assert_eq!(progress.scanned, 250);
+    assert!(!progress.paused);
+
+    let after = api::learning_progress(&id).expect("durable progress");
+    assert!(after.complete);
+    assert_eq!(after.scanned, 250);
+    assert!(!after.paused);
+
+    assert!(
+        harness.notifier.notifications().is_empty(),
+        "history must never post a new-mail notification"
+    );
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok())
+            .all(|event| !matches!(event, CoreEvent::NewMail(_))),
+        "history must never emit a new-mail event"
+    );
+    assert!(
+        api::snapshot().conversations.is_empty(),
+        "history headers must not enter the visible cache"
+    );
+    assert!(
+        api::learning_progress(&AccountId("missing".to_string())).is_err(),
+        "unknown accounts are rejected"
+    );
+}
+
+#[tokio::test]
 async fn sync_all_updates_snapshot_and_emits_new_mail() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
