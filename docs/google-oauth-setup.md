@@ -33,11 +33,14 @@ Scopes requested:
 3. Create a **Desktop app** OAuth client. Supply its client id as
    `GOOGLE_DESKTOP_CLIENT_ID`. Desktop apps are public clients: PKCE is used and
    no client secret is sent, even if the console displays one.
-4. Create an **Android** OAuth client for package `bitshift.pige` with both
-   signing SHA-1s from `docs/provider-feasibility.md` §9.2:
-   - release/shared test key `7E:4B:01:BC:E7:61:75:E3:89:38:88:5D:91:A6:26:FE:D3:07:21:AD`
-   - local debug key `A0:4B:69:80:86:C4:44:A4:B3:6A:43:6D:98:11:CA:EE:64:40:B7:67`
-   There is no redirect URI for this client.
+4. Create an **Android** OAuth client for package `bitshift.pige` with the
+   shared test-key SHA-1
+   `7E:4B:01:BC:E7:61:75:E3:89:38:88:5D:91:A6:26:FE:D3:07:21:AD`.
+   In this checkout both debug and release builds are signed with
+   `android/keystore/pige-release.jks` (verified with `apksigner` on both APKs),
+   so one fingerprint covers them. The host-local debug key
+   `A0:4B:69:…:40:B7:67` is only used when `android/keystore.properties` is
+   absent — add it as a second fingerprint only then. There is no redirect URI.
 5. Optional, only for Android offline/background refresh after process restart:
    create a **Web application** client and supply its id/secret as
    `GOOGLE_WEB_SERVER_CLIENT_ID` plus a Pige auth-server exchange URL whose

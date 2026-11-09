@@ -426,8 +426,11 @@ OAuth clients:
 The Android fingerprints are the real, verifiable identities of this branch's
 signing keys (evidence: `s2-registration-and-device.txt`): the committed shared
 test-phone key `android/keystore/pige-release.jks` (alias `qlaunch`) and the
-local debug key. Both must be registered because debug and release builds use
-different keys when `android/keystore.properties` is absent.
+local debug key. Only the shared-key fingerprint is needed when
+`android/keystore.properties` is present, which is the case in this checkout:
+`apksigner` reports `7E:4B:…` for both the debug and release APKs. Register the
+`A0:4B:…` fingerprint as well only for a build that falls back to the host's
+local debug key (no `keystore.properties`).
 
 The desktop and Android clients are **separate registrations**. There is no
 cross-platform callback URI, and the Android client has none at all — Android
@@ -518,7 +521,8 @@ No case is marked PASS without having been run; no output is fabricated.
 
 Non-live evidence that *was* collected is real:
 
-- Android application identity and both signing SHA-1s (keytool).
+- Android application identity and the shared-key SHA-1 (plus the local debug
+  fallback fingerprint when a build uses it; keytool/apksigner).
 - Attached device: `iPlay60 mini Turbo`, Android 14 / API 34, `arm64-v8a`,
   Google Play services `26.43.30`, Chrome and Play Store present
   (`s2-registration-and-device.txt`).
@@ -534,8 +538,8 @@ evidence) are complete. Missing for the live runs:
 
 1. A Google Cloud project with a registered **Desktop app** OAuth client
    (`GOOGLE_DESKTOP_CLIENT_ID`).
-2. A registered **Android** OAuth client for `bitshift.pige` with the two SHA-1s
-   in §9.2.
+2. A registered **Android** OAuth client for `bitshift.pige` with the shared-key
+   SHA-1 in §9.2 (plus the local debug fallback only if that build uses it).
 3. A **Web application** client id (`GOOGLE_WEB_SERVER_CLIENT_ID`) if the
    offline/`serverAuthCode` path is chosen.
 4. A **disposable Google account** (placeholder `disposable-account@example.com`;
