@@ -30,7 +30,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::account::{Account, AccountId};
 use crate::auth::{
     AuthAnswer, AuthProgress, AuthRequest, AuthenticatedAccount, CredentialSecretRepository,
-    SecretEnvelope, SecretPersistence, SecretRepository, StagedSecretRef,
+    SecretEnvelope, SecretPersistence, SecretRepository, StagedSecretRef, StoredCredentials,
 };
 use crate::config::{self, ConfigDocument};
 use crate::platform::CredentialStore;
@@ -198,10 +198,16 @@ pub async fn finish_auth_with_contacts(
     mut authenticated: AuthenticatedAccount,
     enable_contacts: bool,
 ) -> Result<(AccountId, ModelSnapshot), String> {
+    if enable_contacts
+        && authenticated.account.provider_id().as_str() != crate::providers::GMAIL_PROVIDER
+    {
+        return Err("contacts can only be enabled for a native Google account".to_string());
+    }
+    // The contacts capability follows the scopes Google actually granted, not
+    // the scopes this attempt requested. A user can decline the People consent
+    // while keeping mail, and that mail-only grant must not register sources.
+    let enable_contacts = enable_contacts && google_contacts_granted(&authenticated)?;
     if enable_contacts {
-        if authenticated.account.provider_id().as_str() != crate::providers::GMAIL_PROVIDER {
-            return Err("contacts can only be enabled for a native Google account".to_string());
-        }
         for source in crate::account::google_contact_sources() {
             match authenticated
                 .account
@@ -234,6 +240,39 @@ pub async fn finish_auth_with_contacts(
         }
     }
     Ok((id, snapshot))
+}
+
+/// Whether the completed Google attempt actually granted both People read
+/// scopes. The staged secret records the provider's granted-scope list, so a
+/// mail-only consent can never turn contacts on through the requested scopes.
+fn google_contacts_granted(authenticated: &AuthenticatedAccount) -> Result<bool, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| not_initialized_message().to_string())?;
+    let secrets = CredentialSecretRepository::new(state.config.credentials.clone());
+    let scopes = match secrets
+        .load_staged(&authenticated.credential_ref)
+        .map_err(|error| error.safe_message)?
+        .map(|envelope| envelope.credentials)
+    {
+        Some(StoredCredentials::Google(session)) => session.scopes,
+        _ => Vec::new(),
+    };
+    Ok(contacts_scopes_granted(&scopes))
+}
+
+#[cfg(feature = "provider-google")]
+fn contacts_scopes_granted(scopes: &[String]) -> bool {
+    use crate::providers::google::{CONTACTS_OTHER_READONLY_SCOPE, CONTACTS_READONLY_SCOPE};
+    [CONTACTS_READONLY_SCOPE, CONTACTS_OTHER_READONLY_SCOPE]
+        .iter()
+        .all(|required| scopes.iter().any(|granted| granted == required))
+}
+
+#[cfg(not(feature = "provider-google"))]
+fn contacts_scopes_granted(_scopes: &[String]) -> bool {
+    false
 }
 
 /// Ask the authentication adapter to revoke accounts' provider sessions. This
@@ -426,6 +465,7 @@ pub async fn switch_backend(
         }
 
         let target = merge_target(&previous, &authenticated.account);
+        ensure_matching_identity(&previous, &target)?;
 
         // Cancel every context minted at the old generation before waiting for
         // the account gate. The old generation is fenced durably, so even a
@@ -819,6 +859,27 @@ fn cleanup_switch_references(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// Re-authenticating a native Google account must not silently replace the
+/// account's identity with whichever Google user happened to consent. A
+/// mismatch would rewrite the address and clear the provider cache under a
+/// different mailbox, so it is refused before any commit begins.
+fn ensure_matching_identity(previous: &Account, target: &Account) -> Result<(), String> {
+    if target.provider_id().as_str() != crate::providers::GMAIL_PROVIDER {
+        return Ok(());
+    }
+    let previous_email = previous.email.trim();
+    let target_email = target.email.trim();
+    if !previous_email.is_empty()
+        && !target_email.is_empty()
+        && !previous_email.eq_ignore_ascii_case(target_email)
+    {
+        return Err(format!(
+            "the signed-in Google account ({target_email}) does not match this account ({previous_email}); sign in with {previous_email} or add a separate account"
+        ));
+    }
+    Ok(())
 }
 
 fn merge_target(previous: &Account, supplied: &Account) -> Account {

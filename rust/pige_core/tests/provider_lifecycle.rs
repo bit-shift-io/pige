@@ -2449,6 +2449,68 @@ mod google_onboarding {
     }
 
     #[tokio::test]
+    async fn reconnect_refuses_a_different_google_identity() {
+        let _guard = TEST_LOCK.lock().await;
+        let (harness, _host) = google_harness();
+        let attempt = begin_google(None, false).await;
+        deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "person@example.com");
+        let authenticated = poll_complete(&attempt).await;
+        let (id, _) = api::finish_auth(authenticated)
+            .await
+            .expect("create account");
+
+        let attempt = begin_google(Some(id.clone()), false).await;
+        deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "someone-else@example.com");
+        let authenticated = poll_complete(&attempt).await;
+        let error = api::finish_auth(authenticated)
+            .await
+            .expect_err("a different Google identity must not rewrite the account");
+        assert!(error.contains("does not match"), "{error}");
+        assert!(error.contains("person@example.com"), "{error}");
+
+        let account = api::account(&id).expect("account survives");
+        assert_eq!(account.email, "person@example.com");
+        assert_eq!(account.provider_id().as_str(), GMAIL_PROVIDER);
+        assert!(
+            !harness.store().has_switch_intent(&id).unwrap(),
+            "a refused identity change writes no switch intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_only_grant_registers_no_contact_sources() {
+        let _guard = TEST_LOCK.lock().await;
+        let (harness, host) = google_harness();
+
+        // The attempt asks for contacts, but Google grants mail only.
+        let attempt = begin_google(None, true).await;
+        let launch = host.launches().last().cloned().expect("contacts launch");
+        assert!(
+            launch
+                .scopes
+                .iter()
+                .any(|scope| scope == CONTACTS_READONLY_SCOPE)
+        );
+        deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "person@example.com");
+        let authenticated = poll_complete(&attempt).await;
+        let (id, _) = api::finish_auth_with_contacts(authenticated, true)
+            .await
+            .expect("mail-only grant still completes");
+
+        let account = api::account(&id).expect("created account");
+        assert!(
+            account.contact_sources.is_empty(),
+            "a mail-only grant must not register People sources: {:?}",
+            account.contact_sources
+        );
+        let states = harness.store().contact_source_states(&id).expect("states");
+        assert!(
+            states.is_empty(),
+            "a mail-only grant must not enable durable contact sources: {states:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn same_email_accounts_are_not_silently_merged() {
         let _guard = TEST_LOCK.lock().await;
         let (_harness, _host) = google_harness();

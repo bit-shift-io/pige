@@ -172,6 +172,7 @@ impl AccountForm {
         let native = imap_smtp.is_none();
         let google_contacts = account.contact_sources.iter().any(|source| {
             source.id.as_str() == pige_core::account::GOOGLE_SAVED_CONTACTS_SOURCE_ID
+                && source.enabled
         });
         Self {
             editing: Some(account.id.clone()),
@@ -244,9 +245,19 @@ impl AccountForm {
     /// Select the native Google or manual IMAP/SMTP path. Switching to IMAP
     /// leaves whatever server fields were last shown; the form still requires
     /// the user to save an IMAP account explicitly.
+    ///
+    /// An existing IMAP/SMTP account is never converted through the method
+    /// chips: a native Google account has no endpoints to edit, and an IMAP
+    /// edit keeps its backend. Conversion is the separate, gated
+    /// `Switch to native Google` action so `can_switch_backend` and the
+    /// `gmail.com` restriction always run first.
     pub fn choose_method(&mut self, method: AccountMethod) {
         if self.native {
             self.method = AccountMethod::Google;
+            return;
+        }
+        if self.editing.is_some() {
+            self.method = AccountMethod::Imap;
             return;
         }
         self.method = method;
@@ -640,7 +651,7 @@ fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, M
         .spacing(palette.space.md)
         .width(Fill);
 
-    if !form.native {
+    if !form.native && form.editing.is_none() {
         let mut methods = row![].spacing(palette.space.sm).align_y(Alignment::Center);
         if google_available {
             methods = methods.push(components::chip(
@@ -829,7 +840,10 @@ fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, M
                 Message::GoogleAuth {
                     account: form.editing.clone(),
                     enable_contacts: form.google_contacts,
-                    switch_backend: false,
+                    // A native account reconnects in place. If this ever renders
+                    // for an IMAP edit, it must take the explicit, pre-flighted
+                    // switch path rather than silently converting the backend.
+                    switch_backend: form.editing.is_some() && !form.native,
                 },
             ));
         }
@@ -1006,6 +1020,65 @@ mod tests {
             form.method,
             AccountMethod::Google,
             "a native account has no IMAP endpoints to edit"
+        );
+    }
+
+    #[test]
+    fn disabled_google_contacts_stay_off_across_edit_and_reconnect() {
+        let mut account = Account {
+            id: AccountId("native".into()),
+            label: "Google".into(),
+            email: "person@example.com".into(),
+            display_name: "Person".into(),
+            backend: pige_core::account::MailBackend::gmail("google-user"),
+            contact_sources: pige_core::account::google_contact_sources(),
+            sort_order: 0,
+            color: None,
+        };
+        for source in &mut account.contact_sources {
+            source.enabled = false;
+        }
+
+        let form = AccountForm::from_account(&account);
+        assert!(form.native);
+        assert_eq!(form.method, AccountMethod::Google);
+        assert!(
+            !form.google_contacts,
+            "a disabled Google contact source must not become an opt-in when the edit form reconnects"
+        );
+    }
+
+    #[test]
+    fn an_imap_edit_cannot_choose_google_without_the_gated_switch() {
+        let account = Account {
+            id: AccountId("imap-gmail".into()),
+            label: "Old Gmail".into(),
+            email: "person@gmail.com".into(),
+            display_name: "Person".into(),
+            backend: pige_core::account::MailBackend::ImapSmtp {
+                username: "person@gmail.com".into(),
+                imap: pige_core::account::ServerConfig {
+                    host: "imap.gmail.com".into(),
+                    port: 993,
+                    security: Security::Tls,
+                },
+                smtp: pige_core::account::ServerConfig {
+                    host: "smtp.gmail.com".into(),
+                    port: 465,
+                    security: Security::Tls,
+                },
+                auth: pige_core::account::AuthKind::Password,
+            },
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        };
+        let mut form = AccountForm::from_account(&account);
+        form.choose_method(AccountMethod::Google);
+        assert_eq!(
+            form.method,
+            AccountMethod::Imap,
+            "an IMAP edit must use the explicit switch action, not a silent Google reconnect"
         );
     }
 
