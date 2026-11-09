@@ -198,9 +198,14 @@ impl Store {
                     }
                 }
                 MailChange::RemoveMessage(remote) => {
-                    let id = remote_message_on(&tx, &ctx.account, transport, remote)?
-                        .ok_or_else(|| StoreError::UnknownRemoteMessage(remote.clone()))?;
-                    delete_messages_on(&tx, &[id])?;
+                    // History can replay a delete for a message this store
+                    // never cached (an add+delete inside one page, or mail
+                    // older than the bounded bootstrap window). Removing an
+                    // absent record is already the desired end state, so it is
+                    // a no-op instead of failing and wedging the sync job.
+                    if let Some(id) = remote_message_on(&tx, &ctx.account, transport, remote)? {
+                        delete_messages_on(&tx, &[id])?;
+                    }
                 }
                 MailChange::SetMembership {
                     message,
@@ -414,8 +419,13 @@ fn set_membership_on(
     collection: &RemoteCollectionId,
     present: bool,
 ) -> Result<(), StoreError> {
-    let id = remote_message_on(conn, account, backend, message)?
-        .ok_or_else(|| StoreError::UnknownRemoteMessage(message.clone()))?;
+    // A label change can arrive for a message older than the adapter's bounded
+    // bootstrap window. There is no cached row to attach it to, and history is
+    // expected to replay late or partial ranges, so an unknown remote message is
+    // a no-op rather than an error that wedges the job.
+    let Some(id) = remote_message_on(conn, account, backend, message)? else {
+        return Ok(());
+    };
     let folder = collection_folder_on(conn, account, backend, collection)?
         .ok_or_else(|| StoreError::UnknownRemoteCollection(collection.clone()))?;
     if present {

@@ -78,10 +78,12 @@ pub(crate) fn folder_kind(id: &str) -> FolderKind {
 }
 
 /// Map one label to a collection, or `None` when it is not a mailbox-like
-/// collection (state labels) or is Gmail's real All Mail label, which is
-/// replaced by [`ALL_MAIL_COLLECTION`].
+/// collection. Read/star/important state and Gmail's category buckets are
+/// message flags, not memberships (and [`message_record`] never adds them to a
+/// record's collections), so they are not advertised as collections either.
+/// Gmail's real All Mail label is replaced by [`ALL_MAIL_COLLECTION`].
 pub(crate) fn collection_record(label: &Label) -> Option<CollectionRecord> {
-    if label.id == "ALL" || label.id == "CHATS" || label.id == "UNREAD" {
+    if is_state_label(&label.id) {
         return None;
     }
     Some(CollectionRecord {

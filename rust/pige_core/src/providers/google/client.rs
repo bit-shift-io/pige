@@ -339,7 +339,25 @@ impl GoogleClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.map_err(map_transport_error)?;
+        // `request.send()` has no inherent bound: a stalled connect or a peer
+        // that never finishes the response could outlive the operation. Apply
+        // the caller's remaining deadline to the whole request and race the
+        // future against cancellation so every capability call honors the
+        // master invariant.
+        let remaining = ctx
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderError::transient("operation deadline exceeded"));
+        }
+        let request = request.timeout(remaining);
+        let response = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(ProviderError::cancelled("operation cancelled"));
+            }
+            result = request.send() => result.map_err(map_transport_error)?,
+        };
         let status = response.status();
         let retry_after = response
             .headers()
@@ -347,7 +365,18 @@ impl GoogleClient {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs);
-        let bytes = response.bytes().await.map_err(map_transport_error)?;
+        let bytes = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(ProviderError::cancelled("operation cancelled"));
+            }
+            result = tokio::time::timeout_at(ctx.deadline, response.bytes()) => {
+                match result {
+                    Ok(result) => result.map_err(map_transport_error)?,
+                    Err(_) => return Err(ProviderError::transient("operation deadline exceeded")),
+                }
+            }
+        };
         if status.is_success() {
             Ok(bytes.to_vec())
         } else {

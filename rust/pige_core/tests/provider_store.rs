@@ -598,8 +598,10 @@ fn page_and_cursor_commit_atomically() {
         )
         .unwrap();
 
-    // A page whose second change references an unknown message must roll the
-    // first change back and must not advance the checkpoint.
+    // A page whose second change references an unknown collection must roll the
+    // first change back and must not advance the checkpoint. (An unknown message
+    // id is deliberately a no-op, because history replays late ranges; see
+    // `history_unknown_ids_are_idempotent` in the Google adapter tests.)
     let failed = store.apply_change_page(
         &context(&account.id),
         &key,
@@ -620,8 +622,8 @@ fn page_and_cursor_commit_atomically() {
                     is_new_arrival: false,
                 },
                 MailChange::SetMembership {
-                    message: RemoteMessageId::new("does-not-exist"),
-                    collection: RemoteCollectionId::new("LabelA"),
+                    message: RemoteMessageId::new("native-x"),
+                    collection: RemoteCollectionId::new("LabelMissing"),
                     present: true,
                 },
             ],
@@ -629,7 +631,10 @@ fn page_and_cursor_commit_atomically() {
             has_more: false,
         },
     );
-    assert!(matches!(failed, Err(StoreError::UnknownRemoteMessage(_))));
+    assert!(matches!(
+        failed,
+        Err(StoreError::UnknownRemoteCollection(_))
+    ));
     assert!(
         store
             .remote_message_for(&account.id, GMAIL_PROVIDER, &RemoteMessageId::new("native-x"))

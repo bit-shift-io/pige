@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -29,11 +30,12 @@ use pige_core::providers::google::{
     request_collection,
 };
 use pige_core::providers::{
-    CollectionRecord, ErrorKind, HistoryRequest, MailChange, MailboxService, MessageRecord,
-    MutationAction, MutationOutcome, MutationRequest, MutationService, OperationContext,
-    OperationId, ProviderCursor, ProviderError, RemoteAttachmentId, RemoteCollectionId,
-    RemoteMessageId, SyncRequest, SyncService,
+    ChangePage, CollectionRecord, ErrorKind, GMAIL_PROVIDER, HistoryRequest, JobKey, JobKind,
+    MailChange, MailboxService, MessageRecord, MutationAction, MutationOutcome, MutationRequest,
+    MutationService, OperationContext, OperationId, ProviderCursor, ProviderError,
+    RemoteAttachmentId, RemoteCollectionId, RemoteMessageId, SyncRequest, SyncService,
 };
+use pige_core::{Account, MailBackend, Store};
 
 // ---------------------------------------------------------------------------
 // Local Gmail mock server
@@ -187,6 +189,33 @@ impl MockServer {
             },
         )
     }
+}
+
+/// A TCP peer that accepts a request and never sends a response. Used to prove
+/// the client bounds network calls by the operation deadline and cancellation.
+async fn start_stalled_server() -> (Url, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind stalled server");
+    let address = listener.local_addr().expect("stalled address");
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                // Hold the connection open without a response.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (
+        Url::parse(&format!("http://{address}")).expect("stalled url"),
+        task,
+    )
 }
 
 struct StaticTokens;
@@ -547,6 +576,70 @@ fn collection_name<'a>(changes: &'a [MailChange], id: &str) -> Option<&'a str> {
     })
 }
 
+fn last_modify_body(server: &MockServer) -> Value {
+    let request = server
+        .requests()
+        .into_iter()
+        .rfind(|request| request.path.ends_with("/modify"))
+        .expect("modify request");
+    serde_json::from_str(&request.body).expect("modify body")
+}
+
+fn label_ids(server: &MockServer, id: &str) -> Vec<String> {
+    server
+        .state
+        .lock()
+        .expect("mock state")
+        .messages
+        .get(id)
+        .and_then(|message| message["labelIds"].as_array())
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn test_account(id: &str) -> Account {
+    Account {
+        id: AccountId(id.to_string()),
+        label: id.to_string(),
+        email: format!("{id}@example.com"),
+        display_name: id.to_string(),
+        backend: MailBackend::gmail(id),
+        contact_sources: Vec::new(),
+        sort_order: 0,
+        color: None,
+    }
+}
+
+fn sync_job(account: &AccountId) -> JobKey {
+    JobKey {
+        account: account.clone(),
+        kind: JobKind::MailSync,
+        source: "sync".to_string(),
+    }
+}
+
+async fn apply_action(mutations: &mut GmailMutations, action: MutationAction) {
+    let result = mutations
+        .apply(
+            MutationRequest {
+                operation: OperationId::new("mutation"),
+                targets: vec![RemoteMessageId::new("m1")],
+                source: None,
+                action,
+            },
+            &context(),
+        )
+        .await
+        .expect("mutation");
+    assert_eq!(result.items[0].outcome, MutationOutcome::Applied);
+}
+
 // ---------------------------------------------------------------------------
 // Named G2 tests
 // ---------------------------------------------------------------------------
@@ -882,7 +975,10 @@ async fn partial_metadata_batch_does_not_advance_cursor() {
 async fn user_label_rename_preserves_collection_id() {
     let state = MockState::new("100")
         .with_label("INBOX", "Inbox")
-        .with_label("Label_7", "Projects");
+        .with_label("Label_7", "Projects")
+        .with_label("STARRED", "Starred")
+        .with_label("IMPORTANT", "Important")
+        .with_label("CATEGORY_PERSONAL", "Personal");
     let server = MockServer::start(state).await;
     let client = server.client();
     let mut mailbox = GmailMailbox::new(client.clone(), "me");
@@ -893,6 +989,19 @@ async fn user_label_rename_preserves_collection_id() {
         .find(|collection| collection.remote_id.as_str() == "Label_7")
         .expect("user label");
     assert_eq!(projects.name, "Projects");
+    assert!(
+        before.iter().all(|collection| {
+            !matches!(
+                collection.remote_id.as_str(),
+                "STARRED" | "IMPORTANT" | "CATEGORY_PERSONAL" | "UNREAD" | "ALL" | "CHATS"
+            )
+        }),
+        "state labels are flags, not collections: {:?}",
+        before
+            .iter()
+            .map(|collection| collection.remote_id.as_str())
+            .collect::<Vec<_>>()
+    );
 
     let mut sync = GmailSync::new(client, "me");
     let (synced, cursor) = drive_sync(&mut sync).await;
@@ -1149,4 +1258,251 @@ async fn other_folder_on_demand_is_supported() {
         .filter_map(|request| request.query_value("labelIds"))
         .collect();
     assert_eq!(label_lists, vec!["Label_42"]);
+}
+
+#[tokio::test]
+async fn star_and_read_actions_match_their_labels() {
+    let mut state = MockState::new("100").with_label("INBOX", "Inbox");
+    state.put_message(metadata_message("m1", &["INBOX"], "Star me"));
+    let server = MockServer::start(state).await;
+    let mut mutations = GmailMutations::new(server.client(), "me");
+
+    apply_action(&mut mutations, MutationAction::SetStar(true)).await;
+    let body = last_modify_body(&server);
+    assert_eq!(body["addLabelIds"], json!(["STARRED"]));
+    assert_eq!(body["removeLabelIds"], json!([]));
+    assert!(
+        label_ids(&server, "m1")
+            .iter()
+            .any(|label| label == "STARRED")
+    );
+
+    apply_action(&mut mutations, MutationAction::SetStar(false)).await;
+    let body = last_modify_body(&server);
+    assert_eq!(body["addLabelIds"], json!([]));
+    assert_eq!(body["removeLabelIds"], json!(["STARRED"]));
+    assert!(
+        !label_ids(&server, "m1")
+            .iter()
+            .any(|label| label == "STARRED")
+    );
+
+    apply_action(&mut mutations, MutationAction::SetRead(false)).await;
+    let body = last_modify_body(&server);
+    assert_eq!(body["addLabelIds"], json!(["UNREAD"]));
+    assert_eq!(body["removeLabelIds"], json!([]));
+    assert!(
+        label_ids(&server, "m1")
+            .iter()
+            .any(|label| label == "UNREAD")
+    );
+
+    apply_action(&mut mutations, MutationAction::SetRead(true)).await;
+    let body = last_modify_body(&server);
+    assert_eq!(body["addLabelIds"], json!([]));
+    assert_eq!(body["removeLabelIds"], json!(["UNREAD"]));
+    assert!(
+        !label_ids(&server, "m1")
+            .iter()
+            .any(|label| label == "UNREAD")
+    );
+}
+
+#[tokio::test]
+async fn history_unknown_ids_are_idempotent() {
+    let mut state = MockState::new("100")
+        .with_label("INBOX", "Inbox")
+        .with_label("Label_9", "Projects");
+    state.put_message(metadata_message("recent", &["INBOX"], "Recent"));
+    state.list_label("INBOX", &["recent"]);
+    // Exists in Gmail but is older than the bounded bootstrap window, so the
+    // store has never seen it when its label change arrives.
+    state.put_message(metadata_message("old", &["INBOX", "Label_9"], "Old"));
+    let server = MockServer::start(state).await;
+    let mut sync = GmailSync::new(server.client(), "me");
+    let (bootstrap_changes, cursor) = drive_sync(&mut sync).await;
+
+    let dir = TempDir::new().expect("tempdir");
+    let store = Store::open(dir.path().join("pige.db")).expect("store");
+    store.migrate().expect("migrate");
+    let account = test_account("gmail-g2");
+    store.upsert_account(&account).expect("account");
+    let key = sync_job(&account.id);
+    store
+        .apply_change_page(
+            &context(),
+            &key,
+            GMAIL_PROVIDER,
+            None,
+            &ChangePage {
+                changes: bootstrap_changes,
+                checkpoint: cursor.clone(),
+                has_more: false,
+            },
+        )
+        .expect("bootstrap applies");
+    assert!(
+        store
+            .remote_message_for(&account.id, GMAIL_PROVIDER, &RemoteMessageId::new("old"))
+            .expect("lookup")
+            .is_none(),
+        "the out-of-window message is not cached"
+    );
+
+    // One history page: an add followed by a delete for an id the store never
+    // cached, plus a label change for mail older than the bootstrap window.
+    server.update(|state| {
+        state.history_batches = vec![vec![
+            json!({ "messagesAdded": [{ "message": { "id": "flash" } }] }),
+            json!({ "messagesDeleted": [{ "message": { "id": "flash" } }] }),
+            json!({
+                "labelsAdded": [{
+                    "message": { "id": "old" },
+                    "labelIds": ["Label_9"],
+                }],
+            }),
+        ]];
+    });
+    let page = sync
+        .next_page(
+            SyncRequest {
+                cursor: Some(cursor.clone()),
+                initial_limit: 300,
+            },
+            &context(),
+        )
+        .await
+        .expect("history page");
+    assert!(
+        removed_ids(&page.changes)
+            .iter()
+            .any(|id| id.as_str() == "flash"),
+        "the unknown add+delete is still represented as a tombstone"
+    );
+    assert!(
+        page.changes.iter().any(|change| matches!(
+            change,
+            MailChange::SetMembership { message, collection, present: true }
+                if message.as_str() == "old" && collection.as_str() == "Label_9"
+        )),
+        "the out-of-window label change is still represented"
+    );
+
+    // Applying either for an unknown remote id is a no-op, not a Store error.
+    store
+        .apply_change_page(
+            &context(),
+            &key,
+            GMAIL_PROVIDER,
+            Some(&cursor),
+            &ChangePage {
+                changes: page.changes,
+                checkpoint: page.checkpoint,
+                has_more: page.has_more,
+            },
+        )
+        .expect("unknown remote ids apply idempotently");
+}
+
+#[tokio::test]
+async fn request_honors_deadline_and_cancellation() {
+    let (url, task) = start_stalled_server().await;
+    let client = GoogleClient::new(
+        Arc::new(StaticTokens),
+        GoogleEndpoints {
+            gmail_base: url.clone(),
+            people_base: url,
+        },
+    );
+    let mut mailbox = GmailMailbox::new(client, "me");
+    let deadline = OperationContext::with_timeout(
+        AccountId("gmail-g2".to_string()),
+        1,
+        Duration::from_millis(200),
+    );
+    let started = std::time::Instant::now();
+    let error = mailbox
+        .collections(&deadline)
+        .await
+        .expect_err("a stalled connection must hit the deadline");
+    assert_eq!(error.kind, ErrorKind::Transient);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the request outlived its deadline: {:?}",
+        started.elapsed()
+    );
+    task.abort();
+
+    let (url, task) = start_stalled_server().await;
+    let client = GoogleClient::new(
+        Arc::new(StaticTokens),
+        GoogleEndpoints {
+            gmail_base: url.clone(),
+            people_base: url,
+        },
+    );
+    let mut mailbox = GmailMailbox::new(client, "me");
+    let ctx = context();
+    let cancellation = ctx.cancellation.clone();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+    });
+    let error = mailbox
+        .collections(&ctx)
+        .await
+        .expect_err("cancellation must abort the request");
+    canceller.await.expect("canceller");
+    assert_eq!(error.kind, ErrorKind::Cancelled);
+    task.abort();
+}
+
+#[tokio::test]
+async fn all_mail_on_demand_lists_account_wide() {
+    let mut state = MockState::new("100")
+        .with_label("INBOX", "Inbox")
+        .with_label("SPAM", "Spam");
+    state.put_message(metadata_message("inbox-1", &["INBOX"], "Inbox mail"));
+    state.put_message(metadata_message("spam-1", &["SPAM"], "Spam mail"));
+    let server = MockServer::start(state).await;
+    let mut sync = GmailSync::new(server.client(), "me");
+
+    let cursor = request_collection(None, &RemoteCollectionId::new("pige:all-mail"))
+        .expect("all-mail cursor");
+    let page = sync
+        .next_page(
+            SyncRequest {
+                cursor: Some(cursor),
+                initial_limit: 300,
+            },
+            &context(),
+        )
+        .await
+        .expect("on-demand all mail");
+    let listing = server
+        .requests()
+        .into_iter()
+        .find(|request| request.method == "GET" && request.path.ends_with("/messages"))
+        .expect("message listing");
+    assert_eq!(
+        listing.query_value("labelIds"),
+        None,
+        "the virtual collection must not be sent as a Gmail label id"
+    );
+
+    let inbox = find_message(&page.changes, "inbox-1").expect("inbox message");
+    assert!(
+        inbox
+            .collections
+            .iter()
+            .any(|collection| collection.as_str() == "pige:all-mail")
+    );
+    let spam = find_message(&page.changes, "spam-1").expect("spam message");
+    assert!(
+        !spam
+            .collections
+            .iter()
+            .any(|collection| collection.as_str() == "pige:all-mail"),
+        "Spam is not part of the All Mail view"
+    );
 }

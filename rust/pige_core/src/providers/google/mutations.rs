@@ -70,7 +70,9 @@ impl GmailMutations {
                     .await
             }
             MutationAction::SetStar(star) => {
-                self.modify(target, &[], &[normalize::STARRED_LABEL], !star, ctx)
+                // `SetStar(true)` adds STARRED; `false` removes it. Turning
+                // this around silently inverts every star action.
+                self.modify(target, &[normalize::STARRED_LABEL], &[], !star, ctx)
                     .await
             }
             MutationAction::AddLabel(label) => {

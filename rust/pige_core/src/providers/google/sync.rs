@@ -190,7 +190,7 @@ impl GmailSync {
         let listing = self
             .api
             .list_messages(
-                Some(current.as_str()),
+                listing_label(&current),
                 page_token.as_deref(),
                 limit,
                 true,
@@ -208,15 +208,7 @@ impl GmailSync {
             match fetched.get(id).and_then(Option::as_ref) {
                 Some(record) => {
                     let mut record = record.clone();
-                    if !record
-                        .collections
-                        .iter()
-                        .any(|collection| collection == &current)
-                    {
-                        record.collections.push(current.clone());
-                        record.collections.sort();
-                        record.collections.dedup();
-                    }
+                    add_membership(&mut record, &current);
                     changes.push(MailChange::UpsertMessage {
                         message: record,
                         is_new_arrival: false,
@@ -407,10 +399,11 @@ impl GmailSync {
             }
         };
 
+        let current = RemoteCollectionId::new(token.current.clone());
         let listing = self
             .api
             .list_messages(
-                Some(&token.current),
+                listing_label(&current),
                 token.page.as_deref(),
                 BOOTSTRAP_PER_COLLECTION,
                 true,
@@ -423,15 +416,10 @@ impl GmailSync {
             .map(|message| message.id)
             .collect();
         let fetched = self.metadata_for(&ids, ctx).await?;
-        let current = RemoteCollectionId::new(token.current.clone());
         for id in &ids {
             if let Some(record) = fetched.get(id).and_then(Option::as_ref) {
                 let mut record = record.clone();
-                if !record.collections.iter().any(|label| label == &current) {
-                    record.collections.push(current.clone());
-                    record.collections.sort();
-                    record.collections.dedup();
-                }
+                add_membership(&mut record, &current);
                 // A reconcile is a repair, not a new arrival and not a full
                 // snapshot sweep: no absent-older-message removals.
                 changes.push(MailChange::UpsertMessage {
@@ -676,6 +664,31 @@ fn collection_upserts(labels: &[super::client::Label]) -> Vec<MailChange> {
         normalize::all_mail_collection(),
     ));
     changes
+}
+
+/// Gmail has no `pige:all-mail` label id. The provider-owned virtual collection
+/// is an account-wide view, so a bootstrap for it lists without `labelIds`
+/// instead of sending the virtual id and getting a 400.
+fn listing_label(collection: &RemoteCollectionId) -> Option<&str> {
+    (collection.as_str() != normalize::ALL_MAIL_COLLECTION).then(|| collection.as_str())
+}
+
+/// Record the membership implied by the collection being listed. All Mail is
+/// already computed from the message's labels by `message_record` (and must not
+/// be added to Spam/Trash), so it needs no synthetic membership here.
+fn add_membership(record: &mut MessageRecord, collection: &RemoteCollectionId) {
+    if collection.as_str() == normalize::ALL_MAIL_COLLECTION {
+        return;
+    }
+    if !record
+        .collections
+        .iter()
+        .any(|existing| existing == collection)
+    {
+        record.collections.push(collection.clone());
+        record.collections.sort();
+        record.collections.dedup();
+    }
 }
 
 /// Start a sweep at `current` when it is still present, otherwise at the first
