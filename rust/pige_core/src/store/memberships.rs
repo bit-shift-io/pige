@@ -17,12 +17,15 @@ use std::cell::RefCell;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
+use crate::contacts::learn;
+use crate::contacts::{EvidenceId, LearningOrigin};
 use crate::mail::{FolderId, MessageId, StoredMessage, ThreadAssigner, thread::participants_of};
 use crate::providers::{
     ChangePage, JobKey, MailChange, MessageRecord, OperationContext, ProviderCursor,
     RemoteCollectionId, RemoteMessageId,
 };
 
+use super::correspondents::record_observations_in;
 use super::messages::{delete_messages_on, merge_threads_on, messages_for_account_on, upsert_message_on};
 use super::{Store, StoreError};
 
@@ -171,8 +174,28 @@ impl Store {
                 MailChange::RemoveCollection(remote) => {
                     remove_collection_on(&tx, &ctx.account, transport, remote)?;
                 }
-                MailChange::UpsertMessage { message, .. } => {
+                MailChange::UpsertMessage { message, is_new_arrival } => {
                     upsert_remote_message_on(&tx, &ctx.account, transport, &mut threads, message)?;
+                    if *is_new_arrival {
+                        // Only the adapter's explicit new-arrival signal trains
+                        // live recipients; snapshot/metadata replays carry
+                        // `false` and must not resurrect cleared suggestions.
+                        let observations = learn::observe_message(
+                            &ctx.account,
+                            message,
+                            LearningOrigin::LiveArrival,
+                        );
+                        let fingerprint = learn::header_fingerprint(&message.header);
+                        let evidence = EvidenceId::for_message(&message.remote_id);
+                        record_observations_in(
+                            &tx,
+                            &ctx.account,
+                            &evidence,
+                            LearningOrigin::LiveArrival,
+                            Some(&fingerprint),
+                            &observations,
+                        )?;
+                    }
                 }
                 MailChange::RemoveMessage(remote) => {
                     let id = remote_message_on(&tx, &ctx.account, transport, remote)?

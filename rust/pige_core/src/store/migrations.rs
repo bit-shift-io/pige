@@ -3,6 +3,7 @@
 //! shape of an existing database.
 
 mod v10;
+mod v11;
 mod v2;
 mod v3;
 mod v4;
@@ -62,7 +63,8 @@ impl Store {
     /// remote attachment id on the cached message and attachment; v9 generalizes
     /// the outbox into a provider-neutral durable submission with structured
     /// parts, operation identity, prepared artifacts, and receipts; v10 adds the
-    /// recoverable backend-switch intent.
+    /// recoverable backend-switch intent; v11 adds source contacts and the
+    /// replay-safe correspondent evidence ledger.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -148,6 +150,10 @@ impl Store {
         if version < 10 && target >= 10 {
             v10::apply(&tx)?;
             version = 10;
+        }
+        if version < 11 && target >= 11 {
+            v11::apply(&tx)?;
+            version = 11;
         }
 
         // The rebuild must not leave a dangling reference behind; check before

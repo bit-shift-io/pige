@@ -548,6 +548,32 @@ pub(crate) fn messages_for_account_on(
     Ok(messages)
 }
 
+/// One bounded page of cached messages for the local learning backfill,
+/// ordered by the durable `messages.id` cursor. `after` is exclusive.
+pub(crate) fn cached_messages_after_on(
+    conn: &Connection,
+    account: &AccountId,
+    after: Option<&MessageId>,
+    limit: u32,
+) -> Result<Vec<StoredMessage>, StoreError> {
+    let sql = format!(
+        "SELECT {} FROM messages m
+         WHERE m.account_id = ?1 AND (?2 IS NULL OR m.id > ?2)
+         ORDER BY m.id ASC
+         LIMIT ?3",
+        columns()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let after = after.map(|id| id.0.as_str());
+    let mut rows = stmt.query(params![account.0, after, i64::from(limit)])?;
+
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next()? {
+        messages.push(message_from_row(row)?);
+    }
+    Ok(messages)
+}
+
 pub(crate) fn message_count_on(conn: &Connection, folder: &FolderId) -> Result<u32, StoreError> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM message_collections WHERE folder_id = ?1",

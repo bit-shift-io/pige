@@ -8,6 +8,7 @@ pub mod account;
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod contacts;
 pub mod html;
 pub mod mail;
 pub mod platform;
@@ -31,7 +32,7 @@ pub use store::{Body, ImapCoords, MessageLocation, Store, StoreError};
 
 /// Bumped whenever the persisted schema changes; later tasks version the store
 /// against this so a mismatched database can be migrated or rebuilt.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 #[cfg(test)]
 mod tests {

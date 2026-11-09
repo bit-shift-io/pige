@@ -25,13 +25,14 @@ use async_trait::async_trait;
 use rusqlite::{Row, params};
 
 use crate::account::{Account, AccountId};
+use crate::contacts::{EvidenceId, LearningOrigin, Observation};
 use crate::mail::{Address, AttachmentDisposition, Flags, Uid};
 use crate::providers::{
     ErrorKind, OperationContext, OperationId, PreparedSubmission, ProviderError, ProviderId,
     SubmissionAttachment, SubmissionOutcome, SubmissionReceipt, SubmissionRequest,
     SubmissionService, SentCopyPolicy,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, check_generation_in, record_observations_in};
 use crate::transport::{
     Capabilities, FlagOp, FolderState, MailTransport, RemoteFolder, RemoteMessage, SendError,
     SmtpSender, TransportError, UidRange,
@@ -110,6 +111,15 @@ const COLUMNS: &str = "id, account_id, to_json, cc_json, bcc_json, subject, body
      operation_id, backend, prepared_version, prepared_backend, prepared_raw, \
      prepared_reference, receipt_operation, receipt_remote_message, \
      receipt_remote_thread, retry_count, retry_after";
+
+/// Optional learning payload committed with the once-only acceptance
+/// transition. Keeping it in the same transaction is what guarantees a replay
+/// cannot train the same submission twice.
+struct AcceptanceLearning<'a> {
+    ctx: &'a OperationContext,
+    fingerprint: Option<&'a str>,
+    observations: &'a [Observation],
+}
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -354,8 +364,51 @@ impl Store {
         id: &OutboxId,
         receipt: &SubmissionReceipt,
     ) -> Result<bool, StoreError> {
+        self.record_outbox_acceptance_in(id, receipt, None)
+    }
+
+    /// Record acceptance, the receipt, and accepted-send correspondent
+    /// observations in one transaction.
+    ///
+    /// `fingerprint` is the normalized full-header fingerprint of the exact
+    /// prepared bytes when available, so a later Sent-copy history replay
+    /// converges on this evidence instead of counting the recipients twice.
+    /// Returns true only for the transition that actually recorded acceptance.
+    pub fn record_outbox_acceptance_with_learning(
+        &self,
+        id: &OutboxId,
+        receipt: &SubmissionReceipt,
+        ctx: &OperationContext,
+        fingerprint: Option<&str>,
+        observations: &[Observation],
+    ) -> Result<bool, StoreError> {
+        self.record_outbox_acceptance_in(
+            id,
+            receipt,
+            Some(AcceptanceLearning {
+                ctx,
+                fingerprint,
+                observations,
+            }),
+        )
+    }
+
+    fn record_outbox_acceptance_in(
+        &self,
+        id: &OutboxId,
+        receipt: &SubmissionReceipt,
+        learning: Option<AcceptanceLearning<'_>>,
+    ) -> Result<bool, StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
+        if let Some(learning) = &learning
+            && learning.ctx.generation != 0
+        {
+            // The legacy SMTP/IMAP entry point has no account-session context
+            // and uses generation 0 as its sentinel; every real provider/history
+            // context carries a positive durable generation and is fenced here.
+            check_generation_in(&tx, &learning.ctx.account, learning.ctx.generation)?;
+        }
         let changed = tx.execute(
             "UPDATE outbox
              SET state = 'accepted',
@@ -377,6 +430,19 @@ impl Store {
                 id.0,
             ],
         )?;
+        if changed == 1
+            && let Some(learning) = &learning
+        {
+            let evidence = EvidenceId::for_operation(&receipt.operation);
+            record_observations_in(
+                &tx,
+                &learning.ctx.account,
+                &evidence,
+                LearningOrigin::AcceptedSend,
+                learning.fingerprint,
+                learning.observations,
+            )?;
+        }
         tx.commit()?;
         Ok(changed == 1)
     }

@@ -506,7 +506,27 @@ async fn finish_accepted(
 ) -> Result<(), StoreError> {
     // Acceptance, receipt, and the once-only learning marker share a single
     // transaction. The observer fires only for the transition that wins it.
-    let first = store.record_outbox_acceptance(&entry.id, &receipt)?;
+    let observations = crate::contacts::learn::observe_outgoing(
+        &ctx.account,
+        &entry.message,
+        entry.created_at,
+    );
+    // The prepared bytes are what the provider accepted (and what a client
+    // Sent-copy append stores), so their normalized header fingerprint is the
+    // secondary hint that reconciles a later history/Sent replay.
+    let fingerprint = request
+        .prepared
+        .as_ref()
+        .and_then(|prepared| prepared.raw.as_deref())
+        .and_then(|raw| crate::mail::parse_header_block(raw).ok())
+        .map(|header| crate::contacts::learn::header_fingerprint(&header));
+    let first = store.record_outbox_acceptance_with_learning(
+        &entry.id,
+        &receipt,
+        ctx,
+        fingerprint.as_deref(),
+        &observations,
+    )?;
     if first {
         observer.accepted(entry, &receipt);
     }

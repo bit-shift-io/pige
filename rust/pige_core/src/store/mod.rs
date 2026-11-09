@@ -4,6 +4,8 @@
 mod accounts;
 mod attachments;
 mod bodies;
+mod contacts;
+mod correspondents;
 mod folders;
 mod jobs;
 mod lifecycle;
@@ -31,6 +33,12 @@ use messages::{conversations_on, message_count_on, unified_conversations_on};
 
 pub use attachments::StoredAttachment;
 pub use bodies::Body;
+pub use contacts::CachedContactEmail;
+pub use correspondents::{
+    ExistingCachePage, HISTORY_SOURCE, LearnedAddress, LearningState, history_job,
+};
+pub(crate) use correspondents::record_observations_in;
+pub(crate) use jobs::check_generation_in;
 pub use jobs::{AccountLease, INITIAL_GENERATION, PendingAuthRecord};
 pub use lifecycle::SwitchIntent;
 pub use messages::PrefetchCandidate;
