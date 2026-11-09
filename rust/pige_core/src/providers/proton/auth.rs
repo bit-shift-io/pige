@@ -22,7 +22,7 @@ use crate::account::{Account, AccountId, MailBackend};
 use crate::auth::{
     AccountSessionManager, AuthAnswer, AuthChallenge, AuthProgress, AuthRequest,
     AuthenticatedAccount, AuthenticationService, HumanChallenge, SecretPersistence,
-    SecretRepository, StagedSecretRef, proton::proton_secret,
+    SecretRepository, StagedSecretRef, TokenRefresher, proton::proton_secret,
 };
 use crate::providers::{
     AuthAttemptId, OperationContext, PROTON_PROVIDER, ProviderError, ProviderId,
@@ -30,9 +30,9 @@ use crate::providers::{
 use crate::store::{PendingAuthRecord, Store};
 
 use proton_core::HvChallenge;
-use proton_core::api;
 use proton_core::auth::types::{AuthInfo, AuthResponse, SessionResp};
 use proton_core::crypto;
+use proton_core::crypto::keys::{Address, KeySalt, User};
 use proton_core::transport::{Doer, HttpClient, Request};
 use proton_srp::{RPGPVerifier, SRPAuth, SRPProofB64, SrpHashVersion};
 
@@ -42,11 +42,79 @@ use super::keys::ProtonKeyStores;
 /// How long one interactive Proton attempt may stay open.
 pub const DEFAULT_ATTEMPT_TTL: Duration = Duration::from_secs(300);
 
+/// How long a cold resume may spend refreshing and unlocking.
+pub const DEFAULT_RESUME_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bound on the best-effort server logout after local cleanup.
+pub const DEFAULT_LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[derive(serde::Deserialize)]
+struct SaltsResponse {
+    #[serde(rename = "KeySalts", default)]
+    key_salts: Vec<KeySalt>,
+}
+
+#[derive(serde::Deserialize)]
+struct UserResponse {
+    #[serde(rename = "User")]
+    user: User,
+}
+
+#[derive(serde::Deserialize)]
+struct AddressesResponse {
+    #[serde(rename = "Addresses", default)]
+    addresses: Vec<Address>,
+}
+
+/// Build a transport carrying one access token and deliberately no refresh
+/// token.
+///
+/// The vendored transport refreshes a 401 in memory when a refresh token is
+/// present, which would rotate (and lose) the server's refresh token because the
+/// temporary client is dropped. Pige owns rotation through
+/// [`crate::auth::proton::ProtonTokenRefresher`], which persists before returning.
+async fn authenticated_http(
+    endpoints: &ProtonEndpoints,
+    uid: &str,
+    access: SecretString,
+) -> HttpClient {
+    let http = HttpClient::new(endpoints.as_str(), PROTON_APP_VERSION);
+    http.set_tokens(
+        uid.to_string(),
+        access,
+        SecretString::from(String::new()),
+    )
+    .await;
+    http
+}
+
+async fn fetch_salts(http: &HttpClient) -> Result<Vec<KeySalt>, ProviderError> {
+    let response: SaltsResponse = http
+        .decode(Request::get("/core/v4/keys/salts").no_refresh())
+        .await
+        .map_err(map_proton_error)?;
+    Ok(response.key_salts)
+}
+
+async fn fetch_user_and_addresses(
+    http: &HttpClient,
+) -> Result<(User, Vec<Address>), ProviderError> {
+    let user: UserResponse = http
+        .decode(Request::get("/core/v4/users").no_refresh())
+        .await
+        .map_err(map_proton_error)?;
+    let addresses: AddressesResponse = http
+        .decode(Request::get("/core/v4/addresses").no_refresh())
+        .await
+        .map_err(map_proton_error)?;
+    Ok((user.user, addresses.addresses))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +378,9 @@ pub struct ProtonAuthentication {
     endpoints: ProtonEndpoints,
     keys: Arc<ProtonKeyStores>,
     attempt_ttl: Duration,
+    resume_timeout: Duration,
+    logout_timeout: Duration,
+    refresher: Arc<crate::auth::proton::ProtonTokenRefresher>,
     attempts: HashMap<AuthAttemptId, Attempt>,
 }
 
@@ -321,6 +392,10 @@ impl ProtonAuthentication {
         endpoints: ProtonEndpoints,
         keys: Arc<ProtonKeyStores>,
     ) -> Self {
+        let refresher = Arc::new(crate::auth::proton::ProtonTokenRefresher::new(
+            secrets.clone(),
+            endpoints.clone(),
+        ));
         Self {
             secrets,
             sessions,
@@ -328,6 +403,9 @@ impl ProtonAuthentication {
             endpoints,
             keys,
             attempt_ttl: DEFAULT_ATTEMPT_TTL,
+            resume_timeout: DEFAULT_RESUME_TIMEOUT,
+            logout_timeout: DEFAULT_LOGOUT_TIMEOUT,
+            refresher,
             attempts: HashMap::new(),
         }
     }
@@ -335,6 +413,18 @@ impl ProtonAuthentication {
     #[must_use]
     pub fn with_attempt_ttl(mut self, ttl: Duration) -> Self {
         self.attempt_ttl = ttl;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resume_timeout(mut self, timeout: Duration) -> Self {
+        self.resume_timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_logout_timeout(mut self, timeout: Duration) -> Self {
+        self.logout_timeout = timeout;
         self
     }
 
@@ -717,21 +807,10 @@ impl ProtonAuthentication {
         let expires_at_ms = attempt.expires_at_ms;
         let uid = login.tokens.uid.clone();
 
-        let http = HttpClient::new(self.endpoints.as_str(), PROTON_APP_VERSION);
-        http.set_tokens(
-            login.tokens.uid.clone(),
-            login.tokens.access.clone(),
-            login.tokens.refresh.clone(),
-        )
-        .await;
+        let http = authenticated_http(&self.endpoints, &uid, login.tokens.access.clone()).await;
 
-        let salts = api::keys::get_key_salts(&http)
-            .await
-            .map_err(map_proton_error)?;
-        let user = api::keys::get_user(&http).await.map_err(map_proton_error)?;
-        let addresses = api::keys::get_addresses(&http)
-            .await
-            .map_err(map_proton_error)?;
+        let salts = fetch_salts(&http).await?;
+        let (user, addresses) = fetch_user_and_addresses(&http).await?;
 
         // Key unlock is CPU-heavy; run it on the blocking pool, not the async/UI
         // executor. The password moves into the worker and is dropped there.
@@ -799,6 +878,143 @@ impl ProtonAuthentication {
             persistence: SecretPersistence::Persistent,
             credential_ref: staged,
         }))
+    }
+
+    /// Resume with an explicit operation context.
+    ///
+    /// Normal callers use [`AuthenticationService::resume`], which derives a
+    /// fresh context. This entry point exists so a caller that already owns the
+    /// account gate can resume without silently creating a newer generation; the
+    /// install step is fenced against the context's generation.
+    pub async fn resume_with_context(
+        &mut self,
+        account: &AccountId,
+        ctx: OperationContext,
+    ) -> Result<AuthProgress, ProviderError> {
+        ctx.ensure_active()?;
+        if ctx.account != *account {
+            return Err(ProviderError::conflict(
+                "the Proton resume context belongs to another account",
+            ));
+        }
+        let envelope = self.secrets.load(account)?.ok_or_else(|| {
+            ProviderError::reauthenticate("there is no stored Proton session for this account")
+        })?;
+        let secret = proton_secret(envelope)?;
+        let uid = secret.uid.clone().ok_or_else(|| {
+            ProviderError::reauthenticate("the Proton session id is missing; sign in again")
+        })?;
+        let _refresh = secret.refresh_token.clone().ok_or_else(|| {
+            ProviderError::reauthenticate("the Proton session has expired; sign in again")
+        })?;
+        let skp = secret.skp.clone().ok_or_else(|| {
+            ProviderError::reauthenticate("unlock the Proton mailbox to continue")
+        })?;
+
+        // Use only the stored access token here. The temporary client gets no
+        // refresh token, so the vendored transport cannot rotate the session
+        // token in memory and drop the result. A 401 is retried through Pige's
+        // refresher, which persists the rotated pair before returning.
+        let mut access = secret.access_token.clone();
+        let mut may_refresh = true;
+        let (user, addresses) = loop {
+            ctx.ensure_active()?;
+            let token = match access.take() {
+                Some(token) => token,
+                None => self.refresher.refresh(&ctx).await?,
+            };
+            let http = authenticated_http(&self.endpoints, &uid, token).await;
+            match fetch_user_and_addresses(&http).await {
+                Ok(material) => break material,
+                Err(error)
+                    if error.kind == crate::providers::ErrorKind::Reauthenticate
+                        && may_refresh =>
+                {
+                    may_refresh = false;
+                    access = None;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        let unlocked = tokio::task::spawn_blocking(move || {
+            let provider = crypto::provider();
+            crypto::keys::unlock_with_skp(&provider, &user, &addresses, &skp)
+        })
+        .await
+        .map_err(|_| ProviderError::transient("the Proton key-unlock worker stopped"))?;
+        let keys = unlocked.map_err(map_proton_error)?;
+
+        // Installation shares the account gate with `invalidate`/removal. A
+        // resume that lost the race must not recreate a key store after logout,
+        // and the durable generation is checked inside the same gate as the
+        // install.
+        let fence_ctx = ctx.clone();
+        self.store.with_account_gate(account, || {
+            let fenced = (|| {
+                fence_ctx.ensure_active()?;
+                if self.sessions.generation(account)? != fence_ctx.generation {
+                    return Err(ProviderError::conflict(
+                        "the account changed during Proton resume",
+                    ));
+                }
+                Ok(())
+            })();
+            match fenced {
+                Ok(()) => {
+                    self.keys.get_or_create(account).install(uid, keys);
+                    Ok(())
+                }
+                Err(error) => {
+                    crate::providers::proton::keys::wipe_key_store(keys);
+                    Err(error)
+                }
+            }
+        })?;
+
+        let email = self
+            .store
+            .accounts()
+            .ok()
+            .and_then(|accounts| {
+                accounts
+                    .into_iter()
+                    .find(|candidate| candidate.id == *account)
+                    .map(|candidate| candidate.email)
+            })
+            .unwrap_or_default();
+        let persistent = self.secrets.load_persistent(account)?.is_some();
+        Ok(AuthProgress::Complete(AuthenticatedAccount {
+            account: Self::provisional_account(account.clone(), &email),
+            persistence: if persistent {
+                SecretPersistence::Persistent
+            } else {
+                SecretPersistence::SessionOnly
+            },
+            credential_ref: StagedSecretRef::for_account(account)?,
+        }))
+    }
+
+    /// Best-effort server logout after local state is already protected.
+    ///
+    /// The request carries no refresh token and skips the vendor refresh path.
+    /// It is bounded by `logout_timeout` and by the freshly derived context's
+    /// cancellation token, so an unreachable or hostile endpoint cannot extend
+    /// the logout or keep anything unlocked.
+    async fn server_logout(&self, account: &AccountId, uid: String, access: SecretString) {
+        let Ok(ctx) = self.sessions.context(account, self.logout_timeout) else {
+            return;
+        };
+        let http = authenticated_http(&self.endpoints, &uid, access).await;
+        let request = Request::delete("/core/v4/auth").no_refresh();
+        let call = async {
+            let _ = http.decode::<serde_json::Value>(request).await;
+        };
+        tokio::select! {
+            _ = ctx.cancellation.cancelled() => {}
+            _ = tokio::time::sleep_until(ctx.deadline) => {}
+            _ = call => {}
+        }
     }
 }
 
@@ -871,59 +1087,8 @@ impl AuthenticationService for ProtonAuthentication {
     }
 
     async fn resume(&mut self, account: &AccountId) -> Result<AuthProgress, ProviderError> {
-        let envelope = self.secrets.load(account)?.ok_or_else(|| {
-            ProviderError::reauthenticate("there is no stored Proton session for this account")
-        })?;
-        let secret = proton_secret(envelope)?;
-        let uid = secret.uid.clone().ok_or_else(|| {
-            ProviderError::reauthenticate("the Proton session id is missing; sign in again")
-        })?;
-        let access = secret.access_token.clone().ok_or_else(|| {
-            ProviderError::reauthenticate("the Proton session has expired; sign in again")
-        })?;
-        let refresh = secret.refresh_token.clone().ok_or_else(|| {
-            ProviderError::reauthenticate("the Proton session has expired; sign in again")
-        })?;
-        let skp = secret.skp.clone().ok_or_else(|| {
-            ProviderError::reauthenticate("unlock the Proton mailbox to continue")
-        })?;
-
-        let http = HttpClient::new(self.endpoints.as_str(), PROTON_APP_VERSION);
-        http.set_tokens(uid.clone(), access, refresh).await;
-        let user = api::keys::get_user(&http).await.map_err(map_proton_error)?;
-        let addresses = api::keys::get_addresses(&http)
-            .await
-            .map_err(map_proton_error)?;
-        let unlocked = tokio::task::spawn_blocking(move || {
-            let provider = crypto::provider();
-            crypto::keys::unlock_with_skp(&provider, &user, &addresses, &skp)
-        })
-        .await
-        .map_err(|_| ProviderError::transient("the Proton key-unlock worker stopped"))?;
-        let keys = unlocked.map_err(map_proton_error)?;
-        self.keys.get_or_create(account).install(uid, keys);
-
-        let email = self
-            .store
-            .accounts()
-            .ok()
-            .and_then(|accounts| {
-                accounts
-                    .into_iter()
-                    .find(|candidate| candidate.id == *account)
-                    .map(|candidate| candidate.email)
-            })
-            .unwrap_or_default();
-        let persistent = self.secrets.load_persistent(account)?.is_some();
-        Ok(AuthProgress::Complete(AuthenticatedAccount {
-            account: Self::provisional_account(account.clone(), &email),
-            persistence: if persistent {
-                SecretPersistence::Persistent
-            } else {
-                SecretPersistence::SessionOnly
-            },
-            credential_ref: StagedSecretRef::for_account(account)?,
-        }))
+        let ctx = self.sessions.context(account, self.resume_timeout)?;
+        self.resume_with_context(account, ctx).await
     }
 
     async fn revoke(&mut self, account: &AccountId) -> Result<(), ProviderError> {
@@ -940,26 +1105,26 @@ impl AuthenticationService for ProtonAuthentication {
             self.discard_attempt(&attempt);
         }
 
-        // Best-effort server logout using the still-stored session. Local
-        // cleanup always proceeds even when Proton cannot be reached.
-        if let Ok(Some(envelope)) = self.secrets.load(account)
-            && let Ok(secret) = proton_secret(envelope)
-            && let (Some(uid), Some(access), Some(refresh)) = (
-                secret.uid.clone(),
-                secret.access_token.clone(),
-                secret.refresh_token.clone(),
-            )
-        {
-            let http = HttpClient::new(self.endpoints.as_str(), PROTON_APP_VERSION);
-            http.set_tokens(uid, access, refresh).await;
-            let _ = proton_core::auth::logout(&http).await;
-        }
+        // Capture the session tokens before deleting the credential; local
+        // protection must not depend on the network.
+        let logout_tokens = match self.secrets.load(account) {
+            Ok(Some(envelope)) => proton_secret(envelope).ok().and_then(|secret| {
+                Some((secret.uid?, secret.access_token?))
+            }),
+            _ => None,
+        };
 
-        // Local protection is unconditional: even if cancelling live work or
-        // deleting the stored credential fails, no unlocked key may survive.
+        // Cancel live work, lock keys, and delete the credential first. Only then
+        // is a bounded best-effort server logout attempted; an unreachable or
+        // hostile endpoint cannot leave keys unlocked or contexts live.
         let invalidated = self.sessions.invalidate(account);
         self.keys.lock_and_remove(account);
         let deleted = self.secrets.delete(account);
+
+        if let Some((uid, access)) = logout_tokens {
+            self.server_logout(account, uid, access).await;
+        }
+
         invalidated?;
         deleted?;
         Ok(())

@@ -48,10 +48,13 @@ pub(crate) fn proton_envelope(
 
 /// Refreshes one account's Proton access token.
 ///
-/// A per-account serial mutex makes concurrent refreshes single-flight even if
-/// callers hold different [`crate::auth::CachedTokenSource`] instances. The
-/// rotated refresh token is persisted through the generation-gated repository
-/// before the new access token is returned.
+/// Refreshes are serialized by a mutex owned by this refresher instance. The
+/// provider factory caches one [`crate::auth::CachedTokenSource`] per account, so
+/// every service opened through the same factory shares this instance and its
+/// single-flight cache; independently constructed refreshers (for example a
+/// cold resume path and a provider service) are not serialized against each
+/// other. The rotated refresh token is persisted through the generation-gated
+/// repository before the new access token is returned.
 pub struct ProtonTokenRefresher {
     secrets: Arc<dyn SecretRepository>,
     endpoints: ProtonEndpoints,

@@ -145,11 +145,42 @@ impl ProviderFactory for ProtonProviderFactory {
     }
 }
 
-/// Register the Proton factory with the application-owned registry.
+/// Register the Proton factory in an application-owned registry.
+pub fn register_proton(
+    registry: &mut ProviderRegistry,
+    factory: ProtonProviderFactory,
+) -> Result<(), ProviderError> {
+    registry.register(ProviderId::from(PROTON_PROVIDER), Arc::new(factory))
+}
+
+/// Register the Proton factory with a standalone registry.
 pub fn proton_registry(factory: ProtonProviderFactory) -> Result<ProviderRegistry, ProviderError> {
     let mut registry = ProviderRegistry::new();
-    registry.register(ProviderId::from(PROTON_PROVIDER), Arc::new(factory))?;
+    register_proton(&mut registry, factory)?;
     Ok(registry)
+}
+
+/// The core-level Proton registration: provider dispatch plus the interactive
+/// authentication service that produces its credentials.
+///
+/// P5 still owns the application shell: [`crate::api::Config::auth`] is a single
+/// provider slot, so composing Proton with Google/IMAP onboarding and exposing
+/// the account UI is a shell decision. This type is the wiring the shell will
+/// consume, not a second UI path.
+pub struct ProtonRegistration {
+    pub registry: ProviderRegistry,
+    pub authentication: Arc<AsyncMutex<Box<dyn AuthenticationService>>>,
+}
+
+/// Build the registered Proton provider and authentication service together.
+pub fn proton_registration(
+    factory: ProtonProviderFactory,
+    authentication: ProtonAuthentication,
+) -> Result<ProtonRegistration, ProviderError> {
+    Ok(ProtonRegistration {
+        registry: proton_registry(factory)?,
+        authentication: proton_auth_service(authentication),
+    })
 }
 
 /// Wrap a configured Proton authentication service for [`crate::api::Config`].

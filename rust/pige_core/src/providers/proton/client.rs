@@ -37,13 +37,27 @@ impl ProtonEndpoints {
         }
     }
 
-    /// Inject a mock or approved alternate API root. The trailing slash is
-    /// removed so request paths append cleanly.
+    /// Inject an approved alternate HTTPS API root. The trailing slash is
+    /// removed so request paths append cleanly. Cleartext URLs are rejected:
+    /// bearer tokens and key material must never leave the process unencrypted.
     pub fn new(base_url: impl Into<String>) -> Result<Self, ProviderError> {
-        let mut base_url = base_url.into();
-        while base_url.ends_with('/') {
-            base_url.pop();
+        let base_url = trim_base_url(base_url.into());
+        if !base_url.starts_with("https://") {
+            return Err(ProviderError::new(
+                ErrorKind::Unsupported,
+                "the Proton API base URL must be an https URL",
+            ));
         }
+        Ok(Self { base_url })
+    }
+
+    /// Inject a local mock API root in debug/test builds only.
+    ///
+    /// Release builds do not compile this constructor, so a shipped binary
+    /// cannot be pointed at a cleartext endpoint that would expose tokens.
+    #[cfg(debug_assertions)]
+    pub fn new_insecure_for_tests(base_url: impl Into<String>) -> Result<Self, ProviderError> {
+        let base_url = trim_base_url(base_url.into());
         if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
             return Err(ProviderError::new(
                 ErrorKind::Unsupported,
@@ -57,6 +71,13 @@ impl ProtonEndpoints {
     pub fn as_str(&self) -> &str {
         &self.base_url
     }
+}
+
+fn trim_base_url(mut base_url: String) -> String {
+    while base_url.ends_with('/') {
+        base_url.pop();
+    }
+    base_url
 }
 
 impl fmt::Debug for ProtonEndpoints {

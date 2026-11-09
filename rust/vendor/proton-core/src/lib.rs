@@ -65,6 +65,11 @@ pub mod error;
 pub mod html;
 pub mod mail;
 pub mod model;
+// Pige never calls this module: the F3 `SecretRepository` is the only credential
+// writer. It remains compiled only because the unused high-level `mail::Client`
+// and `auth::login` reference its in-memory `Tokens`/session types. Do not add a
+// Pige call to it; if `mail::Client` is ever deleted, gate this module out too.
+#[doc(hidden)]
 pub mod session;
 pub mod transport;
 

@@ -39,7 +39,7 @@ use pige_core::providers::proton::{
     ProtonAuthentication, ProtonClient, ProtonEndpoints, ProtonKeyStores, ProtonProviderFactory,
 };
 use pige_core::providers::{
-    AuthAttemptId, ErrorKind, OperationContext, PROTON_PROVIDER, ProviderId,
+    AuthAttemptId, ErrorKind, OperationContext, PROTON_PROVIDER, ProviderFactory, ProviderId,
 };
 use pige_core::store::Store;
 use tempfile::TempDir;
@@ -123,6 +123,7 @@ struct MockState {
     interaction: Option<ServerInteraction>,
     hv_token: String,
     hv_headers: Vec<Option<String>>,
+    hv_token_types: Vec<Option<String>>,
     user: Value,
     addresses: Value,
     salts: Value,
@@ -131,11 +132,22 @@ struct MockState {
     refresh: String,
     refresh_tokens: Vec<String>,
     logout_calls: usize,
+    /// Derived mailbox key passphrase, used by cold-resume tests to unlock the
+    /// synthetic key ring without re-running the KDF.
+    skp: String,
 }
 
 struct MockProton {
     server: MockServer,
     state: Arc<Mutex<MockState>>,
+}
+
+fn is_authorized(request: &Request, state: &MockState) -> bool {
+    request
+        .headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == format!("Bearer {}", state.access))
 }
 
 impl MockProton {
@@ -232,6 +244,7 @@ impl MockProton {
             interaction,
             hv_token: "human-token".to_string(),
             hv_headers: Vec::new(),
+            hv_token_types: Vec::new(),
             user,
             addresses: json!({ "Addresses": address_json }),
             salts: json!({ "KeySalts": salt_json }),
@@ -240,6 +253,7 @@ impl MockProton {
             refresh: "refresh-1".to_string(),
             refresh_tokens: Vec::new(),
             logout_calls: 0,
+            skp: derived.expose_secret().to_string(),
         }));
 
         let server = MockServer::start().await;
@@ -306,6 +320,11 @@ impl MockProton {
                     .get("x-pm-human-verification-token")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
+                let hv_type = request
+                    .headers
+                    .get("x-pm-human-verification-token-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
 
                 let client = SRPProofB64 {
                     client_ephemeral: body["ClientEphemeral"]
@@ -335,6 +354,7 @@ impl MockProton {
                     }
                 };
                 state.hv_headers.push(hv.clone());
+                state.hv_token_types.push(hv_type);
 
                 if state.require_hv && hv.as_deref() != Some(state.hv_token.as_str()) {
                     return ResponseTemplate::new(200).set_body_json(json!({
@@ -376,8 +396,12 @@ impl MockProton {
         let salts_state = state.clone();
         Mock::given(method("GET"))
             .and(path("/core/v4/keys/salts"))
-            .respond_with(move |_request: &Request| {
+            .respond_with(move |request: &Request| {
                 let state = salts_state.lock().unwrap();
+                if !is_authorized(request, &state) {
+                    return ResponseTemplate::new(401)
+                        .set_body_json(json!({ "Code": 401, "Error": "expired access token" }));
+                }
                 ResponseTemplate::new(200).set_body_json(state.salts.clone())
             })
             .mount(&server)
@@ -386,8 +410,12 @@ impl MockProton {
         let user_state = state.clone();
         Mock::given(method("GET"))
             .and(path("/core/v4/users"))
-            .respond_with(move |_request: &Request| {
+            .respond_with(move |request: &Request| {
                 let state = user_state.lock().unwrap();
+                if !is_authorized(request, &state) {
+                    return ResponseTemplate::new(401)
+                        .set_body_json(json!({ "Code": 401, "Error": "expired access token" }));
+                }
                 ResponseTemplate::new(200).set_body_json(state.user.clone())
             })
             .mount(&server)
@@ -396,8 +424,12 @@ impl MockProton {
         let addresses_state = state.clone();
         Mock::given(method("GET"))
             .and(path("/core/v4/addresses"))
-            .respond_with(move |_request: &Request| {
+            .respond_with(move |request: &Request| {
                 let state = addresses_state.lock().unwrap();
+                if !is_authorized(request, &state) {
+                    return ResponseTemplate::new(401)
+                        .set_body_json(json!({ "Code": 401, "Error": "expired access token" }));
+                }
                 ResponseTemplate::new(200).set_body_json(state.addresses.clone())
             })
             .mount(&server)
@@ -419,10 +451,12 @@ impl MockProton {
                         .set_body_json(json!({ "Code": 401, "Error": "bad refresh token" }));
                 }
                 let next = state.refresh_tokens.len() + 1;
+                state.access = format!("access-{next}");
+                state.refresh = format!("refresh-{next}");
                 ResponseTemplate::new(200).set_body_json(json!({
                     "Code": 1000,
-                    "AccessToken": format!("access-{next}"),
-                    "RefreshToken": format!("refresh-{next}"),
+                    "AccessToken": state.access.clone(),
+                    "RefreshToken": state.refresh.clone(),
                 }))
             })
             .mount(&server)
@@ -442,7 +476,7 @@ impl MockProton {
     }
 
     fn endpoints(&self) -> ProtonEndpoints {
-        ProtonEndpoints::new(self.server.uri()).expect("mock endpoint")
+        ProtonEndpoints::new_insecure_for_tests(self.server.uri()).expect("mock endpoint")
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, MockState> {
@@ -699,12 +733,12 @@ async fn totp_challenge_requires_same_attempt() {
     assert!(!harness.staged_present(&attempt));
 
     // A live attempt rejects the wrong answer kind, then accepts the code.
-    let (attempt, _) = challenge_attempt(harness.begin().await);
+    let (first, _) = challenge_attempt(harness.begin().await);
     let _ = challenge_attempt(
         harness
             .auth
             .respond(
-                &attempt,
+                &first,
                 AuthAnswer::Password(SecretString::from("account-password")),
             )
             .await
@@ -713,18 +747,41 @@ async fn totp_challenge_requires_same_attempt() {
     let error = harness
         .auth
         .respond(
-            &attempt,
+            &first,
             AuthAnswer::Password(SecretString::from("not-a-totp")),
         )
         .await
         .expect_err("wrong answer kind");
     assert_eq!(error.kind, ErrorKind::Unsupported);
+
+    // Starting a second attempt supersedes the first. The TOTP code can only
+    // be redeemed against the attempt that actually reached the TOTP stage.
+    let (second, _) = challenge_attempt(harness.begin().await);
+    assert_ne!(second, first);
+    let error = harness
+        .auth
+        .respond(&first, AuthAnswer::Totp(SecretString::from("123456")))
+        .await
+        .expect_err("superseded attempt must not redeem a TOTP code");
+    assert_eq!(error.kind, ErrorKind::NotFound);
+    assert!(!harness.staged_present(&first));
+
+    let _ = challenge_attempt(
+        harness
+            .auth
+            .respond(
+                &second,
+                AuthAnswer::Password(SecretString::from("account-password")),
+            )
+            .await
+            .expect("password accepted"),
+    );
     let authenticated = complete(
         harness
             .auth
-            .respond(&attempt, AuthAnswer::Totp(SecretString::from("123456")))
+            .respond(&second, AuthAnswer::Totp(SecretString::from("123456")))
             .await
-            .expect("correct TOTP completes"),
+            .expect("correct TOTP completes the second attempt"),
     );
     assert_eq!(authenticated.persistence, SecretPersistence::Persistent);
 }
@@ -912,6 +969,11 @@ async fn captcha_can_resume_bound_attempt() {
         Some(&Some("human-token".to_string())),
         "the verification token was attached to the retried request"
     );
+    assert_eq!(
+        harness.mock.state().hv_token_types.last(),
+        Some(&Some("captcha".to_string())),
+        "the challenge's CAPTCHA type was carried to the retry"
+    );
 }
 
 #[tokio::test]
@@ -999,6 +1061,175 @@ async fn refresh_rotation_survives_restart() {
         harness.mock.state().refresh_tokens,
         vec!["refresh-1".to_string(), "refresh-2".to_string()]
     );
+}
+
+#[tokio::test]
+async fn cold_resume_after_access_expiry_persists_rotation() {
+    let mut harness = Harness::new(MockConfig::default()).await;
+    let skp = harness.mock.state().skp.clone();
+    harness.save_proton_secret("session-uid", "expired-access", "refresh-1", &skp);
+
+    // The stored access token is rejected. Resume must refresh through Pige's
+    // persistent refresher, not let the temporary vendor client rotate the
+    // refresh token in memory and drop it.
+    let account = harness.account_id();
+    let authenticated = complete(harness.auth.resume(&account).await.expect("cold resume"));
+    assert_eq!(authenticated.account.email, "alice@proton.me");
+    assert_eq!(authenticated.persistence, SecretPersistence::Persistent);
+    assert!(harness.keys_unlocked());
+
+    let stored = harness.proton_secret();
+    assert_eq!(
+        stored
+            .access_token
+            .as_ref()
+            .map(|value| value.expose_secret()),
+        Some("access-2")
+    );
+    assert_eq!(
+        stored
+            .refresh_token
+            .as_ref()
+            .map(|value| value.expose_secret()),
+        Some("refresh-2"),
+        "the rotated refresh token must be persisted, not lost with the client"
+    );
+    assert_eq!(
+        harness.mock.state().refresh_tokens,
+        vec!["refresh-1".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn resume_generation_fence_prevents_key_resurrection() {
+    let mut harness = Harness::new(MockConfig::default()).await;
+    let skp = harness.mock.state().skp.clone();
+    harness.save_proton_secret("session-uid", "access-1", "refresh-1", &skp);
+    let account = harness.account_id();
+    let old_generation = harness.store.generation(&account).expect("generation");
+    let stale = OperationContext::new(
+        account.clone(),
+        old_generation,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    );
+
+    // A removal/revocation advances the durable generation while a resume that
+    // carries the old generation is still in flight.
+    harness.sessions.invalidate(&account).expect("invalidate");
+    let error = harness
+        .auth
+        .resume_with_context(&account, stale)
+        .await
+        .expect_err("stale resume must be fenced");
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert!(
+        harness.keys.get(&account).is_none(),
+        "a fenced resume must not create or install a key store"
+    );
+    assert!(!harness.keys_unlocked());
+}
+
+#[tokio::test]
+async fn logout_unreachable_server_still_locks_and_cancels() {
+    let mut harness = Harness::new(MockConfig::default()).await;
+    let (attempt, _) = challenge_attempt(harness.begin().await);
+    let authenticated = complete(
+        harness
+            .auth
+            .respond(
+                &attempt,
+                AuthAnswer::Password(SecretString::from("account-password")),
+            )
+            .await
+            .expect("login"),
+    );
+    let staged = harness
+        .secrets
+        .load_staged(&authenticated.credential_ref)
+        .expect("load staged")
+        .expect("staged credential");
+    let commit_ctx = harness.context();
+    harness.secrets.save(&commit_ctx, &staged).expect("commit");
+    let key_store = harness.keys.get(&harness.account_id()).expect("key store");
+    assert!(key_store.is_unlocked());
+
+    // A server that accepts the request but never answers in time.
+    let delayed = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/core/v4/auth"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&delayed)
+        .await;
+    let mut auth = ProtonAuthentication::new(
+        harness.secrets.clone(),
+        harness.sessions.clone(),
+        harness.store.clone(),
+        ProtonEndpoints::new_insecure_for_tests(delayed.uri()).expect("delayed endpoint"),
+        harness.keys.clone(),
+    )
+    .with_logout_timeout(Duration::from_millis(100));
+
+    let live_context = harness.context();
+    let started = std::time::Instant::now();
+    auth.revoke(&harness.account_id())
+        .await
+        .expect("local logout succeeds despite an unreachable server");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "server logout must be bounded"
+    );
+    assert!(
+        live_context.cancellation.is_cancelled(),
+        "logout must cancel live work before the network call"
+    );
+    assert!(
+        !key_store.is_unlocked(),
+        "logout must wipe keys before the network call"
+    );
+    assert!(harness.keys.get(&harness.account_id()).is_none());
+    assert!(
+        harness
+            .secrets
+            .load(&harness.account_id())
+            .expect("load")
+            .is_none(),
+        "the stored credential is removed locally"
+    );
+}
+
+#[tokio::test]
+async fn proton_registration_resolves_provider_and_auth() {
+    let harness = Harness::new(MockConfig::default()).await;
+    let factory = ProtonProviderFactory::new(
+        harness.sessions.clone(),
+        harness.secrets.clone(),
+        harness.endpoints.clone(),
+        harness.keys.clone(),
+    );
+    let ctx = harness.context();
+    let request = harness.request();
+    let account = harness.account.clone();
+    let registration =
+        pige_core::providers::proton::proton_registration(factory, harness.auth)
+            .expect("register Proton");
+    assert!(
+        registration
+            .registry
+            .contains(&ProviderId::from(PROTON_PROVIDER))
+    );
+    let session = registration
+        .registry
+        .open(&account, &ctx)
+        .await
+        .expect("open registered Proton provider");
+    assert_eq!(session.provider, ProviderId::from(PROTON_PROVIDER));
+
+    let mut auth = registration.authentication.lock().await;
+    let progress = auth
+        .begin(request)
+        .await
+        .expect("registered auth service begins");
+    assert!(matches!(progress, AuthProgress::Challenge { .. }));
 }
 
 #[tokio::test]
@@ -1194,6 +1425,14 @@ async fn secrets_never_enter_debug_or_cache() {
     assert!(
         !harness.dir.path().join("sessions").exists(),
         "the vendored session-file module must never be used"
+    );
+    // Cover the vendor's own default path too, not just the Pige data dir.
+    let vendor_default_sessions = std::env::temp_dir()
+        .join("proton-core-fork")
+        .join("sessions");
+    assert!(
+        !vendor_default_sessions.exists(),
+        "the vendored session module must not create its default session dir"
     );
 }
 
