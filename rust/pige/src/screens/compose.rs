@@ -6,7 +6,7 @@
 use iced::widget::{column, container, row, text_editor};
 use iced::{Alignment, Element, Fill, Length};
 use pige_core::account::AccountId;
-use pige_core::api::{DeliveryPreview, RecipientSuggestion};
+use pige_core::api::{DeliveryPreview, DeliveryPreviewError, RecipientSuggestion};
 use pige_core::mail::Address;
 use pige_core::send::{OutboxId, OutgoingMessage};
 
@@ -286,14 +286,18 @@ impl ComposeState {
     pub fn apply_delivery(
         &mut self,
         generation: u64,
-        result: Result<DeliveryPreview, String>,
+        result: Result<DeliveryPreview, DeliveryPreviewError>,
     ) -> bool {
         if generation != self.delivery_generation {
             return false;
         }
         self.delivery = match result {
             Ok(preview) => DeliveryState::Ready(preview),
-            Err(error) => DeliveryState::Blocked(error),
+            // Only a provider policy refusal is actionable and blocks Send. A
+            // network/key-lookup failure is not evidence of a policy problem:
+            // leave delivery unknown and let submit re-check and fail closed.
+            Err(error) if error.blocks_send => DeliveryState::Blocked(error.message),
+            Err(_) => DeliveryState::Unknown,
         };
         true
     }
@@ -931,7 +935,14 @@ fn action_buttons<'a>(compose: &'a ComposeState) -> Vec<Element<'a, Message>> {
             ButtonVariant::Outlined,
             Message::ComposeSaveDraft,
         ),
-        components::button("Send", ButtonVariant::Filled, Message::ComposeSend),
+        components::button_maybe(
+            "Send",
+            ButtonVariant::Filled,
+            compose
+                .blocked_delivery()
+                .is_none()
+                .then_some(Message::ComposeSend),
+        ),
     ]
 }
 
@@ -988,6 +999,35 @@ mod tests {
                 .message
                 .to_ascii_lowercase()
                 .contains("not encrypted")
+        );
+    }
+
+    #[test]
+    fn transient_delivery_failure_does_not_block_send() {
+        let mut compose = ComposeState::new(AccountId("a".into()));
+        assert!(compose.apply_delivery(
+            0,
+            Err(DeliveryPreviewError::transient("could not reach Proton"))
+        ));
+        assert_eq!(compose.delivery, DeliveryState::Unknown);
+        assert!(
+            compose.blocked_delivery().is_none(),
+            "an offline/transient key lookup is not a policy refusal"
+        );
+    }
+
+    #[test]
+    fn policy_delivery_failure_blocks_send() {
+        let mut compose = ComposeState::new(AccountId("a".into()));
+        assert!(compose.apply_delivery(
+            0,
+            Err(DeliveryPreviewError::policy(
+                "this recipient requires encryption but no usable key is available"
+            ))
+        ));
+        assert_eq!(
+            compose.blocked_delivery(),
+            Some("this recipient requires encryption but no usable key is available")
         );
     }
 

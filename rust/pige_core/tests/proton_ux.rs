@@ -330,6 +330,69 @@ async fn removed_account_late_login_is_discarded() {
 }
 
 #[tokio::test]
+async fn proton_reconnect_refuses_a_different_email() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new(proton_script(AuthChallenge::Password {
+        username: Some("alice@proton.me".to_string()),
+    }));
+
+    let AuthProgress::Challenge { attempt, .. } = begin_proton(None).await else {
+        panic!("expected a password challenge");
+    };
+    let AuthProgress::Complete(mut authenticated) = api::answer_auth(
+        &attempt,
+        pige_core::auth::AuthAnswer::Password(pige_core::auth::secrecy::SecretString::from(
+            "proton-account-password",
+        )),
+    )
+    .await
+    .expect("complete Proton sign-in") else {
+        panic!("expected completion");
+    };
+    provisional_proton(&mut authenticated);
+    let (id, _) = api::finish_auth(authenticated)
+        .await
+        .expect("commit Proton account");
+
+    // A reconnect starts from the per-account pane, where the address field is
+    // editable. The candidate reuses the existing id, so a different address
+    // would otherwise keep the old mailbox's cache under new credentials.
+    let AuthProgress::Challenge { attempt, .. } = api::begin_auth_with_username(
+        ProviderId::from(PROTON_PROVIDER),
+        "bob@proton.me".to_string(),
+        Some(id.clone()),
+        false,
+    )
+    .await
+    .expect("begin Proton reconnect with an edited address") else {
+        panic!("expected a password challenge");
+    };
+    let AuthProgress::Complete(redirected) = api::answer_auth(
+        &attempt,
+        pige_core::auth::AuthAnswer::Password(pige_core::auth::secrecy::SecretString::from(
+            "proton-account-password",
+        )),
+    )
+    .await
+    .expect("complete Proton reconnect") else {
+        panic!("expected completion");
+    };
+
+    let error = api::finish_auth(redirected)
+        .await
+        .expect_err("a different Proton address must not rewrite this account");
+    assert!(error.contains("does not match"), "{error}");
+    assert!(error.contains("alice@proton.me"), "{error}");
+    assert!(
+        !harness.store().has_switch_intent(&id).unwrap(),
+        "a refused Proton identity change writes no switch intent"
+    );
+    let account = api::account(&id).expect("account survives");
+    assert_eq!(account.email, "alice@proton.me");
+    assert_eq!(account.provider_id().as_str(), PROTON_PROVIDER);
+}
+
+#[tokio::test]
 async fn proton_contacts_are_registered_when_enabled() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new(proton_script(AuthChallenge::Password {

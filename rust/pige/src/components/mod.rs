@@ -41,7 +41,7 @@ pub mod spinner;
 pub use spinner::{spinner, toolbar_spinner};
 
 pub use avatar::avatar;
-pub use buttons::{ButtonVariant, button, floating_action_button, icon_button};
+pub use buttons::{ButtonVariant, button, button_maybe, floating_action_button, icon_button};
 pub use chips::{attachment_chip, chip, format_size};
 pub use chrome::{app_bar, app_bar_actions, empty_state, toast};
 pub use dialog::{dialog, dialog_sized};

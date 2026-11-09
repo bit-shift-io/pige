@@ -933,14 +933,22 @@ fn cleanup_switch_references(
     }
 }
 
-/// Re-authenticating a native Google account must not silently replace the
-/// account's identity with whichever Google user happened to consent. A
-/// mismatch would rewrite the address and clear the provider cache under a
+/// Re-authenticating a native account must not silently replace the account's
+/// identity with whichever provider user happened to sign in. A mismatch would
+/// rewrite the address and leave the provider cache under a credential for a
 /// different mailbox, so it is refused before any commit begins.
+///
+/// Proton account candidates are built from the typed address, so an edited
+/// reconnect address is caught here as well. A same-backend Proton reconnect
+/// cannot rely on the backend comparison to clear the cache because both sides
+/// are `proton(None)`.
 fn ensure_matching_identity(previous: &Account, target: &Account) -> Result<(), String> {
-    if target.provider_id().as_str() != crate::providers::GMAIL_PROVIDER {
-        return Ok(());
-    }
+    let provider = target.provider_id();
+    let provider_name = match provider.as_str() {
+        crate::providers::GMAIL_PROVIDER => "Google",
+        crate::providers::PROTON_PROVIDER => "Proton",
+        _ => return Ok(()),
+    };
     let previous_email = previous.email.trim();
     let target_email = target.email.trim();
     if !previous_email.is_empty()
@@ -948,7 +956,7 @@ fn ensure_matching_identity(previous: &Account, target: &Account) -> Result<(), 
         && !previous_email.eq_ignore_ascii_case(target_email)
     {
         return Err(format!(
-            "the signed-in Google account ({target_email}) does not match this account ({previous_email}); sign in with {previous_email} or add a separate account"
+            "the signed-in {provider_name} account ({target_email}) does not match this account ({previous_email}); sign in with {previous_email} or add a separate account"
         ));
     }
     Ok(())

@@ -16,6 +16,7 @@ pub mod snapshot;
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -2955,6 +2956,41 @@ fn message_text(store: &Store, message: &crate::mail::StoredMessage) -> String {
         .unwrap_or_else(|| message.snippet.clone())
 }
 
+/// A failed recipient-delivery preview.
+///
+/// A network/key lookup failure must not be presented as a recipient policy
+/// refusal: offline and transient failures leave delivery "unknown" and let
+/// submit re-check and fail closed. Only provider policy refusals
+/// (`Forbidden`/`Unsupported`) keep Send disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryPreviewError {
+    pub message: String,
+    /// Whether this is a recipient-policy refusal that must block sending.
+    pub blocks_send: bool,
+}
+
+impl DeliveryPreviewError {
+    pub fn policy(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            blocks_send: true,
+        }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            blocks_send: false,
+        }
+    }
+}
+
+impl fmt::Display for DeliveryPreviewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// Resolve each recipient's delivery classification before sending.
 ///
 /// This is a network read through the account's submission service: Proton
@@ -2962,13 +2998,16 @@ fn message_text(store: &Store, message: &crate::mail::StoredMessage) -> String {
 /// Providers without a recipient-level policy return an empty preview, which
 /// the compose screen treats as "nothing to add" rather than an encryption
 /// claim. The message is not queued and no draft is created.
-pub async fn preview_delivery(message: &OutgoingMessage) -> Result<DeliveryPreview, String> {
+pub async fn preview_delivery(
+    message: &OutgoingMessage,
+) -> Result<DeliveryPreview, DeliveryPreviewError> {
     let (config, sessions, account) = {
         let guard = lock_state();
         let state = guard
             .as_ref()
-            .ok_or_else(|| not_initialized_message().to_string())?;
-        let account = find_account(&state.store, &message.account_id)?;
+            .ok_or_else(|| DeliveryPreviewError::transient(not_initialized_message()))?;
+        let account = find_account(&state.store, &message.account_id)
+            .map_err(DeliveryPreviewError::transient)?;
         (state.config.clone(), state.sessions.clone(), account)
     };
     // Only Proton has a recipient-level security policy. Do not open an
@@ -2978,19 +3017,25 @@ pub async fn preview_delivery(message: &OutgoingMessage) -> Result<DeliveryPrevi
     }
     let ctx = sessions
         .context(&account.id, INTERACTIVE_TIMEOUT)
-        .map_err(|error| error.safe_message)?;
+        .map_err(|error| DeliveryPreviewError::transient(error.safe_message))?;
     let mut session = config
         .providers
         .open(&account, &ctx)
         .await
-        .map_err(|error| error.safe_message)?;
+        .map_err(|error| DeliveryPreviewError::transient(error.safe_message))?;
     let service = session
         .submission_service()
-        .map_err(mailbox::provider_message)?;
-    let recipients = service
-        .classify(message, &ctx)
-        .await
-        .map_err(|error| error.safe_message)?;
+        .map_err(|error| DeliveryPreviewError::transient(mailbox::provider_message(error)))?;
+    let recipients = service.classify(message, &ctx).await.map_err(|error| {
+        if matches!(
+            error.kind,
+            crate::providers::ErrorKind::Forbidden | crate::providers::ErrorKind::Unsupported
+        ) {
+            DeliveryPreviewError::policy(error.safe_message)
+        } else {
+            DeliveryPreviewError::transient(error.safe_message)
+        }
+    })?;
     Ok(DeliveryPreview { recipients })
 }
 

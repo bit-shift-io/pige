@@ -285,7 +285,7 @@ pub enum Message {
     /// A debounced delivery classification for the open compose form.
     ComposeDeliveryChecked {
         generation: u64,
-        result: Result<pige_core::api::DeliveryPreview, String>,
+        result: Result<pige_core::api::DeliveryPreview, pige_core::api::DeliveryPreviewError>,
     },
     AccountPasswordChanged(Password),
     AccountPresetChanged(ProviderPreset),

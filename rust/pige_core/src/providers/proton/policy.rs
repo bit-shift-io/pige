@@ -240,8 +240,9 @@ impl ProtonRecipientPolicy {
                 classify(&keys, contact.as_ref()).map_err(|mut error| {
                     if error.kind == ErrorKind::Unsupported {
                         error.safe_message = format!(
-                            "{} for {email}. Add a usable OpenPGP key, or turn off encryption \
-                         for this contact before sending.",
+                            "{} for {email}. Pige cannot change a Proton contact's encryption \
+                         policy yet; ask the recipient to publish an OpenPGP key, or update the \
+                         contact in Proton.",
                             error.safe_message
                         );
                     }

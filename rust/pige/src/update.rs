@@ -439,6 +439,20 @@ impl App {
                 enable_contacts,
                 resume,
             } => {
+                // A list-row "Unlock / reconnect" starts from a summary with no
+                // form open. Open the Proton pane first so a password/TOTP/
+                // mailbox-unlock challenge has a visible prompt and answer
+                // field instead of being silently discarded.
+                if self.accounts.form.is_none()
+                    && let Some(id) = account.as_ref()
+                    && let Some(summary) = self
+                        .snapshot
+                        .accounts
+                        .iter()
+                        .find(|candidate| &candidate.id == id)
+                {
+                    self.accounts.start_proton_reconnect(summary);
+                }
                 self.accounts.proton_contacts_request = enable_contacts;
                 if let Some(form) = self.accounts.form.as_mut() {
                     form.busy = true;
@@ -543,7 +557,23 @@ impl App {
             }
             Message::ProtonContactsToggle(account, enabled) => {
                 if enabled {
+                    // Enabling contacts is an interactive Proton authorization,
+                    // so it needs the same challenge pane as a reconnect.
+                    if self.accounts.form.is_none()
+                        && let Some(summary) = self
+                            .snapshot
+                            .accounts
+                            .iter()
+                            .find(|candidate| candidate.id == account)
+                    {
+                        self.accounts.start_proton_reconnect(summary);
+                    }
                     self.accounts.proton_contacts_request = true;
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = true;
+                        form.test = TestState::Idle;
+                        form.clear_proton_challenge();
+                    }
                     let email = self
                         .snapshot
                         .accounts
@@ -1817,6 +1847,41 @@ mod tests {
         let _ = app.update(Message::AccountSaved(Err("bad credentials".into())));
         assert!(app.accounts.form.is_some());
         assert!(app.accounts_open);
+    }
+
+    #[test]
+    fn list_row_proton_unlock_opens_the_form_before_the_challenge() {
+        let mut app = App::for_test();
+        app.accounts_open = true;
+        let id = AccountId("proton-1".into());
+        app.snapshot.accounts = vec![pige_core::api::AccountSummary {
+            id: id.clone(),
+            label: "Proton".into(),
+            email: "alice@proton.me".into(),
+            unread: 0,
+            color: "#00897b".into(),
+            learning_paused: false,
+            contact_sources: Vec::new(),
+            provider: PROTON_PROVIDER.into(),
+            available: true,
+            unavailable_reason: None,
+        }];
+
+        let _ = app.update(Message::ProtonAuth {
+            account: Some(id.clone()),
+            email: "alice@proton.me".into(),
+            enable_contacts: false,
+            resume: true,
+        });
+
+        let form = app
+            .accounts
+            .form
+            .as_ref()
+            .expect("the list-row reconnect must open the Proton pane");
+        assert_eq!(form.method, crate::screens::accounts::AccountMethod::Proton);
+        assert_eq!(form.editing, Some(id));
+        assert!(form.busy);
     }
 
     #[test]

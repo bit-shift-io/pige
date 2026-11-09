@@ -117,6 +117,17 @@ pub fn button<'a>(
     variant: ButtonVariant,
     on_press: Message,
 ) -> Element<'a, Message> {
+    button_maybe(label, variant, Some(on_press))
+}
+
+/// A labelled action button that renders disabled when `on_press` is `None`.
+/// The disabled style already exists on every [`ButtonVariant`], so a policy
+/// refusal can keep the Send affordance visible without accepting presses.
+pub fn button_maybe<'a>(
+    label: impl Into<String>,
+    variant: ButtonVariant,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
     let palette = theme::active();
     let label = label.into();
     let label_style = palette.role(TextRole::LabelLarge);
@@ -135,7 +146,7 @@ pub fn button<'a>(
     .height(palette.metrics.action_height)
     .padding(0)
     .style(style(palette, variant))
-    .on_press(on_press)
+    .on_press_maybe(on_press)
     .into()
 }
 

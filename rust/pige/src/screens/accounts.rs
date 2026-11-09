@@ -503,6 +503,25 @@ impl AccountsState {
         self.notice = None;
     }
 
+    /// Open the Proton pane for a list-row reconnect/unlock. A list row only has
+    /// the summary, but that is enough to build the interactive form: the
+    /// provider returns the authoritative account candidate on completion. The
+    /// form must exist before the first challenge arrives, otherwise the prompt
+    /// has nowhere to render.
+    pub fn start_proton_reconnect(&mut self, account: &AccountSummary) {
+        let mut form = AccountForm::proton(account.email.clone());
+        form.editing = Some(account.id.clone());
+        form.label = account.label.clone();
+        form.proton_contacts = account.contact_sources.iter().any(|source| {
+            source.source.as_str() == pige_core::account::PROTON_CONTACTS_SOURCE_ID
+                && source.enabled
+        });
+        form.busy = true;
+        self.form = Some(form);
+        self.confirm_remove = None;
+        self.notice = None;
+    }
+
     pub fn close_form(&mut self) {
         self.form = None;
     }
@@ -621,7 +640,7 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
             .unwrap_or(&account.label);
         let provider_label = match account.provider.as_str() {
             "gmail" => "Native Google",
-            "proton" => "Native Proton (E2E)",
+            "proton" => "Native Proton Mail",
             "imap-smtp" if looks_like_gmail(&account.email) => "Gmail over IMAP",
             "imap-smtp" => "IMAP/SMTP",
             other => other,
@@ -1481,6 +1500,36 @@ mod tests {
             account_id: AccountId("acc".into()),
         };
         assert!(result.warning.as_deref() == Some("session only"));
+    }
+
+    #[test]
+    fn list_row_proton_reconnect_opens_the_challenge_pane() {
+        let mut state = AccountsState::default();
+        let summary = AccountSummary {
+            id: AccountId("proton-1".into()),
+            label: "Proton".into(),
+            email: "alice@proton.me".into(),
+            unread: 0,
+            color: "#00897b".into(),
+            learning_paused: false,
+            contact_sources: Vec::new(),
+            provider: pige_core::providers::PROTON_PROVIDER.into(),
+            available: true,
+            unavailable_reason: None,
+        };
+
+        state.start_proton_reconnect(&summary);
+
+        let form = state.form.as_ref().expect("a Proton form is open");
+        assert_eq!(form.method, AccountMethod::Proton);
+        assert_eq!(form.editing, Some(summary.id.clone()));
+        assert_eq!(form.email, "alice@proton.me");
+        assert!(form.busy, "the reconnect starts immediately");
+        assert_eq!(
+            form.proton_prompt(),
+            None,
+            "no prompt exists until the provider returns a challenge"
+        );
     }
 
     #[test]
