@@ -78,6 +78,9 @@ struct MockState {
     page_hook: Option<(usize, PageHook)>,
     /// Listing pages that answer with a transient 503.
     fail_pages: HashSet<usize>,
+    /// Artificial latency on the decorative counts endpoint, so a test can let
+    /// the operation deadline expire while counts are in flight.
+    count_delay: Option<Duration>,
     requests: Vec<RecordedRequest>,
 }
 
@@ -237,10 +240,14 @@ fn respond(state: &mut MockState, request: &Request) -> ResponseTemplate {
                 json!({ "LabelID": label, "Total": total, "Unread": unread })
             })
             .collect();
-        return ResponseTemplate::new(200).set_body_json(json!({
+        let response = ResponseTemplate::new(200).set_body_json(json!({
             "Code": 1000,
             "Counts": counts,
         }));
+        return match state.count_delay {
+            Some(delay) => response.set_delay(delay),
+            None => response,
+        };
     }
 
     if path == "/mail/v4/messages" && request.method.as_str() == "GET" {
@@ -1716,4 +1723,130 @@ async fn snapshot_page_size_is_pinned_in_the_cursor() {
         vec![Some("2"), Some("2")],
         "a changed initial_limit must not shift snapshot offsets"
     );
+}
+
+#[tokio::test]
+async fn label_deleted_ahead_of_cursor_does_not_skip_or_retire() {
+    // System folders come first (0,7,8,3,4,6), then user labels sorted by id.
+    // Each message belongs only to one user label, so a skipped listing is
+    // directly observable as a missing upsert.
+    let mut state = default_state()
+        .with_label("Label_a", "Alpha", 1)
+        .with_label("Label_b", "Beta", 1)
+        .with_label("Label_c", "Gamma", 1);
+    for (id, label, time) in [
+        ("msg-a", "Label_a", 1_700_000_300),
+        ("msg-b", "Label_b", 1_700_000_200),
+        ("msg-c", "Label_c", 1_700_000_100),
+    ] {
+        state.put_message(message(
+            id,
+            &format!("conv-{id}"),
+            id,
+            &[label],
+            "sender@example.com",
+            "alice@example.com",
+            time,
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let ctx = context();
+    let mut sync = ProtonSync::new(mock.client(Arc::new(StaticTokens)));
+
+    // A completed sweep establishes the retirement baseline (msg-a/b/c known).
+    let first = drive_sync(&mut sync, &ctx, 10, 40).await;
+    let checkpoint = first.last().expect("pages").checkpoint.clone();
+    assert_eq!(cursor_stage(&checkpoint).expect("stage"), "complete");
+    let baseline = upserts(&first);
+    for id in ["msg-a", "msg-b", "msg-c"] {
+        assert!(
+            baseline
+                .iter()
+                .any(|(record, _)| record.remote_id.as_str() == id),
+            "the baseline sweep must know {id}"
+        );
+    }
+
+    // Force a reconciliation so a fresh sweep compares against that baseline.
+    mock.update(|state| {
+        state.latest_event = "event-label-reset".to_string();
+        state.event(
+            "event-0",
+            json!({
+                "EventID": "event-label-reset",
+                "More": 0,
+                "Refresh": 1,
+                "Messages": [],
+                "MessageCounts": [],
+            }),
+        );
+    });
+
+    // Delete Label_a as soon as the sweep has enumerated its page. Label_b is
+    // still ahead of the collection cursor; a positional cursor would shift
+    // Label_b into the consumed slot and skip it.
+    let mut cursor = Some(checkpoint);
+    let mut pages = Vec::new();
+    let mut deleted = false;
+    for _ in 0..40 {
+        let page = sync
+            .next_page(
+                SyncRequest {
+                    cursor: cursor.clone(),
+                    initial_limit: 10,
+                },
+                &ctx,
+            )
+            .await
+            .expect("reconcile page");
+        let saw_a = upserts(std::slice::from_ref(&page))
+            .iter()
+            .any(|(record, _)| record.remote_id.as_str() == "msg-a");
+        let more = page.has_more;
+        cursor = Some(page.checkpoint.clone());
+        pages.push(page);
+        if saw_a && !deleted {
+            deleted = true;
+            mock.update(|state| state.labels.retain(|label| label["ID"] != "Label_a"));
+        }
+        if !more {
+            break;
+        }
+    }
+    assert!(deleted, "the sweep must reach the label deleted mid-sweep");
+
+    let swept = upserts(&pages);
+    for id in ["msg-b", "msg-c"] {
+        assert!(
+            swept
+                .iter()
+                .any(|(record, _)| record.remote_id.as_str() == id),
+            "deleting a label ahead of the cursor skipped {id}; swept {:?}",
+            swept
+                .iter()
+                .map(|(record, _)| record.remote_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        removed(&pages).is_empty(),
+        "a scope change mid-sweep must not retire anything; removed {:?}",
+        removed(&pages)
+    );
+}
+
+#[tokio::test]
+async fn collections_honors_deadline_after_decorative_counts() {
+    let mock = ProtonMock::start(default_state()).await;
+    mock.update(|state| state.count_delay = Some(Duration::from_millis(200)));
+    let ctx = OperationContext::with_timeout(AccountId::new(), 1, Duration::from_millis(50));
+    let mut mailbox = ProtonMailbox::new(mock.client(Arc::new(StaticTokens)));
+
+    // Count failures are decorative, but a deadline that expired while the
+    // counts request was in flight must not be swallowed: the call fails.
+    let error = mailbox
+        .collections(&ctx)
+        .await
+        .expect_err("an expired deadline must fail collections");
+    assert_eq!(error.kind, ErrorKind::Transient);
 }

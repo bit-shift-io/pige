@@ -54,6 +54,10 @@ impl MailboxService for ProtonMailbox {
         let http = self.client.request_http(ctx).await?;
         let labels = fetch_labels(&http).await?;
         let counts = fetch_counts(&http).await?;
+        // Count failures are decorative, but a deadline/cancellation that
+        // expired while fetching them must still fail the whole call: the
+        // context owns whether this operation may return a result at all.
+        ctx.ensure_active()?;
         let mut collections = collection_records(&labels, &counts);
         collections.sort_by(|left, right| {
             collection_order(&left.remote_id)
