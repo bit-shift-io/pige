@@ -2800,6 +2800,7 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
     // A body read applies nothing durable, so it does not take the account's
     // sync/mutation gate: it opens its own connection and never blocks an
     // interactive read behind a background sync (or vice versa).
+    let mut fetch_error = None;
     let fetched = match (remote, ctx) {
         (Some(remote), Some(ctx)) => {
             let providers = config.providers.clone();
@@ -2808,6 +2809,7 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
                 Ok(content) => Some(content),
                 Err(error) => {
                     log::warn!("open conversation {thread_id}: {error}");
+                    fetch_error = Some(error);
                     None
                 }
             }
@@ -2830,7 +2832,9 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             body::cache_body_content(&state.store, &messages[0].id, content)
                 .map(MessageBody::Document)
         } else {
-            None
+            // A failed fetch (unsupported encryption, integrity failure,
+            // oversize) surfaces its redacted reason instead of an empty body.
+            fetch_error.map(MessageBody::Failed)
         };
         if generation != state.open_generation {
             return Ok(state.build_snapshot());

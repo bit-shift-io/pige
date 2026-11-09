@@ -9,7 +9,7 @@ pub use message::{
     algo_name, decrypt_attachment, decrypt_attachment_bounded, decrypt_body,
     decrypt_body_bounded, encrypt_attachment, encrypt_for_transport, encrypt_self_draft,
     encrypt_text_with_password, new_session_key, rewrap_attachment_session_key, wrap_session_key,
-    wrap_session_key_to_self, wrap_session_key_with_password, SessionKeyMaterial,
+    wrap_session_key_to_self, wrap_session_key_with_password, DecryptFailure, SessionKeyMaterial,
     UploadedAttachment, Verdict,
 };
 

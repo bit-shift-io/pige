@@ -161,7 +161,17 @@ impl AddressBookService for ProtonAddressBook {
         }
 
         let page_end = u64::from(state.page.saturating_add(1)) * u64::from(state.page_size);
-        let has_more = !changes.is_empty() && page_end < u64::from(total);
+        let at_end = page_end >= u64::from(total);
+        // An empty page before the reported total means the offset listing
+        // shifted under this snapshot (or the server miscounted). Reporting it
+        // as complete would let R6 sweep the whole address book, so retry the
+        // page instead of advancing a checkpoint.
+        if changes.is_empty() && !at_end {
+            return Err(ProviderError::transient(
+                "the Proton contacts page was empty before the reported total",
+            ));
+        }
+        let has_more = !at_end;
         let checkpoint = ContactsCursor {
             v: CURSOR_VERSION,
             page: state.page.saturating_add(1),

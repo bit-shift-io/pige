@@ -12,6 +12,7 @@ pub enum ReaderBody {
     Document,
     TooLarge,
     Loading,
+    Failed,
     Missing,
 }
 
@@ -20,6 +21,7 @@ pub fn reader_body_kind(message: &MessageSummary) -> ReaderBody {
         Some(MessageBody::Document(_)) => ReaderBody::Document,
         Some(MessageBody::TooLarge) => ReaderBody::TooLarge,
         Some(MessageBody::Loading) => ReaderBody::Loading,
+        Some(MessageBody::Failed(_)) => ReaderBody::Failed,
         None => ReaderBody::Missing,
     }
 }
@@ -421,6 +423,21 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
                 .padding(palette.space.lg),
             );
         }
+        ReaderBody::Failed => {
+            let reason = match &latest.body {
+                Some(MessageBody::Failed(reason)) => reason.as_str(),
+                _ => "the message could not be opened",
+            };
+            content = content.push(
+                container(components::styled_text(
+                    format!("This message could not be opened: {reason}"),
+                    palette.role(TextRole::BodyMedium),
+                    palette.on_surface_variant,
+                ))
+                .width(Fill)
+                .padding(palette.space.lg),
+            );
+        }
         ReaderBody::Missing => {
             content = content.push(
                 container(components::styled_text(
@@ -593,6 +610,13 @@ fn earlier_message<'a>(message: &'a MessageSummary) -> Element<'a, Message> {
                 palette.on_surface_variant,
             ));
         }
+        Some(MessageBody::Failed(reason)) => {
+            card = card.push(components::styled_text(
+                format!("This message could not be opened: {reason}"),
+                palette.role(TextRole::BodySmall),
+                palette.on_surface_variant,
+            ));
+        }
         None => {
             if !message.snippet.trim().is_empty() {
                 card = card.push(components::styled_text(
@@ -757,6 +781,12 @@ mod tests {
         assert_eq!(
             reader_body_kind(&with_body(Some(MessageBody::TooLarge))),
             ReaderBody::TooLarge
+        );
+        assert_eq!(
+            reader_body_kind(&with_body(Some(MessageBody::Failed(
+                "the body failed its integrity check".to_string()
+            )))),
+            ReaderBody::Failed
         );
     }
 }

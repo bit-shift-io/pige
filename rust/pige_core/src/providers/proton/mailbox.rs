@@ -23,8 +23,8 @@ use crate::providers::{
 
 use proton_core::api;
 use proton_core::crypto::keys::{AddressKeys, KeyStore};
-use proton_core::crypto::Verdict;
-use proton_core::model::enums::{label_type, message_flag};
+use proton_core::crypto::{DecryptFailure, Verdict};
+use proton_core::model::enums::{key_flag, label_type, message_flag};
 use proton_core::model::label::Label;
 use proton_core::model::message::{Attachment, Message, MessageMetadata};
 
@@ -352,6 +352,8 @@ fn body_kind(message: &Message) -> Result<BodyKind, ProviderError> {
 
 /// Verified Proton sender keys only. External/WKD keys stay out of the
 /// verifier set, so an external signature is `Unverified`, never `Verified`.
+/// Proton's per-key `Flags` are part of the trust decision: a key the provider
+/// marks compromised or no-sign must never produce `Verified`.
 async fn sender_verification_keys(http: &ProtonHttp, email: &str) -> Vec<String> {
     if email.trim().is_empty() {
         return Vec::new();
@@ -362,6 +364,10 @@ async fn sender_verification_keys(http: &ProtonHttp, email: &str) -> Vec<String>
         Ok(keys) => keys
             .keys
             .into_iter()
+            .filter(|key| {
+                key.flags & key_flag::NOT_COMPROMISED != 0
+                    && key.flags & key_flag::EMAIL_NO_SIGN == 0
+            })
             .map(|key| key.public_key)
             .filter(|key| !key.is_empty())
             .collect(),
@@ -401,6 +407,8 @@ fn decrypt_body(
         }
         let provider = proton_core::crypto::provider();
         let mut last_error = None;
+        let mut exceeded = false;
+        let mut integrity = false;
         for address in candidates {
             match proton_core::crypto::decrypt_body_bounded(
                 &provider,
@@ -410,8 +418,22 @@ fn decrypt_body(
                 MAX_BODY_BYTES,
             ) {
                 Ok(result) => return Ok(result),
+                Err(DecryptFailure::TooLarge { .. }) => exceeded = true,
+                Err(DecryptFailure::Integrity(detail)) => {
+                    integrity = true;
+                    last_error = Some(detail);
+                }
                 Err(error) => last_error = Some(error.to_string()),
             }
+        }
+        if exceeded {
+            return Err(too_large("message body"));
+        }
+        if integrity {
+            return Err(ProviderError::transient(
+                "the encrypted message failed its integrity check",
+            )
+            .with_source_detail(last_error.unwrap_or_default()));
         }
         Err(
             ProviderError::new(ErrorKind::Unsupported, "decrypting this Proton message body")
@@ -435,6 +457,8 @@ fn decrypt_attachment(
         }
         let provider = proton_core::crypto::provider();
         let mut last_error = None;
+        let mut exceeded = false;
+        let mut integrity = false;
         for address in candidates {
             match proton_core::crypto::decrypt_attachment_bounded(
                 &provider,
@@ -444,8 +468,22 @@ fn decrypt_attachment(
                 MAX_ATTACHMENT_BYTES as usize,
             ) {
                 Ok(result) => return Ok(result),
+                Err(DecryptFailure::TooLarge { .. }) => exceeded = true,
+                Err(DecryptFailure::Integrity(detail)) => {
+                    integrity = true;
+                    last_error = Some(detail);
+                }
                 Err(error) => last_error = Some(error.to_string()),
             }
+        }
+        if exceeded {
+            return Err(too_large("attachment"));
+        }
+        if integrity {
+            return Err(ProviderError::transient(
+                "the encrypted attachment failed its integrity check",
+            )
+            .with_source_detail(last_error.unwrap_or_default()));
         }
         Err(
             ProviderError::new(ErrorKind::Unsupported, "decrypting this Proton attachment")

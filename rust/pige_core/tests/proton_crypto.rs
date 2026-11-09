@@ -34,12 +34,13 @@ use pige_core::providers::proton::{
     proton_crypto,
 };
 use pige_core::providers::{
-    ContactSourceId, ErrorKind, HistoryCoverage, HistoryPage, MailboxService, MessageRecord,
-    OperationContext, ProviderCursor, ProviderError, RemoteAttachmentId, RemoteMessageId,
-    SignatureStatus,
+    AddressBookService, ContactSourceId, ErrorKind, HistoryCoverage, HistoryPage, MailboxService,
+    MessageRecord, OperationContext, ProviderCursor, ProviderError, RemoteAttachmentId,
+    RemoteMessageId, SignatureStatus,
 };
 use pige_core::sync::provider::WorkBudget;
 use proton_core::crypto::keys::{AddressKeys, KeyStore, StoredKey};
+use proton_core::model::enums::key_flag;
 use proton_crypto::crypto::{
     DataEncoding, Encryptor, EncryptorSync, KeyGenerator, KeyGeneratorAlgorithm, KeyGeneratorSync,
     PGPMessage, PGPProviderSync,
@@ -62,6 +63,9 @@ struct MockState {
     /// `/core/v4/keys/all` response object.
     sender_keys: HashMap<String, Value>,
     contacts: Vec<Value>,
+    /// Override the reported `Total`, to exercise an empty page that still
+    /// claims more contacts remain.
+    contact_total: Option<usize>,
 }
 
 struct ProtonMock {
@@ -174,7 +178,7 @@ fn respond(state: &mut MockState, request: &Request) -> ResponseTemplate {
             .collect();
         return ResponseTemplate::new(200).set_body_json(json!({
             "Code": 1000,
-            "Total": state.contacts.len(),
+            "Total": state.contact_total.unwrap_or(state.contacts.len()),
             "Contacts": contacts,
         }));
     }
@@ -307,6 +311,140 @@ fn encrypt_to(
     }
     let message = encryptor.encrypt(text.as_bytes()).expect("encrypt body");
     String::from_utf8(message.armor().expect("armor body")).expect("armor utf8")
+}
+
+/// Encrypt `text` to an armored public key using compressed plaintext. This is
+/// the shape of a compression bomb: a tiny ciphertext that expands past the
+/// body cap only after decryption.
+fn encrypt_to_compressed(recipient_public: &str, text: &str) -> String {
+    let provider = provider();
+    let public = provider
+        .public_key_import(recipient_public.as_bytes(), DataEncoding::Armor)
+        .expect("import recipient key");
+    let message = provider
+        .new_encryptor()
+        .with_encryption_key(&public)
+        .with_utf8()
+        .with_compression()
+        .encrypt(text.as_bytes())
+        .expect("encrypt compressed body");
+    String::from_utf8(message.armor().expect("armor body")).expect("armor utf8")
+}
+
+struct RawPacketStream(Vec<u8>);
+
+impl proton_rpgp::pgp::ser::Serialize for RawPacketStream {
+    fn to_writer<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> proton_rpgp::pgp::errors::Result<()> {
+        writer.write_all(&self.0)?;
+        Ok(())
+    }
+
+    fn write_len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Build an encrypted message whose inline signature was produced over
+/// `signed_plaintext` but whose encrypted literal contains `plaintext`. The
+/// packet stream stays integrity-protected (valid SEIPD MDC), so decryption
+/// succeeds and the failure is specifically a bad signature over the data.
+fn encrypt_with_mismatched_signature(
+    recipient_public: &str,
+    signer: &GeneratedKey,
+    plaintext: &str,
+    signed_plaintext: &str,
+) -> String {
+    use proton_rpgp::pgp::{
+        armor,
+        bytes::Bytes,
+        composed::{Deserializable, SignedPublicKey, SignedSecretKey},
+        crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm},
+        packet::{
+            LiteralData, OnePassSignature, PublicKeyEncryptedSessionKey, SignatureConfig,
+            SignatureType, SymEncryptedProtectedData,
+        },
+        types::{KeyDetails, Password},
+    };
+
+    let (recipient, _) = SignedPublicKey::from_string(recipient_public).expect("recipient key");
+    let (signer_key, _) =
+        SignedSecretKey::from_string(&signer.stored.armored).expect("signer key");
+    let profile = proton_rpgp::Profile::default();
+    let session_key = SymmetricKeyAlgorithm::AES256.new_session_key(profile.rng());
+    let signature = SignatureConfig::v4(
+        SignatureType::Binary,
+        signer_key.primary_key.algorithm(),
+        HashAlgorithm::Sha256,
+    )
+    .sign(
+        &signer_key.primary_key,
+        &Password::from("synthetic-passphrase"),
+        signed_plaintext.as_bytes(),
+    )
+    .expect("sign different data");
+    let one_pass = OnePassSignature::v3(
+        SignatureType::Binary,
+        HashAlgorithm::Sha256,
+        signer_key.primary_key.algorithm(),
+        signer_key.primary_key.legacy_key_id(),
+    );
+    let literal = LiteralData::from_bytes("", Bytes::copy_from_slice(plaintext.as_bytes()))
+        .expect("literal packet");
+    use proton_rpgp::pgp::packet::PacketTrait;
+
+    let mut inner = Vec::new();
+    one_pass
+        .to_writer_with_header(&mut inner)
+        .expect("one-pass packet");
+    literal
+        .to_writer_with_header(&mut inner)
+        .expect("literal packet");
+    signature
+        .to_writer_with_header(&mut inner)
+        .expect("signature packet");
+    proton_rpgp::pgp::composed::Message::from_bytes(&inner[..])
+        .expect("inner signed packet stream parses");
+    let data_packet = SymEncryptedProtectedData::encrypt_seipdv1(
+        profile.rng(),
+        SymmetricKeyAlgorithm::AES256,
+        session_key.as_ref(),
+        &inner,
+    )
+    .expect("encrypt packet stream");
+    // The generated ECC identity signs with an EdDSA primary key and encrypts
+    // with its bound subkey, so wrap the session key to the encryption subkey.
+    let encryption_key = &recipient
+        .public_subkeys
+        .first()
+        .expect("recipient encryption subkey")
+        .key;
+    let key_packet = PublicKeyEncryptedSessionKey::from_session_key_v3(
+        profile.rng(),
+        &session_key,
+        SymmetricKeyAlgorithm::AES256,
+        encryption_key,
+    )
+    .expect("wrap session key");
+    let mut packets = Vec::new();
+    key_packet
+        .to_writer_with_header(&mut packets)
+        .expect("key packet");
+    data_packet
+        .to_writer_with_header(&mut packets)
+        .expect("data packet");
+    let mut armored = Vec::new();
+    armor::write(
+        &RawPacketStream(packets),
+        armor::BlockType::Message,
+        &mut armored,
+        None,
+        false,
+    )
+    .expect("armor message");
+    String::from_utf8(armored).expect("armored utf8")
 }
 
 fn message(
@@ -457,6 +595,64 @@ async fn unsigned_is_not_verified() {
 }
 
 #[tokio::test]
+async fn flagged_sender_key_is_not_verified() {
+    let me = generate_key("me@example.com");
+    let compromised = generate_key("compromised@example.com");
+    let no_sign = generate_key("no-sign@example.com");
+    let keys = key_store(vec![address_keys("address-1", "me@example.com", &[&me])]);
+
+    let mut state = MockState::default();
+    // Proton marks one key as compromised (missing NOT_COMPROMISED) and the
+    // other as no-sign. Neither may be used as a verifier.
+    state.sender_keys.insert(
+        "compromised@example.com".to_string(),
+        internal_keys(
+            "compromised@example.com",
+            &[(&compromised.public, key_flag::NOT_OBSOLETE)],
+        ),
+    );
+    state.sender_keys.insert(
+        "no-sign@example.com".to_string(),
+        internal_keys(
+            "no-sign@example.com",
+            &[(
+                &no_sign.public,
+                key_flag::NOT_COMPROMISED | key_flag::EMAIL_NO_SIGN,
+            )],
+        ),
+    );
+    for (id, sender, signer) in [
+        ("compromised-key", "compromised@example.com", &compromised),
+        ("no-sign-key", "no-sign@example.com", &no_sign),
+    ] {
+        state.messages.insert(
+            id.to_string(),
+            message(
+                id,
+                &encrypt_to(&me.public, Some(signer), "flagged signature body", false),
+                "text/plain",
+                "address-1",
+                sender,
+                1 << 3,
+                Vec::new(),
+            ),
+        );
+    }
+    let mock = ProtonMock::start(state).await;
+
+    for id in ["compromised-key", "no-sign-key"] {
+        let content = body(&mock, &keys, id).await.expect("flagged body");
+        assert_eq!(content.plain_text.as_deref(), Some("flagged signature body"));
+        assert_ne!(
+            content.signature,
+            SignatureStatus::Verified,
+            "{id} signed by an untrusted key must never verify"
+        );
+        assert_eq!(content.signature, SignatureStatus::Unverified);
+    }
+}
+
+#[tokio::test]
 async fn bad_signature_is_invalid() {
     let me = generate_key("me@example.com");
     let keys = key_store(vec![address_keys("address-1", "me@example.com", &[&me])]);
@@ -469,9 +665,14 @@ async fn bad_signature_is_invalid() {
         "invalid".to_string(),
         message(
             "invalid",
-            // A signature whose creation time is in the future fails
-            // verification while the data still decrypts.
-            &encrypt_to(&me.public, Some(&me), "tampered body", true),
+            // The packet integrity is valid, but the signature covers different
+            // data, so this is a real tampered-data signature failure.
+            &encrypt_with_mismatched_signature(
+                &me.public,
+                &me,
+                "tampered body",
+                "original body",
+            ),
             "text/plain",
             "address-1",
             "me@example.com",
@@ -622,7 +823,12 @@ async fn attachment_packet_integrity_failure_returns_error() {
         )
         .await
         .expect_err("a corrupted attachment packet must not return bytes");
-    assert_eq!(error.kind, ErrorKind::Unsupported);
+    assert_eq!(
+        error.kind,
+        ErrorKind::Transient,
+        "packet integrity failure must not be reported as an unsupported format"
+    );
+    assert_ne!(error.kind, ErrorKind::Unsupported);
 }
 
 #[tokio::test]
@@ -652,6 +858,45 @@ async fn oversize_plaintext_is_rejected_before_cache_growth() {
 }
 
 #[tokio::test]
+async fn compressed_oversize_is_rejected_before_materialization() {
+    let me = generate_key("me@example.com");
+    let keys = key_store(vec![address_keys("address-1", "me@example.com", &[&me])]);
+    // Highly compressible data far above the cap: the armored ciphertext stays
+    // small (well under the encrypted-input bound), so only a bounded
+    // decrypt/decompress step can reject it without allocating the full text.
+    let oversized = "A".repeat(BODY_CAP + 4 * 1024 * 1024);
+    let compressed = encrypt_to_compressed(&me.public, &oversized);
+    assert!(
+        compressed.len() < BODY_CAP,
+        "compressed ciphertext must be smaller than its expansion"
+    );
+    let mut state = MockState::default();
+    state.messages.insert(
+        "compressed-oversize".to_string(),
+        message(
+            "compressed-oversize",
+            &compressed,
+            "text/plain",
+            "address-1",
+            "me@example.com",
+            1 << 3,
+            Vec::new(),
+        ),
+    );
+    let mock = ProtonMock::start(state).await;
+
+    let error = body(&mock, &keys, "compressed-oversize")
+        .await
+        .expect_err("a decompression bomb must be rejected at the output cap");
+    assert_eq!(error.kind, ErrorKind::Unsupported);
+    assert!(
+        error.safe_message.contains("larger"),
+        "the reader should see a size-limit failure: {}",
+        error.safe_message
+    );
+}
+
+#[tokio::test]
 async fn html_still_passes_sanitizer() {
     let me = generate_key("me@example.com");
     let keys = key_store(vec![address_keys("address-1", "me@example.com", &[&me])]);
@@ -673,7 +918,16 @@ async fn html_still_passes_sanitizer() {
 
     let content = body(&mock, &keys, "html").await.expect("html body");
     let html = content.html.expect("adapter returns normalized HTML");
-    let rendered = format!("{:?}", pige_core::html::parse_html(&html, false));
+    let document = pige_core::html::parse_html(&html, false);
+    assert!(document.has_remote_images(), "the remote image must be retained as blocked content");
+    assert!(document.blocks.iter().any(|block| matches!(
+        block,
+        pige_core::html::Block::Image {
+            src: pige_core::html::ImageSource::Remote(url),
+            ..
+        } if url.contains("tracker.example")
+    )));
+    let rendered = format!("{document:?}");
     assert!(rendered.contains("Hello"));
     assert!(!rendered.contains("script"));
     assert!(!rendered.contains("alert"));
@@ -745,6 +999,31 @@ async fn contact_names_and_emails_sync_offline() {
         "only the proton.contacts source is populated"
     );
     drop(dir);
+}
+
+#[tokio::test]
+async fn empty_contact_page_before_total_is_transient() {
+    let me = generate_key("me@example.com");
+    let keys = key_store(vec![address_keys("address-1", "me@example.com", &[&me])]);
+    let state = MockState {
+        contacts: Vec::new(),
+        // The server still claims 1000 contacts, but page zero is empty: this
+        // is an offset shift, not a complete snapshot. Reporting completion
+        // would let R6 sweep the whole address book.
+        contact_total: Some(1000),
+        ..MockState::default()
+    };
+    let mock = ProtonMock::start(state).await;
+    let mut address_book = ProtonAddressBook::new(mock.client(keys));
+    let error = address_book
+        .next_page(
+            &ContactSourceId::new(SOURCE),
+            None,
+            &context(),
+        )
+        .await
+        .expect_err("an empty page before the reported total must not complete");
+    assert_eq!(error.kind, ErrorKind::Transient);
 }
 
 #[tokio::test]

@@ -70,6 +70,9 @@ jni = "0.21"
 # Enable the cfg-gated test-support surface for this package's own unit and
 # integration tests without compiling it into product builds.
 pige_core = { path = ".", features = ["provider-proton-test-support"] }
+# Low-level packet assembly for a tampered-signature fixture. Already in the
+# tree through proton-crypto; test-only here so product builds are unchanged.
+proton-rpgp = "0.9"
 rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"
 # Synthetic HTTP fixtures for the native Proton auth tests. This is a

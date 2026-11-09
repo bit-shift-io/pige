@@ -4724,6 +4724,7 @@ dependencies = [
  "pige_core",
  "proton-core",
  "proton-crypto",
+ "proton-rpgp",
  "proton-srp",
  "rand 0.9.5",
  "reqwest 0.12.28",

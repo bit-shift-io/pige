@@ -1,11 +1,13 @@
 //! Message body + attachment encryption/decryption.
 
+use std::io::Read;
+
 use super::keys::AddressKeys;
 use crate::error::{Error, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use proton_crypto::crypto::{
     DataEncoding, Decryptor, DecryptorSync, Encryptor, EncryptorSync, PGPMessage, PGPProviderSync,
-    SessionKeyAlgorithm, Signer, SignerSync, VerificationError, VerifiedData,
+    SessionKeyAlgorithm, Signer, SignerSync, VerificationError, VerifiedDataReader,
 };
 use zeroize::Zeroizing;
 
@@ -21,6 +23,80 @@ pub enum Verdict {
     Unverified,
     /// A signature was present but failed verification.
     Invalid,
+}
+
+/// A bounded decryption failure, classified so callers can keep an integrity
+/// failure distinct from an unsupported format or an over-limit payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecryptFailure {
+    /// The decrypted output exceeded the caller's limit before it was fully
+    /// materialized.
+    TooLarge {
+        /// The caller's plaintext byte cap.
+        limit: usize,
+    },
+    /// The encrypted packet stream was corrupt or failed its integrity check.
+    Integrity(String),
+    /// The ciphertext could not be decrypted with any supplied key (or used a
+    /// format this backend does not implement).
+    Crypto(String),
+}
+
+impl std::fmt::Display for DecryptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { limit } => {
+                write!(formatter, "decrypted data exceeds the {limit} byte limit")
+            }
+            Self::Integrity(detail) => {
+                write!(formatter, "encrypted data failed its integrity check: {detail}")
+            }
+            Self::Crypto(detail) => write!(formatter, "decryption failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for DecryptFailure {}
+
+impl From<DecryptFailure> for Error {
+    fn from(failure: DecryptFailure) -> Self {
+        match failure {
+            DecryptFailure::TooLarge { .. } => Error::Other(failure.to_string()),
+            DecryptFailure::Integrity(detail) | DecryptFailure::Crypto(detail) => {
+                Error::Crypto(detail)
+            }
+        }
+    }
+}
+
+/// Classify a rustpgp error string. The backend surfaces SEIPD/MDC failures as
+/// generic IO/decryption errors, so keep the integrity wording distinct from a
+/// format or key-selection failure.
+fn classify_crypto_error(error: impl std::fmt::Display) -> DecryptFailure {
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("modification detection") || lower.contains("mdc") {
+        DecryptFailure::Integrity(detail)
+    } else {
+        DecryptFailure::Crypto(detail)
+    }
+}
+
+/// Read at most `max_output + 1` bytes so an expanding (compressed) payload is
+/// rejected as soon as it crosses the cap instead of being fully materialized.
+fn read_bounded(
+    reader: &mut impl Read,
+    max_output: usize,
+) -> std::result::Result<Vec<u8>, DecryptFailure> {
+    let mut out = Vec::new();
+    let mut limited = reader.take((max_output as u64).saturating_add(1));
+    limited
+        .read_to_end(&mut out)
+        .map_err(|error| DecryptFailure::Integrity(error.to_string()))?;
+    if out.len() > max_output {
+        return Err(DecryptFailure::TooLarge { limit: max_output });
+    }
+    Ok(out)
 }
 
 /// A serialized session key (exported bytes + algorithm) so it can survive
@@ -87,8 +163,9 @@ pub fn decrypt_body_bounded<P: PGPProviderSync>(
     verify_pubs_armored: &[String],
     armored_body: &str,
     max_output: usize,
-) -> Result<(Vec<u8>, Verdict)> {
-    let privs = import_privs(provider, addr)?;
+) -> std::result::Result<(Vec<u8>, Verdict), DecryptFailure> {
+    let privs = import_privs(provider, addr)
+        .map_err(|error| DecryptFailure::Crypto(error.to_string()))?;
     let pubs: Vec<P::PublicKey> = verify_pubs_armored
         .iter()
         .filter_map(|a| {
@@ -104,26 +181,24 @@ pub fn decrypt_body_bounded<P: PGPProviderSync>(
     if have_verifier {
         dec = dec.with_verification_keys(pubs.iter());
     }
-    let verified = dec
-        .decrypt(armored_body.as_bytes(), DataEncoding::Armor)
-        .map_err(|e| Error::Crypto(format!("body decrypt failed: {e}")))?;
-    if verified.as_bytes().len() > max_output {
-        return Err(Error::Other(format!(
-            "decrypted body exceeds the {max_output} byte limit"
-        )));
-    }
+    let mut reader = dec
+        .decrypt_stream(armored_body.as_bytes(), DataEncoding::Armor)
+        .map_err(classify_crypto_error)?;
+    // The reader decrypts and decompresses on demand, so `take(max+1)` stops a
+    // compression bomb after one byte over the cap rather than materializing
+    // the whole expansion first.
+    let body = read_bounded(&mut reader, max_output)?;
 
     let verdict = if !have_verifier {
         Verdict::Unverified
     } else {
-        match verified.verification_result() {
+        match reader.verification_result() {
             Ok(_) => Verdict::Verified,
             Err(VerificationError::NotSigned(_)) => Verdict::Unsigned,
             Err(VerificationError::NoVerifier(_)) => Verdict::Unverified,
             Err(_) => Verdict::Invalid,
         }
     };
-    let body = verified.as_bytes().to_vec();
     tracing::debug!(target: "proton_core::crypto", verdict = ?verdict, plaintext_len = body.len(), "message body decrypted");
     Ok((body, verdict))
 }
@@ -136,7 +211,13 @@ pub fn decrypt_attachment<P: PGPProviderSync>(
     key_packets_b64: &str,
     data_packet: &[u8],
 ) -> Result<Vec<u8>> {
-    decrypt_attachment_bounded(provider, addr, key_packets_b64, data_packet, usize::MAX)
+    Ok(decrypt_attachment_bounded(
+        provider,
+        addr,
+        key_packets_b64,
+        data_packet,
+        usize::MAX,
+    )?)
 }
 
 /// Decrypt an attachment while refusing plaintext above `max_output` bytes.
@@ -146,28 +227,26 @@ pub fn decrypt_attachment_bounded<P: PGPProviderSync>(
     key_packets_b64: &str,
     data_packet: &[u8],
     max_output: usize,
-) -> Result<Vec<u8>> {
-    let privs = import_privs(provider, addr)?;
+) -> std::result::Result<Vec<u8>, DecryptFailure> {
+    let privs = import_privs(provider, addr)
+        .map_err(|error| DecryptFailure::Crypto(error.to_string()))?;
     tracing::debug!(target: "proton_core::crypto", address = %addr.email, data_packet = data_packet.len(), "decrypting attachment (unwrap session key → decrypt data packet)");
     let kp = STANDARD
         .decode(key_packets_b64)
-        .map_err(|e| Error::Crypto(format!("bad attachment key packet: {e}")))?;
+        .map_err(|e| DecryptFailure::Crypto(format!("bad attachment key packet: {e}")))?;
     let sk = provider
         .new_decryptor()
         .with_decryption_keys(privs.iter())
         .decrypt_session_key(&kp)
-        .map_err(|e| Error::Crypto(format!("attachment session key decrypt failed: {e}")))?;
-    let out = provider
+        .map_err(|e| DecryptFailure::Crypto(format!("attachment session key decrypt failed: {e}")))?;
+    let mut reader = provider
         .new_decryptor()
         .with_session_key(sk)
-        .decrypt(data_packet, DataEncoding::Bytes)
-        .map_err(|e| Error::Crypto(format!("attachment data decrypt failed: {e}")))?;
-    if out.as_bytes().len() > max_output {
-        return Err(Error::Other(format!(
-            "decrypted attachment exceeds the {max_output} byte limit"
-        )));
-    }
-    Ok(out.as_bytes().to_vec())
+        .decrypt_stream(data_packet, DataEncoding::Bytes)
+        .map_err(classify_crypto_error)?;
+    // Bound the decompressed attachment before materializing it, matching the
+    // body path so an encrypted attachment bomb cannot exhaust memory.
+    read_bounded(&mut reader, max_output)
 }
 
 /// Encrypt + sign a draft body to the sender's own address key (armored).
@@ -412,7 +491,7 @@ mod tests {
     use crate::crypto::keys::{AddressKeys, StoredKey};
     use proton_crypto::crypto::{
         AccessKeyInfo, KeyGenerator, KeyGeneratorAlgorithm, KeyGeneratorSync, PGPProviderSync,
-        SessionKey, Verifier, VerifierSync,
+        SessionKey, VerifiedData, Verifier, VerifierSync,
     };
     use secrecy::SecretString;
 

@@ -103,6 +103,10 @@ pub enum MessageBody {
     Document(MailDocument),
     /// The raw message exceeds the fetch cap and was not downloaded.
     TooLarge,
+    /// The body could not be fetched or decrypted. The string is the
+    /// provider's already-redacted reason, shown so the failure is not mistaken
+    /// for an empty message.
+    Failed(String),
 }
 
 /// One message inside a conversation.
