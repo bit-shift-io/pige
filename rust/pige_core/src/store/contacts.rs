@@ -324,12 +324,19 @@ impl Store {
 
         let key = contacts_job(&ctx.account, source);
         let mut cursor = checkpoint_cursor_in(&tx, &key)?;
-        let fresh = cursor.is_none() || state.complete;
+        // A refresh that has already started but has not committed its first
+        // page keeps the prior snapshot's `complete` flag. Otherwise an
+        // interrupted refresh would flip a synced source to "sync paused"
+        // before any new data was written. Resume the same generation so
+        // repeated starts before the first page do not bump it again.
+        let refresh_pending = state.snapshot_active && state.complete;
+        let fresh = !refresh_pending && (cursor.is_none() || state.complete);
         let (generation, scanned, complete, active) = if fresh {
             // A completed (or never-started) job starts a fresh generation.
             // Retire the finished snapshot's cursor so the first page of the
             // new generation is requested from no cursor. The previous
-            // generation's rows stay until this one completes.
+            // generation's rows stay until this one completes, and its
+            // `complete` flag stays visible until the first new page commits.
             if cursor.is_some() {
                 delete_checkpoint_in(&tx, &key)?;
                 cursor = None;
@@ -337,14 +344,14 @@ impl Store {
             (
                 state.snapshot_generation.saturating_add(1).max(1),
                 0,
-                false,
+                state.complete,
                 true,
             )
         } else {
             // A legacy checkpoint written before generations existed resumes
             // as generation 1 rather than sweeping rows as generation 0.
             let generation = state.snapshot_generation.max(1);
-            (generation, state.scanned, false, true)
+            (generation, state.scanned, state.complete, true)
         };
         tx.execute(
             "INSERT INTO contact_sources (account_id, source_id, display_name, kind)

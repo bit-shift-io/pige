@@ -301,7 +301,7 @@ fn recipient_suggestions_section<'a>(app: &'a App) -> Element<'a, Message> {
             account_details = account_details.push(styled(
                 format!(
                     "Contacts {}: {state} ({} contacts cached)",
-                    contact.source, contact.scanned
+                    contact.source, contact.cached
                 ),
                 TextRole::LabelMedium,
                 palette.on_surface_variant,

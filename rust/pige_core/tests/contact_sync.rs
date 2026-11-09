@@ -22,10 +22,11 @@ use pige_core::platform::fake::{
 };
 use pige_core::providers::fake::{FakeProviderFactory, FakeProviderSession, FakeServices};
 use pige_core::providers::{
-    ContactCapabilities, ContactChange, ContactPage, ContactRecord, ContactSourceId, ErrorKind,
-    HistoryCoverage, HistoryPage, MessageRecord, OperationContext, ProviderCapabilities,
-    ProviderCursor, ProviderError, ProviderFactory, ProviderSession, RemoteContactId,
-    RemoteMessageId,
+    BodyContent, ChangePage, CollectionRecord, ContactCapabilities, ContactChange, ContactPage,
+    ContactRecord, ContactSourceId, ErrorKind, HistoryCoverage, HistoryPage, HistoryRequest,
+    MailboxService, MessageRecord, OperationContext, ProviderCapabilities, ProviderCursor,
+    ProviderError, ProviderFactory, ProviderSession, RemoteAttachmentId, RemoteContactId,
+    RemoteMessageId, SyncRequest, SyncService,
 };
 use pige_core::store::contacts_job;
 use pige_core::sync::provider::WorkBudget;
@@ -911,8 +912,7 @@ async fn disabling_contact_sync_keeps_cached_contacts() {
 }
 
 #[tokio::test]
-async fn contacts_are_usable_offline_after_restart() {
-    let _guard = API_LOCK.lock().await;
+async fn contacts_are_usable_offline_after_restart() {    let _guard = API_LOCK.lock().await;
     let harness = ApiHarness::new(Arc::new(FakeProviderFactory::new()));
     let account = harness.add_account().await;
     let source = source("saved");
@@ -965,4 +965,356 @@ async fn contacts_are_usable_offline_after_restart() {
             .contains(&pige_core::contacts::SuggestionSource::SavedContact),
         "the restarted app must still know this address came from a saved address book"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance budget/cancellation regressions
+// ---------------------------------------------------------------------------
+
+/// A mail-sync service that blocks in the provider call until the operation is
+/// cancelled or its own deadline expires. This is how the tests observe whether
+/// the maintenance token/deadline actually reached the mail phase.
+struct BlockingSync {
+    entered: Arc<Notify>,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl SyncService for BlockingSync {
+    async fn next_page(
+        &mut self,
+        _request: SyncRequest,
+        ctx: &OperationContext,
+    ) -> Result<ChangePage, ProviderError> {
+        *self.calls.lock().unwrap() += 1;
+        self.entered.notify_one();
+        tokio::select! {
+            _ = ctx.cancellation.cancelled() => Err(ProviderError::cancelled("worker stopped")),
+            _ = tokio::time::sleep_until(ctx.deadline) => {
+                Err(ProviderError::transient("mail pass deadline"))
+            }
+        }
+    }
+}
+
+struct BlockingMailFactory {
+    entered: Arc<Notify>,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl BlockingMailFactory {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(Notify::new()),
+            calls: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderFactory for BlockingMailFactory {
+    async fn open(
+        &self,
+        _account: &Account,
+        _ctx: &OperationContext,
+    ) -> Result<ProviderSession, ProviderError> {
+        let capabilities = ProviderCapabilities {
+            sync: true,
+            ..ProviderCapabilities::default()
+        };
+        let mut session = ProviderSession::new(capabilities);
+        session.sync = Some(Box::new(BlockingSync {
+            entered: self.entered.clone(),
+            calls: self.calls.clone(),
+        }));
+        Ok(session)
+    }
+}
+
+#[tokio::test]
+async fn maintenance_deadline_bounds_mail_phase() {
+    let _guard = API_LOCK.lock().await;
+    let factory = Arc::new(BlockingMailFactory::new());
+    let entered = factory.entered.clone();
+    let calls = factory.calls.clone();
+    let harness = ApiHarness::new(factory);
+    let _account = harness.add_account().await;
+
+    let run = tokio::spawn(async move { api::run_maintenance(Duration::from_millis(120)).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("the mail phase must actually start");
+    let result = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("the pass deadline must bound the mail phase");
+    assert!(
+        result.is_ok(),
+        "a deadline stop is a normal pass exit"
+    );
+    assert_eq!(*calls.lock().unwrap(), 1, "the mail call was reached once");
+}
+
+#[tokio::test]
+async fn maintenance_cancel_reaches_mail_phase() {
+    let _guard = API_LOCK.lock().await;
+    let factory = Arc::new(BlockingMailFactory::new());
+    let entered = factory.entered.clone();
+    let calls = factory.calls.clone();
+    let harness = ApiHarness::new(factory);
+    let _account = harness.add_account().await;
+
+    let run = tokio::spawn(async move { api::run_maintenance(Duration::from_secs(20)).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("the mail phase must actually start");
+    api::cancel_maintenance();
+    let result = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("a WorkManager stop must reach the in-flight mail call");
+    assert!(
+        result.is_ok(),
+        "a WorkManager stop is a normal pass exit"
+    );
+    assert_eq!(*calls.lock().unwrap(), 1, "the mail call was reached once");
+}
+
+#[tokio::test]
+async fn maintenance_stop_before_token_install_is_honored() {
+    let _guard = API_LOCK.lock().await;
+    let factory = Arc::new(BlockingMailFactory::new());
+    let calls = factory.calls.clone();
+    let harness = ApiHarness::new(factory);
+    let _account = harness.add_account().await;
+
+    // WorkManager stops the worker before the native pass installs its token.
+    api::cancel_maintenance();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        api::run_maintenance(Duration::from_secs(20)),
+    )
+    .await
+    .expect("a pre-install stop must not wait for a full pass");
+    assert!(
+        result.is_ok(),
+        "a pre-install stop is a normal pass exit"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        0,
+        "a stopped pass must not start the mail phase"
+    );
+}
+
+/// Slow history: sleeps until the budget it was actually given, so a pass that
+/// hands history the whole deadline starves contacts.
+struct SlowHistory {
+    entered: Arc<Notify>,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl MailboxService for SlowHistory {
+    async fn collections(
+        &mut self,
+        _ctx: &OperationContext,
+    ) -> Result<Vec<CollectionRecord>, ProviderError> {
+        Err(ProviderError::unsupported("collections"))
+    }
+
+    async fn body(
+        &mut self,
+        _id: &RemoteMessageId,
+        _ctx: &OperationContext,
+    ) -> Result<BodyContent, ProviderError> {
+        Err(ProviderError::unsupported("body"))
+    }
+
+    async fn attachment(
+        &mut self,
+        _message: &RemoteMessageId,
+        _id: &RemoteAttachmentId,
+        _ctx: &OperationContext,
+    ) -> Result<Vec<u8>, ProviderError> {
+        Err(ProviderError::unsupported("attachment"))
+    }
+
+    async fn history(
+        &mut self,
+        _request: HistoryRequest,
+        ctx: &OperationContext,
+    ) -> Result<HistoryPage, ProviderError> {
+        *self.calls.lock().unwrap() += 1;
+        self.entered.notify_one();
+        tokio::time::sleep_until(ctx.deadline).await;
+        Err(ProviderError::transient("slow history"))
+    }
+}
+
+struct OnePageContacts {
+    entered: Arc<Notify>,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl pige_core::providers::AddressBookService for OnePageContacts {
+    async fn next_page(
+        &mut self,
+        _source: &ContactSourceId,
+        _cursor: Option<ProviderCursor>,
+        _ctx: &OperationContext,
+    ) -> Result<ContactPage, ProviderError> {
+        *self.calls.lock().unwrap() += 1;
+        self.entered.notify_one();
+        Ok(page(
+            vec![contact_change(
+                "share",
+                None,
+                &["share@example.com"],
+            )],
+            "c1",
+            false,
+        ))
+    }
+}
+
+struct SlowHistoryContactsFactory {
+    history_entered: Arc<Notify>,
+    history_calls: Arc<Mutex<usize>>,
+    contact_entered: Arc<Notify>,
+    contact_calls: Arc<Mutex<usize>>,
+}
+
+impl SlowHistoryContactsFactory {
+    fn new() -> Self {
+        Self {
+            history_entered: Arc::new(Notify::new()),
+            history_calls: Arc::new(Mutex::new(0)),
+            contact_entered: Arc::new(Notify::new()),
+            contact_calls: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderFactory for SlowHistoryContactsFactory {
+    async fn open(
+        &self,
+        _account: &Account,
+        _ctx: &OperationContext,
+    ) -> Result<ProviderSession, ProviderError> {
+        let capabilities = ProviderCapabilities {
+            mailbox: true,
+            contacts: ContactCapabilities {
+                read: true,
+                incremental_sync: true,
+                ..ContactCapabilities::default()
+            },
+            ..ProviderCapabilities::default()
+        };
+        let mut session = ProviderSession::new(capabilities);
+        session.mailbox = Some(Box::new(SlowHistory {
+            entered: self.history_entered.clone(),
+            calls: self.history_calls.clone(),
+        }));
+        session.address_book = Some(Box::new(OnePageContacts {
+            entered: self.contact_entered.clone(),
+            calls: self.contact_calls.clone(),
+        }));
+        Ok(session)
+    }
+}
+
+#[tokio::test]
+async fn contacts_get_budget_even_when_history_is_slow() {
+    let _guard = API_LOCK.lock().await;
+    let factory = Arc::new(SlowHistoryContactsFactory::new());
+    let history_entered = factory.history_entered.clone();
+    let history_calls = factory.history_calls.clone();
+    let contact_calls = factory.contact_calls.clone();
+    let harness = ApiHarness::new(factory);
+    let account = harness.add_account().await;
+    let source = source("saved");
+    api::set_contact_sync(&account, &source, true).expect("enable contacts");
+
+    let run = tokio::spawn(async move { api::run_maintenance(Duration::from_millis(300)).await });
+    tokio::time::timeout(Duration::from_secs(1), history_entered.notified())
+        .await
+        .expect("history must run before contacts");
+    let result = tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .expect("slow history must not consume the contact share");
+    assert!(
+        result.is_ok(),
+        "a budget exit is a normal pass exit"
+    );
+    assert!(*history_calls.lock().unwrap() > 0, "history ran");
+    assert!(
+        *contact_calls.lock().unwrap() > 0,
+        "contacts must still receive a slice after slow history"
+    );
+
+    let store = harness.open_store();
+    assert!(
+        has_contact(&store, &account, &source, "share@example.com"),
+        "the contact page committed despite the slow history phase"
+    );
+}
+
+#[tokio::test]
+async fn contact_refresh_preserves_completed_until_first_page() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+    let source = source("saved");
+
+    store
+        .upsert_contact_source(&account.id, &source, Some("Address book"))
+        .unwrap();
+    let mut initial = ScriptedContacts::new(vec![page(
+        vec![contact_change("one", None, &["one@example.com"])],
+        "c1",
+        false,
+    )]);
+    sync_slice(
+        &store,
+        &mut initial,
+        &source,
+        &context,
+        WorkBudget::with_timeout(100, 5, Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert!(store.contact_source_state(&account.id, &source).unwrap().complete);
+
+    // Starting the next generation must not flip a synced source to "paused"
+    // before any page of the refresh has committed.
+    let start = store.contact_sync_start(&context, &source).unwrap();
+    assert!(start.complete, "the prior completed snapshot stays visible");
+    let active = store.contact_source_state(&account.id, &source).unwrap();
+    assert!(active.complete && active.snapshot_active);
+    assert_eq!(start.generation, active.snapshot_generation);
+
+    // A second start before the first page resumes the same generation instead
+    // of allocating another one.
+    let again = store.contact_sync_start(&context, &source).unwrap();
+    assert_eq!(again.generation, start.generation);
+    assert!(again.complete);
+
+    // The first committed page is the point where progress becomes in-flight.
+    let mut partial = ScriptedContacts::new(vec![page(
+        vec![contact_change("two", None, &["two@example.com"])],
+        "c2",
+        true,
+    )]);
+    let progress = sync_slice(
+        &store,
+        &mut partial,
+        &source,
+        &context,
+        WorkBudget::with_timeout(100, 1, Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert!(!progress.complete);
+    assert!(!store.contact_source_state(&account.id, &source).unwrap().complete);
 }

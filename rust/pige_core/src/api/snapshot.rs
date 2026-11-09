@@ -30,8 +30,11 @@ pub struct AccountSummary {
 pub struct ContactSyncSummary {
     pub source: ContactSourceId,
     pub enabled: bool,
-    /// Contact records observed in the current/last full snapshot.
+    /// Contact records observed in the current/last full snapshot. This resets
+    /// when a new snapshot generation starts, so it is not a cache size.
     pub scanned: u64,
+    /// Distinct remote contacts currently cached for this source.
+    pub cached: u64,
     pub complete: bool,
 }
 

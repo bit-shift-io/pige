@@ -15,7 +15,7 @@ pub mod mutations;
 pub mod snapshot;
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -37,8 +37,8 @@ use crate::mail::{
 };
 use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
 use crate::providers::{
-    OperationContext, ProviderCapabilities, ProviderFactory, RemoteAttachmentId,
-    imap::ImapSubmission,
+    ContactSourceId, OperationContext, ProviderCapabilities, ProviderFactory, RemoteAttachmentId,
+    RemoteContactId, imap::ImapSubmission,
 };
 use crate::search::{SearchHit, SearchScope};
 use crate::send::{
@@ -437,12 +437,30 @@ impl AppState {
                 });
             }
 
+            // `scanned` resets with each snapshot generation and counts page
+            // changes, so show the actual distinct cached contacts instead.
+            let mut cached_contacts: HashMap<ContactSourceId, HashSet<RemoteContactId>> =
+                HashMap::new();
+            for cached in self
+                .store
+                .contact_emails(&section.account.id)
+                .unwrap_or_default()
+            {
+                cached_contacts
+                    .entry(cached.source)
+                    .or_default()
+                    .insert(cached.remote_contact);
+            }
+
             let mut contact_sources = self
                 .store
                 .contact_source_states(&section.account.id)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(source, state)| ContactSyncSummary {
+                    cached: cached_contacts
+                        .get(&source)
+                        .map_or(0, |contacts| contacts.len() as u64),
                     source,
                     enabled: state.enabled,
                     scanned: state.scanned,
@@ -455,6 +473,9 @@ impl AppState {
                     .any(|summary| summary.source == configured.id)
                 {
                     contact_sources.push(ContactSyncSummary {
+                        cached: cached_contacts
+                            .get(&configured.id)
+                            .map_or(0, |contacts| contacts.len() as u64),
                         source: configured.id.clone(),
                         enabled: configured.enabled,
                         scanned: 0,
@@ -558,6 +579,12 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
 #[doc(hidden)]
 pub fn reset_for_tests() {
     *lock_state() = None;
+    // A test must not inherit a stopped worker from an earlier test.
+    let mut gate = MAINTENANCE_CANCEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gate.token = None;
+    gate.stop_pending = false;
 }
 
 fn database_path(data_dir: &Path) -> PathBuf {
@@ -890,20 +917,109 @@ pub async fn learn_history_now(account: &AccountId) -> Result<LearningProgress, 
 
 /// The cancellation token of the currently running native maintenance slice.
 /// WorkManager's `onStopped` cancels this through [`cancel_maintenance`].
-static MAINTENANCE_CANCEL: Mutex<Option<Arc<CancellationToken>>> = Mutex::new(None);
+///
+/// `stop_pending` closes the race where a worker is stopped before its pass has
+/// installed a token: the next pass consumes the flag and exits immediately
+/// instead of running a full budget that the OS already cancelled.
+#[derive(Default)]
+struct MaintenanceGate {
+    token: Option<Arc<CancellationToken>>,
+    stop_pending: bool,
+}
+
+static MAINTENANCE_CANCEL: Mutex<MaintenanceGate> = Mutex::new(MaintenanceGate {
+    token: None,
+    stop_pending: false,
+});
 
 /// Stop the current [`run_maintenance`] slice.
 ///
-/// Cancellation is observed between contact pages and during a provider call,
-/// so the last committed page and its checkpoint survive. This is the bridge
-/// used by Android when WorkManager stops the worker; it is safe to call with
-/// no maintenance running.
+/// Cancellation is observed during the mail/outbox phase as well as between
+/// contact/history pages, so the last committed page and its checkpoint
+/// survive. This is the bridge used by Android when WorkManager stops the
+/// worker; it is safe to call with no maintenance running.
 pub fn cancel_maintenance() {
-    let guard = MAINTENANCE_CANCEL
+    let mut guard = MAINTENANCE_CANCEL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(token) = guard.as_ref() {
-        token.cancel();
+    match guard.token.as_ref() {
+        Some(token) => token.cancel(),
+        // No pass is running yet. Remember the stop so the pass that WorkManager
+        // is about to start does not do a full budget of work first.
+        None => guard.stop_pending = true,
+    }
+}
+
+/// Cancellation and wall-clock scope for one maintenance pass.
+///
+/// The default (no deadline, no token) is an ordinary interactive sync: every
+/// account keeps its own [`SYNC_TIMEOUT`]. A maintenance pass supplies both so
+/// one slow account cannot outlive the worker's budget and a stop during the
+/// mail phase is observed by the provider call itself, not after it returns.
+#[derive(Clone, Default)]
+struct SyncBounds {
+    deadline: Option<tokio::time::Instant>,
+    cancel: Option<Arc<CancellationToken>>,
+}
+
+impl SyncBounds {
+    fn new(deadline: tokio::time::Instant, cancel: Arc<CancellationToken>) -> Self {
+        Self {
+            deadline: Some(deadline),
+            cancel: Some(cancel),
+        }
+    }
+
+    /// Whether the pass has been stopped or has reached its overall deadline.
+    fn stopped(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_cancelled())
+            || self
+                .deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }
+
+    /// Bounded passes run mail/outbox only; history gets its own reserved slice
+    /// after the mail phase instead of being learned twice.
+    fn is_bounded(&self) -> bool {
+        self.deadline.is_some() || self.cancel.is_some()
+    }
+
+    /// The timeout for one account operation, capped by the pass deadline.
+    fn remaining(&self, cap: std::time::Duration) -> std::time::Duration {
+        match self.deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(cap),
+            None => cap,
+        }
+    }
+
+    /// Combine the maintenance stop with the account's generation cancellation.
+    /// The returned guard cancels the listener task on drop, including early
+    /// returns, so a background context never outlives its pass.
+    fn context_with_cancel(
+        &self,
+        ctx: OperationContext,
+    ) -> (OperationContext, Option<CancelListener>) {
+        match &self.cancel {
+            Some(cancel) => {
+                let (ctx, listener) = with_maintenance_cancel(ctx, cancel);
+                (ctx, Some(CancelListener(listener)))
+            }
+            None => (ctx, None),
+        }
+    }
+}
+
+/// Cancels a combined account/maintenance listener token when its account
+/// operation finishes, so the spawned listener neither lingers nor leaks.
+struct CancelListener(CancellationToken);
+
+impl Drop for CancelListener {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -920,46 +1036,59 @@ pub async fn run_maintenance(budget: std::time::Duration) -> Result<(), String> 
     }
     let token = Arc::new(CancellationToken::new());
     {
-        let mut guard = MAINTENANCE_CANCEL
+        let mut gate = MAINTENANCE_CANCEL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(previous) = guard.replace(token.clone()) {
+        if let Some(previous) = gate.token.replace(token.clone()) {
             // A newer maintenance pass supersedes an older one; the older
             // slice exits with its last committed checkpoint.
             previous.cancel();
         }
+        if std::mem::take(&mut gate.stop_pending) {
+            // WorkManager stopped the worker before this pass installed its
+            // token. Honour that stop instead of running a full budget.
+            token.cancel();
+        }
     }
     let deadline = tokio::time::Instant::now() + budget;
-    let result = run_maintenance_inner(deadline, token.clone()).await;
+    let bounds = SyncBounds::new(deadline, token.clone());
+    let result = run_maintenance_inner(&bounds, token.clone()).await;
     // Release the listener tasks and make a late cancel a no-op.
     token.cancel();
     {
-        let mut guard = MAINTENANCE_CANCEL
+        let mut gate = MAINTENANCE_CANCEL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard
+        if gate
+            .token
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &token))
         {
-            *guard = None;
+            gate.token = None;
         }
     }
     result
 }
 
 async fn run_maintenance_inner(
-    deadline: tokio::time::Instant,
+    bounds: &SyncBounds,
     cancel: Arc<CancellationToken>,
 ) -> Result<(), String> {
+    let deadline = bounds.deadline.unwrap_or_else(tokio::time::Instant::now);
+
     // Interactive mail and outbox delivery keep priority over local learning.
-    // Their own account deadlines still bound a stopped worker.
-    if !cancel.is_cancelled()
-        && let Err(error) = sync_all().await
-    {
-        log::warn!("maintenance mail sync: {error}");
+    // The pass deadline and stop token reach every account context, and the
+    // outer timeout is a hard backstop if an adapter ignores its context.
+    if !bounds.stopped() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, sync_all_with_bounds(bounds)).await {
+            Ok(Err(error)) => log::warn!("maintenance mail sync: {error}"),
+            Ok(Ok(_)) => {}
+            Err(_) => log::debug!("maintenance mail phase reached the pass budget"),
+        }
     }
 
-    if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+    if bounds.stopped() {
         return Ok(());
     }
 
@@ -981,21 +1110,50 @@ async fn run_maintenance_inner(
         )
     };
 
+    // Resolve the enabled contact sources first. If any exist, reserve half of
+    // the remaining pass for them: history resumes from a durable cursor, so a
+    // starving history crawl must not consume the only budget contacts get.
+    let contact_targets: Vec<(&Account, &crate::providers::ContactSourceId)> = accounts
+        .iter()
+        .flat_map(|account| {
+            account
+                .contact_sources
+                .iter()
+                .filter(|configured| configured.enabled)
+                .filter(|configured| {
+                    store
+                        .contact_source_state(&account.id, &configured.id)
+                        .is_ok_and(|state| state.enabled)
+                })
+                .map(move |configured| (account, &configured.id))
+        })
+        .collect();
+
+    let now = tokio::time::Instant::now();
+    let mut history_deadline = deadline;
+    if !contact_targets.is_empty() && now < deadline {
+        history_deadline = now + (deadline - now) / 2;
+    }
+
     // One bounded history slice per account, then one contact slice per enabled
-    // source. Both resume from their durable cursors on the next pass.
+    // source. Both resume from their durable cursors on the next pass. History
+    // may use its reserved share only; unused time falls through to contacts.
     for account in &accounts {
-        if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+        if cancel.is_cancelled() {
             return Ok(());
         }
-        let remaining = deadline - tokio::time::Instant::now();
+        if tokio::time::Instant::now() >= history_deadline {
+            break;
+        }
+        let remaining = history_deadline.saturating_duration_since(tokio::time::Instant::now());
         let Ok(ctx) = sessions.context(&account.id, remaining) else {
             continue;
         };
-        let (ctx, listener) = with_maintenance_cancel(ctx, &cancel);
+        let (ctx, _listener) = bounds.context_with_cancel(ctx);
         let budget = WorkBudget::new(
             crate::sync::history::HISTORY_PAGE_SIZE,
             crate::sync::history::HISTORY_MAX_PAGES,
-            deadline,
+            history_deadline,
         );
         match crate::sync::history::learn_account_slice(
             &store,
@@ -1019,75 +1177,67 @@ async fn run_maintenance_inner(
                 error.safe_message
             ),
         }
-        listener.cancel();
     }
 
-    for account in &accounts {
-        for configured in &account.contact_sources {
-            if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                return Ok(());
-            }
-            if !configured.enabled {
-                continue;
-            }
-            let source = &configured.id;
-            let Ok(state) = store.contact_source_state(&account.id, source) else {
-                continue;
-            };
-            if !state.enabled {
-                continue;
-            }
-            let remaining = deadline - tokio::time::Instant::now();
-            let Ok(ctx) = sessions.context(&account.id, remaining) else {
-                continue;
-            };
-            let (ctx, listener) = with_maintenance_cancel(ctx, &cancel);
-            let mut session = match config.providers.open(account, &ctx).await {
-                Ok(session) => session,
-                Err(error) => {
-                    log::debug!(
-                        "maintenance contacts for {}: {}",
-                        account.label,
-                        error.safe_message
-                    );
-                    listener.cancel();
-                    continue;
-                }
-            };
-            let Ok(service) = session.address_book_service() else {
-                listener.cancel();
-                continue;
-            };
-            let budget = WorkBudget::new(
-                crate::contacts::sync::CONTACTS_PAGE_SIZE,
-                crate::contacts::sync::CONTACTS_MAX_PAGES,
-                deadline,
-            );
-            match crate::contacts::sync::sync_slice_paged(
-                &store,
-                service.as_mut(),
-                source,
-                &ctx,
-                budget,
-                &scheduler,
-            )
-            .await
-            {
-                Ok(progress) => {
-                    let _ = sender.send(CoreEvent::ContactSyncProgress {
-                        account: account.id.clone(),
-                        source: source.clone(),
-                        scanned: progress.scanned,
-                        complete: progress.complete,
-                    });
-                }
-                Err(error) => log::debug!(
-                    "maintenance contacts for {} / {source}: {}",
+    for (account, source) in contact_targets {
+        if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        // Re-read under the pass: a disable or a permission failure may have
+        // landed while history was running.
+        let Ok(state) = store.contact_source_state(&account.id, source) else {
+            continue;
+        };
+        if !state.enabled {
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(ctx) = sessions.context(&account.id, remaining) else {
+            continue;
+        };
+        let (ctx, _listener) = bounds.context_with_cancel(ctx);
+        let mut session = match config.providers.open(account, &ctx).await {
+            Ok(session) => session,
+            Err(error) => {
+                log::debug!(
+                    "maintenance contacts for {}: {}",
                     account.label,
                     error.safe_message
-                ),
+                );
+                continue;
             }
-            listener.cancel();
+        };
+        let Ok(service) = session.address_book_service() else {
+            continue;
+        };
+        let budget = WorkBudget::new(
+            crate::contacts::sync::CONTACTS_PAGE_SIZE,
+            crate::contacts::sync::CONTACTS_MAX_PAGES,
+            deadline,
+        );
+        match crate::contacts::sync::sync_slice_paged(
+            &store,
+            service.as_mut(),
+            source,
+            &ctx,
+            budget,
+            &scheduler,
+        )
+        .await
+        {
+            Ok(progress) => {
+                let _ = sender.send(CoreEvent::ContactSyncProgress {
+                    account: account.id.clone(),
+                    source: source.clone(),
+                    scanned: progress.scanned,
+                    complete: progress.complete,
+                });
+            }
+            Err(error) => log::debug!(
+                "maintenance contacts for {} / {source}: {}",
+                account.label,
+                error.safe_message
+            ),
         }
     }
 
@@ -1943,6 +2093,15 @@ fn delete_secret(state: &AppState, id: &AccountId, target: SecretTarget) -> Resu
 /// Sync every account. One failing account emits an error but never stops the
 /// others; unread rollups in the returned snapshot cover all of them.
 pub async fn sync_all() -> Result<ModelSnapshot, String> {
+    sync_all_with_bounds(&SyncBounds::default()).await
+}
+
+/// Sync every account within an optional overall deadline and stop token.
+///
+/// The public [`sync_all`] passes the default (interactive) bounds; background
+/// maintenance supplies both so a per-account `SYNC_TIMEOUT` cannot outlive the
+/// pass and a WorkManager stop reaches the in-flight provider call.
+async fn sync_all_with_bounds(bounds: &SyncBounds) -> Result<ModelSnapshot, String> {
     let _sync = SYNC_LOCK.lock().await;
     let (config, sessions, scheduler, accounts, sender) = {
         let mut guard = lock_state();
@@ -1963,12 +2122,15 @@ pub async fn sync_all() -> Result<ModelSnapshot, String> {
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
     let (outcome, capabilities) =
-        sync_accounts(&config, &sessions, &scheduler, &accounts, &sender).await;
+        sync_accounts(&config, &sessions, &scheduler, &accounts, &sender, bounds).await;
 
     let status = finish_sync(accounts.len(), outcome, capabilities);
     // The account sync never visits non-special folders; if one is open,
-    // refresh it too so manual refresh and pull-to-refresh update the view.
-    if let Some(folder) = selected_other_folder()
+    // refresh it too so manual refresh and pull-to-refresh update the view. A
+    // bounded maintenance pass skips it: its budget belongs to learning, and
+    // the visible folder is refreshed by the next interactive sync.
+    if !bounds.is_bounded()
+        && let Some(folder) = selected_other_folder()
         && let Err(error) = sync_folder_inner(&folder).await
     {
         log::warn!("refresh open folder {}: {error}", folder);
@@ -2009,8 +2171,15 @@ pub async fn sync_account(id: &AccountId) -> Result<ModelSnapshot, String> {
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
     let accounts = std::slice::from_ref(&account);
-    let (outcome, capabilities) =
-        sync_accounts(&config, &sessions, &scheduler, accounts, &sender).await;
+    let (outcome, capabilities) = sync_accounts(
+        &config,
+        &sessions,
+        &scheduler,
+        accounts,
+        &sender,
+        &SyncBounds::default(),
+    )
+    .await;
 
     let status = finish_sync(accounts.len(), outcome, capabilities);
     let snapshot = snapshot();
@@ -3383,6 +3552,7 @@ async fn sync_accounts(
     scheduler: &AccountScheduler,
     accounts: &[Account],
     sender: &broadcast::Sender<CoreEvent>,
+    bounds: &SyncBounds,
 ) -> (SyncOutcome, Vec<(AccountId, ProviderCapabilities)>) {
     let store = match Store::open(database_path(&config.data_dir)) {
         Ok(store) => store,
@@ -3418,11 +3588,14 @@ async fn sync_accounts(
     let mut capabilities = Vec::new();
 
     for account in accounts {
+        if bounds.stopped() {
+            break;
+        }
         let _ = sender.send(CoreEvent::SyncStarted {
             account: account.id.clone(),
         });
 
-        match sync_one(&store, config, sessions, scheduler, account, sender).await {
+        match sync_one(&store, config, sessions, scheduler, account, sender, bounds).await {
             Ok(caps) => {
                 outcome.succeeded += 1;
                 capabilities.push((account.id.clone(), caps));
@@ -3451,12 +3624,19 @@ async fn sync_one(
     scheduler: &AccountScheduler,
     account: &Account,
     sender: &broadcast::Sender<CoreEvent>,
+    bounds: &SyncBounds,
 ) -> Result<ProviderCapabilities, String> {
-    // A missing or cancelled session means the account was removed or
-    // invalidated; report it as an unreachable account rather than syncing.
-    let Ok(ctx) = sessions.context(&account.id, SYNC_TIMEOUT) else {
+    // A bounded pass caps this account's context at the pass deadline instead
+    // of the interactive 60s. A missing or cancelled session means the account
+    // was removed or invalidated; report it as unreachable rather than syncing.
+    let timeout = bounds.remaining(SYNC_TIMEOUT);
+    if timeout.is_zero() {
+        return Err(format!("{}: {RECONNECT_ERROR}", account.label));
+    }
+    let Ok(ctx) = sessions.context(&account.id, timeout) else {
         return Err(format!("{}: {RECONNECT_ERROR}", account.label));
     };
+    let (ctx, _listener) = bounds.context_with_cancel(ctx);
 
     // The whole remote-read/apply sequence holds the account's gate so a
     // concurrent mutation for the same account cannot interleave it, and a late
@@ -3503,11 +3683,15 @@ async fn sync_one(
 
     // After the visible-window sync, learn one bounded slice of header history
     // using the session that is already open, so background learning never
-    // amplifies provider connections. The interactive gate is released now;
-    // the paged history path re-takes it per page and yields between pages.
-    // History never inserts headers into the visible mailbox cache or notifies,
-    // and a history failure must not fail the user-visible sync.
-    if capabilities.mailbox
+    // amplifies provider connections. A bounded maintenance pass skips this:
+    // it runs its own reserved history slice after the mail phase, so doing it
+    // here would spend the contact budget twice. The interactive gate is
+    // released now; the paged history path re-takes it per page and yields
+    // between pages. History never inserts headers into the visible mailbox
+    // cache or notifies, and a history failure must not fail the user-visible
+    // sync.
+    if !bounds.is_bounded()
+        && capabilities.mailbox
         && let Some(mailbox) = session.mailbox.as_mut()
         && let Ok(history_ctx) =
             sessions.context(&account.id, crate::sync::history::HISTORY_SLICE_TIMEOUT)

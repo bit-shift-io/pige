@@ -218,9 +218,12 @@ async fn sync(
 }
 
 fn store_error(error: StoreError) -> ProviderError {
+    // A stale generation/checkpoint means another writer moved the source while
+    // this slice was in flight. That is a retryable race, not a credential
+    // problem: re-authenticating would be misleading and would not fix it.
     match error {
         StoreError::StaleGeneration { .. } | StoreError::StaleCheckpoint { .. } => {
-            ProviderError::reauthenticate(format!("contact store: {error}"))
+            ProviderError::transient(format!("contact store: {error}"))
         }
         _ => ProviderError::transient(format!("contact store: {error}")),
     }

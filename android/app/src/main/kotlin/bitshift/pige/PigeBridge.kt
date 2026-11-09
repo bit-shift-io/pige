@@ -241,7 +241,12 @@ object PigeBridge {
     /// worker never corrupts local state and the next run resumes.
     @JvmStatic
     fun cancelMaintenance() {
-        nativeCancelMaintenance()
+        try {
+            nativeCancelMaintenance()
+        } catch (_: UnsatisfiedLinkError) {
+            // WorkManager can call onStopped before doWork has loaded the native
+            // library on a cold start. There is no native slice to stop then.
+        }
     }
 
     @JvmStatic
