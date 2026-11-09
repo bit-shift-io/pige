@@ -108,6 +108,20 @@ pub enum StoreError {
     /// violation) is never reported as `StalePage`.
     #[error("a change page based on an outdated checkpoint was discarded")]
     StalePage,
+    /// A learning page carried an epoch older than the account's durable
+    /// learning epoch: clear, rebuild, pause, or resume happened while it was in
+    /// flight. The page must be discarded rather than resurrect forgotten
+    /// suggestions.
+    #[error("learning epoch {expected} is stale (current epoch is {actual})")]
+    StaleLearningEpoch { expected: u64, actual: u64 },
+    /// Learning is explicitly paused for the account, so no ingestion path may
+    /// write evidence or advance a crawl checkpoint.
+    #[error("recipient learning is paused")]
+    LearningPaused,
+    /// Clear disabled automatic `ExistingCache`/`History` ingestion until an
+    /// explicit rebuild re-enables it.
+    #[error("automatic recipient learning is disabled")]
+    LearningDisabled,
     /// Another process holds the account's cross-process lease.
     #[error("account is busy with another operation")]
     LeaseHeld,

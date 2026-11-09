@@ -156,6 +156,7 @@ pub fn learning_progress(
     account: &crate::account::AccountId,
 ) -> Result<LearningProgress, ProviderError> {
     let state = store.history_state(account).map_err(store_error)?;
+    let learning = store.learning_state(account).map_err(store_error)?;
     Ok(LearningProgress {
         scanned: state.progress.scanned,
         total_hint: state.progress.total_hint,
@@ -163,7 +164,11 @@ pub fn learning_progress(
         // `paused` is the durable "stopped with more remaining" flag, not just
         // the complement of `complete`: an in-flight/not-yet-started crawl is
         // not paused, and a completed crawl is neither paused nor incomplete.
-        paused: state.progress.paused && !state.progress.complete,
+        // An explicit learning pause or a clear-disabled crawl also reports
+        // paused so the UI never implies automatic learning is still running.
+        paused: (state.progress.paused && !state.progress.complete)
+            || learning.paused
+            || learning.history_disabled,
     })
 }
 
@@ -176,6 +181,16 @@ async fn learn(
 ) -> Result<LearningProgress, ProviderError> {
     let key = history_job(&ctx.account);
     let state = store.history_state(&ctx.account).map_err(store_error)?;
+    let learning = store.learning_state(&ctx.account).map_err(store_error)?;
+    if learning.paused || learning.history_disabled {
+        return Ok(LearningProgress {
+            scanned: state.progress.scanned,
+            total_hint: state.progress.total_hint,
+            complete: state.progress.complete,
+            paused: true,
+        });
+    }
+    let epoch = learning.epoch;
     if state.progress.complete {
         return Ok(LearningProgress {
             scanned: state.progress.scanned,
@@ -247,6 +262,13 @@ async fn learn(
         // Re-read the cursor under the gate: it is both the request cursor and
         // the expected-previous value of this page's compare-and-set.
         let stored = store.job_checkpoint(&key).map_err(store_error)?;
+        // Clear/rebuild/pause may have happened while the previous page was in
+        // flight. Stop before issuing more network work under an old epoch.
+        let current = store.learning_state(&ctx.account).map_err(store_error)?;
+        if current.paused || current.history_disabled || current.epoch != epoch {
+            drop(gate);
+            break;
+        }
         let request = HistoryRequest {
             cursor: if pending_reset { None } else { stored.clone() },
             page_size,
@@ -318,12 +340,19 @@ async fn learn(
             },
         };
 
-        match store.apply_history_page(ctx, stored.as_ref(), &page) {
+        match store.apply_history_page_at_epoch(ctx, epoch, stored.as_ref(), &page) {
             Ok(()) => {}
             // Another writer advanced the history checkpoint while this page
-            // was in flight. Discard the page; the next slice reconciles from
-            // whatever is durable now.
-            Err(StoreError::StalePage) => {
+            // was in flight, or the learning epoch moved (clear/rebuild/pause).
+            // Discard the page; the next slice reconciles from whatever is
+            // durable now.
+            Err(StoreError::StalePage | StoreError::StaleLearningEpoch { .. }) => {
+                drop(gate);
+                break;
+            }
+            // Clear or pause landed while the page was being fetched. The page
+            // must not be recorded at all.
+            Err(StoreError::LearningPaused | StoreError::LearningDisabled) => {
                 drop(gate);
                 break;
             }

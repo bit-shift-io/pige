@@ -61,6 +61,15 @@ pub struct LearningState {
     /// Last cached `messages.id` learned by the ExistingCache backfill.
     pub existing_cache_cursor: Option<MessageId>,
     pub updated_at: i64,
+    /// Monotonic fence for crawl pages. Clear, rebuild, pause, and resume bump
+    /// it so a page produced under an older epoch cannot commit.
+    pub epoch: u64,
+    /// The user's persistent pause switch. Existing suggestions are untouched.
+    pub paused: bool,
+    /// Clear disabled the provider history crawl until an explicit rebuild.
+    pub history_disabled: bool,
+    /// Clear disabled the local ExistingCache backfill until an explicit rebuild.
+    pub cache_backfill_disabled: bool,
 }
 
 /// Restart-safe progress of the provider header-history crawl.
@@ -163,15 +172,215 @@ impl Store {
     /// matches the durable checkpoint is rejected with [`StoreError::StalePage`]
     /// and neither its observations nor its checkpoint are applied. Pass `None`
     /// for the very first page.
+    ///
+    /// This convenience form stamps the page with the *current* learning epoch.
+    /// A crawl that fetched its page before a clear/rebuild/pause must call
+    /// [`Self::apply_history_page_at_epoch`] with the epoch it captured instead.
     pub fn apply_history_page(
         &self,
         ctx: &OperationContext,
         expected_previous: Option<&ProviderCursor>,
         page: &HistoryPage,
     ) -> Result<(), StoreError> {
+        let epoch = self.learning_epoch(&ctx.account)?;
+        self.apply_history_page_at_epoch(ctx, epoch, expected_previous, page)
+    }
+
+    /// Learn up to `limit` already-cached messages that have not yet been
+    /// backfilled, then durably advance the local cursor.
+    ///
+    /// The cursor is a `messages.id` stored in `contact_learning_state`, so a
+    /// crash before commit replays the same batch and a restart resumes after
+    /// the last committed row. `ExistingCache` reads cached headers only, so it
+    /// learns From/To/Cc; `Reply-To` and `Bcc` are not persisted by F5 and are
+    /// deliberately excluded here (provider history/live sync still see them).
+    ///
+    /// Clear disables this path until an explicit rebuild, and pause stops it.
+    /// A backfill that captured an older epoch must use
+    /// [`Self::learn_existing_cache_page_at_epoch`].
+    pub fn learn_existing_cache_page(
+        &self,
+        ctx: &OperationContext,
+        limit: u32,
+    ) -> Result<ExistingCachePage, StoreError> {
+        let epoch = self.learning_epoch(&ctx.account)?;
+        self.learn_existing_cache_page_at_epoch(ctx, limit, epoch)
+    }
+
+    /// Epoch-fenced form of [`Self::learn_existing_cache_page`].
+    pub fn learn_existing_cache_page_at_epoch(
+        &self,
+        ctx: &OperationContext,
+        limit: u32,
+        expected_epoch: u64,
+    ) -> Result<ExistingCachePage, StoreError> {
+        let limit = limit.max(1);
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        let state = learning_state_in(&tx, &ctx.account)?;
+        check_learning_write_in(&state, expected_epoch)?;
+        if state.cache_backfill_disabled {
+            return Err(StoreError::LearningDisabled);
+        }
+
+        let after = state.existing_cache_cursor.clone();
+        let mut messages =
+            cached_messages_after_on(&tx, &ctx.account, after.as_ref(), limit.saturating_add(1))?;
+        let has_more = messages.len() > limit as usize;
+        messages.truncate(limit as usize);
+
+        for message in &messages {
+            let observations =
+                learn::observe_cached_message(&ctx.account, &message.header, message.flags.draft);
+            let fingerprint = learn::header_fingerprint(&message.header);
+            let evidence = EvidenceId::for_local(&message.id);
+            record_observations_in(
+                &tx,
+                &ctx.account,
+                &evidence,
+                LearningOrigin::ExistingCache,
+                Some(&fingerprint),
+                &observations,
+            )?;
+        }
+
+        let next_cursor = messages
+            .last()
+            .map(|message| message.id.0.clone())
+            .or_else(|| state.existing_cache_cursor.map(|cursor| cursor.0));
+        tx.execute(
+            "INSERT INTO contact_learning_state (account_id, existing_cache_cursor, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 existing_cache_cursor = excluded.existing_cache_cursor,
+                 updated_at = excluded.updated_at",
+            params![ctx.account.0, next_cursor, now_unix()],
+        )?;
+        tx.commit()?;
+
+        Ok(ExistingCachePage {
+            scanned: messages.len() as u32,
+            has_more,
+        })
+    }
+
+    /// Current learning epoch for one account. Bumped by clear, rebuild, and
+    /// pause/resume so a crawl that started earlier cannot commit.
+    pub fn learning_epoch(&self, account: &AccountId) -> Result<u64, StoreError> {
+        Ok(self.learning_state(account)?.epoch)
+    }
+
+    /// Pause or resume all learning ingestion for one account.
+    ///
+    /// Pausing keeps every existing suggestion and leaves the history
+    /// checkpoint in place so a resume continues where it stopped. Both edges
+    /// advance the learning epoch: a page that was already in flight must not
+    /// commit while paused, nor immediately after a resume.
+    pub fn pause_learning(&self, account: &AccountId, paused: bool) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        ensure_learning_state_in(&tx, account)?;
+        tx.execute(
+            "UPDATE contact_learning_state
+             SET learning_paused = ?2,
+                 learning_epoch = learning_epoch + 1,
+                 updated_at = ?3
+             WHERE account_id = ?1",
+            params![account.0, bool_int(paused), now_unix()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove this account's learned evidence/projection/selections and disable
+    /// automatic history and cached-header ingestion.
+    ///
+    /// Synced contacts and their independently derived suggestions are kept. On
+    /// disk this is a logical deletion of the account's learning rows; it is not
+    /// a secure forensic erase of SQLite pages.
+    pub fn clear_learned_recipients(&self, account: &AccountId) -> Result<(), StoreError> {
+        self.reset_learning_in(account, false)
+    }
+
+    /// Clear learned data and re-enable automatic history under a new epoch.
+    ///
+    /// A rebuild is deliberately a fresh learning epoch: it discards what was
+    /// learned before and lets a new full-history crawl start from the
+    /// beginning. The persistent pause switch is left exactly as the user set
+    /// it, and synced contacts are preserved.
+    pub fn rebuild_learned_recipients(&self, account: &AccountId) -> Result<(), StoreError> {
+        self.reset_learning_in(account, true)
+    }
+
+    fn reset_learning_in(
+        &self,
+        account: &AccountId,
+        enable_automatic_learning: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        ensure_learning_state_in(&tx, account)?;
+
+        // Deletes evidence rows (and `evidence_addresses` through its foreign
+        // key) and the aggregated learned projection. Selections are ordinary
+        // evidence rows with origin `selection`, so they disappear too.
+        tx.execute(
+            "DELETE FROM correspondence_evidence WHERE account_id = ?1",
+            [&account.0],
+        )?;
+        tx.execute(
+            "DELETE FROM contact_addresses WHERE account_id = ?1",
+            [&account.0],
+        )?;
+        // Rebuild the derived projection so the account's synced contacts remain
+        // suggestible even though every learned signal for it is gone.
+        rebuild_recipient_index_in(&tx)?;
+
+        let disabled = if enable_automatic_learning { 0 } else { 1 };
+        tx.execute(
+            "UPDATE contact_learning_state
+             SET existing_cache_cursor = NULL,
+                 updated_at = ?2,
+                 history_scanned = 0,
+                 history_total_hint = NULL,
+                 history_complete = 0,
+                 history_paused = 0,
+                 history_retry_after = 0,
+                 learning_epoch = learning_epoch + 1,
+                 history_disabled = ?3,
+                 cache_backfill_disabled = ?4
+             WHERE account_id = ?1",
+            params![account.0, now_unix(), disabled, disabled],
+        )?;
+
+        // The history checkpoint is not learning evidence, but deleting it
+        // makes a new epoch start a full crawl instead of resuming a cursor that
+        // may already be past everything the user asked to forget.
+        let job_key = serde_json::to_string(&history_job(account))?;
+        tx.execute("DELETE FROM job_checkpoints WHERE job_key = ?1", [job_key])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Epoch-fenced form of [`Self::apply_history_page`]. A page that was
+    /// produced before clear/rebuild/pause is rejected instead of committing.
+    pub fn apply_history_page_at_epoch(
+        &self,
+        ctx: &OperationContext,
+        expected_epoch: u64,
+        expected_previous: Option<&ProviderCursor>,
+        page: &HistoryPage,
+    ) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        let state = learning_state_in(&tx, &ctx.account)?;
+        check_learning_write_in(&state, expected_epoch)?;
+        if state.history_disabled {
+            return Err(StoreError::LearningDisabled);
+        }
         let key = history_job(&ctx.account);
         check_checkpoint_in(&tx, &key, expected_previous)?;
 
@@ -206,91 +415,9 @@ impl Store {
         Ok(())
     }
 
-    /// Learn up to `limit` already-cached messages that have not yet been
-    /// backfilled, then durably advance the local cursor.
-    ///
-    /// The cursor is a `messages.id` stored in `contact_learning_state`, so a
-    /// crash before commit replays the same batch and a restart resumes after
-    /// the last committed row. `ExistingCache` reads cached headers only, so it
-    /// learns From/To/Cc; `Reply-To` and `Bcc` are not persisted by F5 and are
-    /// deliberately excluded here (provider history/live sync still see them).
-    pub fn learn_existing_cache_page(
-        &self,
-        ctx: &OperationContext,
-        limit: u32,
-    ) -> Result<ExistingCachePage, StoreError> {
-        let limit = limit.max(1);
-        let conn = self.connection();
-        let tx = conn.unchecked_transaction()?;
-        check_generation_in(&tx, &ctx.account, ctx.generation)?;
-
-        let cursor: Option<String> = tx
-            .query_row(
-                "SELECT existing_cache_cursor FROM contact_learning_state WHERE account_id = ?1",
-                [&ctx.account.0],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        let after = cursor.clone().map(MessageId);
-        let mut messages =
-            cached_messages_after_on(&tx, &ctx.account, after.as_ref(), limit.saturating_add(1))?;
-        let has_more = messages.len() > limit as usize;
-        messages.truncate(limit as usize);
-
-        for message in &messages {
-            let observations =
-                learn::observe_cached_message(&ctx.account, &message.header, message.flags.draft);
-            let fingerprint = learn::header_fingerprint(&message.header);
-            let evidence = EvidenceId::for_local(&message.id);
-            record_observations_in(
-                &tx,
-                &ctx.account,
-                &evidence,
-                LearningOrigin::ExistingCache,
-                Some(&fingerprint),
-                &observations,
-            )?;
-        }
-
-        let next_cursor = messages
-            .last()
-            .map(|message| message.id.0.clone())
-            .or(cursor);
-        tx.execute(
-            "INSERT INTO contact_learning_state (account_id, existing_cache_cursor, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id) DO UPDATE SET
-                 existing_cache_cursor = excluded.existing_cache_cursor,
-                 updated_at = excluded.updated_at",
-            params![ctx.account.0, next_cursor, now_unix()],
-        )?;
-        tx.commit()?;
-
-        Ok(ExistingCachePage {
-            scanned: messages.len() as u32,
-            has_more,
-        })
-    }
-
     /// Restart-safe local learning progress for one account.
     pub fn learning_state(&self, account: &AccountId) -> Result<LearningState, StoreError> {
-        let row: Option<(Option<String>, i64)> = self
-            .connection()
-            .query_row(
-                "SELECT existing_cache_cursor, updated_at
-                 FROM contact_learning_state WHERE account_id = ?1",
-                [&account.0],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(match row {
-            Some((cursor, updated_at)) => LearningState {
-                existing_cache_cursor: cursor.map(MessageId),
-                updated_at,
-            },
-            None => LearningState::default(),
-        })
+        learning_state_in(&self.connection(), account)
     }
 
     /// Durable header-history progress for one account, without network work.
@@ -1034,6 +1161,19 @@ fn record_observations_collect_in(
     fingerprint: Option<&str>,
     observations: &[Observation],
 ) -> Result<Vec<AddressKey>, StoreError> {
+    // Pause is a global stop for every ingestion path. Clear also blocks the
+    // two automatic origins even if a future caller bypasses the dedicated
+    // history/backfill entry points. A caller inside an already-running
+    // transaction (live arrival, accepted send) still commits its own
+    // non-learning state, but adds no evidence.
+    let controls = learning_state_in(tx, account)?;
+    if controls.paused
+        || (origin == LearningOrigin::History && controls.history_disabled)
+        || (origin == LearningOrigin::ExistingCache && controls.cache_backfill_disabled)
+    {
+        return Ok(Vec::new());
+    }
+
     // Re-normalize and deduplicate one more time so a caller cannot bypass the
     // pure extractor and smuggle duplicate or invalid rows into the ledger.
     let mut accepted = Vec::new();
@@ -1332,6 +1472,76 @@ fn learned_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnedAddress>
         trust: ObservationTrust::from_db(&trust).unwrap_or(ObservationTrust::Ordinary),
         last_seen,
     })
+}
+
+/// Make sure an account has a durable learning-controls row without changing
+/// any existing value.
+fn ensure_learning_state_in(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO contact_learning_state (account_id, updated_at)
+         VALUES (?1, 0)",
+        [&account.0],
+    )?;
+    Ok(())
+}
+
+fn learning_state_in(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+) -> Result<LearningState, StoreError> {
+    let row: Option<(Option<String>, i64, i64, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT existing_cache_cursor, updated_at, learning_epoch, learning_paused,
+                    history_disabled, cache_backfill_disabled
+             FROM contact_learning_state WHERE account_id = ?1",
+            [&account.0],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match row {
+        Some((cursor, updated_at, epoch, paused, history_disabled, cache_disabled)) => {
+            LearningState {
+                existing_cache_cursor: cursor.map(MessageId),
+                updated_at,
+                epoch: epoch.max(0) as u64,
+                paused: paused != 0,
+                history_disabled: history_disabled != 0,
+                cache_backfill_disabled: cache_disabled != 0,
+            }
+        }
+        None => LearningState::default(),
+    })
+}
+
+/// Reject a page that was produced before the account's learning controls last
+/// moved. Clear/rebuild also set the source-specific disabled flags, which the
+/// caller checks separately.
+fn check_learning_write_in(
+    state: &LearningState,
+    expected_epoch: u64,
+) -> Result<(), StoreError> {
+    if state.epoch != expected_epoch {
+        return Err(StoreError::StaleLearningEpoch {
+            expected: expected_epoch,
+            actual: state.epoch,
+        });
+    }
+    if state.paused {
+        return Err(StoreError::LearningPaused);
+    }
+    Ok(())
 }
 
 fn bool_int(value: bool) -> i64 {

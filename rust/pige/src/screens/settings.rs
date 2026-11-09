@@ -9,7 +9,7 @@ use iced::widget::{column, container, row};
 use iced::{Alignment, Element, Fill};
 use pige_core::settings::ThemeMode;
 
-use crate::app::App;
+use crate::app::{App, LearningConfirm};
 use crate::components::{self, ButtonVariant};
 use crate::icons;
 use crate::message::Message;
@@ -36,6 +36,7 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
         notifications_section(app),
         theme_section(app),
         accounts_section(app),
+        recipient_suggestions_section(app),
         components::action_card(
             "Advanced",
             "Backup, restore and factory reset.",
@@ -216,6 +217,102 @@ fn accounts_section<'a>(app: &'a App) -> Element<'a, Message> {
     ));
 
     section("Accounts", list.into())
+}
+
+fn recipient_suggestions_section<'a>(app: &'a App) -> Element<'a, Message> {
+    let palette = theme::active();
+    let mut list = column![].spacing(palette.space.md).width(Fill);
+
+    list = list.push(styled(
+        "Learned from synced contacts, accepted sends and mail history. Clearing forgets learned suggestions but keeps synced contacts."
+            .to_string(),
+        TextRole::LabelMedium,
+        palette.on_surface_variant,
+    ));
+
+    if app.snapshot.accounts.is_empty() {
+        list = list.push(styled(
+            "No accounts yet.".to_string(),
+            TextRole::BodyMedium,
+            palette.on_surface_variant,
+        ));
+    }
+
+    for account in &app.snapshot.accounts {
+        let status = if account.learning_paused {
+            "Paused"
+        } else {
+            "On"
+        };
+        list = list.push(
+            column![
+                row![
+                    styled(
+                        account.email.clone(),
+                        TextRole::LabelMedium,
+                        palette.on_surface_variant,
+                    ),
+                    styled(
+                        format!("Learning {status}"),
+                        TextRole::LabelMedium,
+                        palette.on_surface,
+                    ),
+                ]
+                .spacing(palette.space.sm)
+                .align_y(Alignment::Center),
+                row![
+                    components::button(
+                        if account.learning_paused {
+                            "Resume learning"
+                        } else {
+                            "Pause learning"
+                        },
+                        ButtonVariant::Text,
+                        Message::LearningPause(account.id.clone(), !account.learning_paused),
+                    ),
+                    components::button(
+                        "Clear...",
+                        ButtonVariant::Danger,
+                        Message::LearningClear(account.id.clone()),
+                    ),
+                    components::button(
+                        "Rebuild...",
+                        ButtonVariant::Outlined,
+                        Message::LearningRebuild(account.id.clone()),
+                    ),
+                ]
+                .spacing(palette.space.sm)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(palette.space.sm)
+            .width(Fill),
+        );
+    }
+
+    section("Recipient suggestions", list.into())
+}
+
+/// Confirmation for the two destructive learning actions. Pause/resume is
+/// reversible and needs no dialog.
+pub(crate) fn learning_confirm_modal(confirm: &LearningConfirm) -> Element<'static, Message> {
+    match confirm {
+        LearningConfirm::Clear(_) => components::confirm(
+            "Clear learned suggestions",
+            "This forgets every recipient learned for this account from mail history, accepted sends and compose selections. Synced contacts are kept, and automatic history learning stays off until you rebuild.",
+            "Clear",
+            true,
+            Message::LearningClearConfirmed,
+            Message::LearningActionCancelled,
+        ),
+        LearningConfirm::Rebuild(_) => components::confirm(
+            "Rebuild learned suggestions",
+            "This discards the account's learned recipients and starts a new full-history learning epoch. Synced contacts are kept; learning continues in the background.",
+            "Rebuild",
+            true,
+            Message::LearningRebuildConfirmed,
+            Message::LearningActionCancelled,
+        ),
+    }
 }
 
 /// A titled card holding one group of settings.

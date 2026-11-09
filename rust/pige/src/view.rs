@@ -60,6 +60,13 @@ impl App {
         if self.confirm_reset {
             root = stack![root, crate::screens::advanced::reset_confirm_modal()].into();
         }
+        if let Some(confirm) = &self.learning_confirm {
+            root = stack![
+                root,
+                crate::screens::settings::learning_confirm_modal(confirm)
+            ]
+            .into();
+        }
         if panes.nav && breakpoint != Breakpoint::Expanded {
             root = stack![root, self.drawer()].into();
         }

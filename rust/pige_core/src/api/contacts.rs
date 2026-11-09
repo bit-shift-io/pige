@@ -102,6 +102,63 @@ pub fn record_recipient_selection(account: &AccountId, address: &Address) -> Res
         .map_err(|error| format!("record recipient selection: {error}"))
 }
 
+/// Pause or resume recipient learning for one account. Pausing keeps existing
+/// suggestions but stops every ingestion path until learning is resumed.
+pub fn pause_learning(account: &AccountId, paused: bool) -> Result<(), String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    ensure_configured_account(state, account)?;
+    state
+        .store
+        .pause_learning(account, paused)
+        .map_err(|error| format!("pause recipient learning: {error}"))
+}
+
+/// Forget this account's learned recipient evidence and suggestions. Synced
+/// contacts are preserved. This is a logical deletion, not secure forensic
+/// erasure, and automatic history/cache ingestion stays disabled until an
+/// explicit rebuild.
+pub fn clear_learned_recipients(account: &AccountId) -> Result<(), String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    ensure_configured_account(state, account)?;
+    state
+        .store
+        .clear_learned_recipients(account)
+        .map_err(|error| format!("clear learned recipients: {error}"))
+}
+
+/// Discard learned recipient data and re-enable automatic history under a new
+/// learning epoch. Synced contacts are preserved.
+pub fn rebuild_learned_recipients(account: &AccountId) -> Result<(), String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    ensure_configured_account(state, account)?;
+    state
+        .store
+        .rebuild_learned_recipients(account)
+        .map_err(|error| format!("rebuild learned recipients: {error}"))
+}
+
+fn ensure_configured_account(state: &super::AppState, account: &AccountId) -> Result<(), String> {
+    if state
+        .config_doc
+        .accounts
+        .iter()
+        .any(|configured| &configured.id == account)
+    {
+        Ok(())
+    } else {
+        Err(format!("unknown account {account}"))
+    }
+}
+
 /// Every configured account address and IMAP login alias. These are never
 /// default suggestions.
 fn self_identity_keys(accounts: &[Account]) -> HashSet<AddressKey> {

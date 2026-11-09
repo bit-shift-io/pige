@@ -71,6 +71,13 @@ impl Toast {
     }
 }
 
+/// A destructive recipient-learning action that waits for confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LearningConfirm {
+    Clear(AccountId),
+    Rebuild(AccountId),
+}
+
 /// Everything the shell remembers between messages.
 pub struct App {
     /// The latest authoritative cache view.
@@ -122,6 +129,8 @@ pub struct App {
     pub(crate) restore_confirm: Option<String>,
     /// Whether the Advanced factory-reset confirmation is open.
     pub(crate) confirm_reset: bool,
+    /// A pending clear/rebuild of one account's learned recipients.
+    pub(crate) learning_confirm: Option<LearningConfirm>,
     /// Whether the full-window account screen is showing.
     pub accounts_open: bool,
     /// The account list/form/confirmation state.
@@ -206,6 +215,7 @@ impl App {
                 restore_picker: None,
                 restore_confirm: None,
                 confirm_reset: false,
+                learning_confirm: None,
                 accounts_open: false,
                 accounts: AccountsState::default(),
                 settings_open: false,
@@ -248,6 +258,7 @@ impl App {
             restore_picker: None,
             restore_confirm: None,
             confirm_reset: false,
+            learning_confirm: None,
             accounts_open: false,
             accounts: AccountsState::default(),
             settings_open: false,

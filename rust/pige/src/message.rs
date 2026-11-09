@@ -202,6 +202,20 @@ pub enum Message {
     SettingsSave,
     /// The save finished, off the UI thread.
     SettingsSaved(Result<(), String>),
+    /// Pause or resume recipient learning for one account.
+    LearningPause(AccountId, bool),
+    /// Ask to clear one account's learned recipient suggestions.
+    LearningClear(AccountId),
+    /// Ask to rebuild one account's learned recipient suggestions.
+    LearningRebuild(AccountId),
+    /// The clear confirmation was accepted.
+    LearningClearConfirmed,
+    /// The rebuild confirmation was accepted.
+    LearningRebuildConfirmed,
+    /// The clear/rebuild confirmation was dismissed.
+    LearningActionCancelled,
+    /// A learning action finished, with the toast copy to show.
+    LearningActionDone(String, Result<(), String>),
     /// The operating system reported its light/dark preference.
     SystemTheme(iced::theme::Mode),
     /// The Android system font scale changed.

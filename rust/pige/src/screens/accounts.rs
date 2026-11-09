@@ -782,6 +782,7 @@ mod tests {
                 email: "ada@example.com".into(),
                 unread: 0,
                 color: "#00897b".into(),
+                learning_paused: false,
             }],
             ..ModelSnapshot::default()
         };

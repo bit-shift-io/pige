@@ -18,6 +18,9 @@ pub struct AccountSummary {
     pub unread: u32,
     /// Resolved `#rrggbb` accent colour used to tag the account in the UI.
     pub color: String,
+    /// Whether the user paused recipient learning for this account. Existing
+    /// suggestions remain visible while paused.
+    pub learning_paused: bool,
 }
 
 /// One account's expandable folder group.

@@ -12,7 +12,7 @@ use pige_core::platform::credentials_unavailable;
 use pige_core::settings::{Settings, ThemeMode};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::app::App;
+use crate::app::{App, LearningConfirm};
 use crate::layout::Breakpoint;
 use crate::message::{AccountSaveResult, Message};
 use crate::screens::accounts::{AccountField, TestState};
@@ -183,6 +183,8 @@ impl App {
                     self.accounts.confirm_remove = None;
                 } else if self.advanced_open {
                     self.advanced_open = false;
+                } else if self.learning_confirm.is_some() {
+                    self.learning_confirm = None;
                 } else if self.settings_open {
                     self.settings_open = false;
                 } else if self.drawer_open {
@@ -811,6 +813,52 @@ impl App {
                     Message::SettingsSaved,
                 );
             }
+            Message::LearningPause(id, paused) => {
+                let copy = if paused {
+                    "Recipient learning paused."
+                } else {
+                    "Recipient learning resumed."
+                };
+                return Task::perform(
+                    async move { api::pause_learning(&id, paused) },
+                    move |result| Message::LearningActionDone(copy.to_string(), result),
+                );
+            }
+            Message::LearningClear(id) => {
+                self.learning_confirm = Some(LearningConfirm::Clear(id));
+            }
+            Message::LearningRebuild(id) => {
+                self.learning_confirm = Some(LearningConfirm::Rebuild(id));
+            }
+            Message::LearningClearConfirmed => {
+                let Some(LearningConfirm::Clear(id)) = self.learning_confirm.take() else {
+                    return Task::none();
+                };
+                return Task::perform(
+                    async move { api::clear_learned_recipients(&id) },
+                    |result| Message::LearningActionDone("Recipient suggestions cleared.".to_string(), result),
+                );
+            }
+            Message::LearningRebuildConfirmed => {
+                let Some(LearningConfirm::Rebuild(id)) = self.learning_confirm.take() else {
+                    return Task::none();
+                };
+                return Task::perform(
+                    async move { api::rebuild_learned_recipients(&id) },
+                    |result| Message::LearningActionDone("Recipient suggestions rebuilt.".to_string(), result),
+                );
+            }
+            Message::LearningActionCancelled => self.learning_confirm = None,
+            Message::LearningActionDone(copy, result) => match result {
+                Ok(()) => {
+                    let toast = self.show_toast(copy);
+                    return Task::batch([
+                        toast,
+                        Task::perform(async { api::snapshot() }, Message::Snapshot),
+                    ]);
+                }
+                Err(error) => return self.show_toast(error),
+            },
             Message::SettingsSaved(result) => match result {
                 Ok(()) => {
                     crate::platform::apply_background_sync(

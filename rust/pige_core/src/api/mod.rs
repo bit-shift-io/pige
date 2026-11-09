@@ -66,7 +66,10 @@ pub use accounts::{
 pub use accounts::{
     clear_switch_crash, inject_switch_crash_after_config, inject_switch_crash_after_secret,
 };
-pub use contacts::{record_recipient_selection, suggest_recipients};
+pub use contacts::{
+    clear_learned_recipients, pause_learning, rebuild_learned_recipients,
+    record_recipient_selection, suggest_recipients,
+};
 pub use events::{CoreEvent, back_pressed, subscribe};
 pub use mutations::{
     RECONNECT_ERROR, archive_available, archive_thread, delete_permanently, move_thread, set_read,
@@ -443,6 +446,11 @@ impl AppState {
                     .copied()
                     .unwrap_or_else(|| section.account.resolved_color())
                     .to_string(),
+                learning_paused: self
+                    .store
+                    .learning_state(&section.account.id)
+                    .map(|state| state.paused)
+                    .unwrap_or(false),
             });
             sections.push(AccountSection {
                 account_id: section.account.id.clone(),

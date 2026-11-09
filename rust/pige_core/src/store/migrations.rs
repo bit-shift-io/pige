@@ -7,6 +7,7 @@ mod v11;
 mod v12;
 mod v13;
 mod v14;
+mod v15;
 mod v2;
 mod v3;
 mod v4;
@@ -70,7 +71,8 @@ impl Store {
     /// replay-safe correspondent evidence ledger; v12 adds the indexed recipient
     /// search projection and contact-source kind; v13 adds the rank index that
     /// bounds short-prefix lookups to an indexed top-N; v14 adds durable
-    /// header-history learning progress and the rate-limit retry time.
+    /// header-history learning progress and the rate-limit retry time; v15
+    /// adds durable learning pause/epoch/clear controls.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -172,6 +174,10 @@ impl Store {
         if version < 14 && target >= 14 {
             v14::apply(&tx)?;
             version = 14;
+        }
+        if version < 15 && target >= 15 {
+            v15::apply(&tx)?;
+            version = 15;
         }
 
         // The rebuild must not leave a dangling reference behind; check before
