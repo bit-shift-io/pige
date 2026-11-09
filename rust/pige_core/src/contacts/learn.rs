@@ -30,7 +30,32 @@ pub fn observe_message(
     if message.flags.draft {
         return Vec::new();
     }
-    observations_from_header(&message.header, origin)
+    let trust = if !matches!(
+        origin,
+        LearningOrigin::AcceptedSend | LearningOrigin::Selection
+    ) && is_low_trust_mailbox(message)
+    {
+        // Spam/Trash observations stay available for later corroboration but
+        // are suppressed from ordinary ranking until a deliberate signal
+        // exists.
+        Some(ObservationTrust::SpamOrTrash)
+    } else {
+        None
+    };
+    observations_from_header(&message.header, origin, trust)
+}
+
+/// Whether the message is only known through a Spam/Trash collection. Gmail
+/// exposes system label ids (`SPAM`, `TRASH`); IMAP exposes mailbox names
+/// (`Junk`, `[Gmail]/Trash`); both are checked case-insensitively.
+fn is_low_trust_mailbox(message: &MessageRecord) -> bool {
+    message.collections.iter().any(|collection| {
+        let id = collection.as_str().trim().to_ascii_lowercase();
+        matches!(id.as_str(), "spam" | "trash" | "junk")
+            || id.ends_with("/spam")
+            || id.ends_with("/trash")
+            || id.ends_with("/junk")
+    })
 }
 
 /// Observe the recipients of an accepted outgoing message.
@@ -153,17 +178,21 @@ fn fingerprint_addresses(addresses: &[Address]) -> Vec<String> {
         .collect()
 }
 
-fn observations_from_header(header: &MessageHeader, origin: LearningOrigin) -> Vec<Observation> {
+fn observations_from_header(
+    header: &MessageHeader,
+    origin: LearningOrigin,
+    trust_override: Option<ObservationTrust>,
+) -> Vec<Observation> {
     let outgoing = matches!(
         origin,
         LearningOrigin::AcceptedSend | LearningOrigin::Selection
     );
-    let trust = match origin {
+    let trust = trust_override.unwrap_or(match origin {
         LearningOrigin::AcceptedSend | LearningOrigin::Selection => ObservationTrust::Deliberate,
         LearningOrigin::ExistingCache | LearningOrigin::History | LearningOrigin::LiveArrival => {
             ObservationTrust::Ordinary
         }
-    };
+    });
     let mut observations = Vec::new();
     let mut seen = HashSet::new();
     for (role, addresses) in [

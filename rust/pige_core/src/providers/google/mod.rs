@@ -9,6 +9,10 @@ pub mod android;
 pub mod auth;
 pub mod client;
 pub mod desktop;
+mod mailbox;
+mod mutations;
+mod normalize;
+mod sync;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,9 +23,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::account::{Account, AccountId, MailBackend};
 use crate::auth::{AccountSessionManager, AuthenticationService, TokenSource};
 use crate::providers::{
-    GMAIL_PROVIDER, OperationContext, ProviderCapabilities, ProviderError, ProviderFactory,
-    ProviderId, ProviderRegistry, ProviderSession,
+    GMAIL_PROVIDER, MutationCapabilities, OperationContext, ProviderCapabilities, ProviderError,
+    ProviderFactory, ProviderId, ProviderRegistry, ProviderSession,
 };
+
+pub use mailbox::GmailMailbox;
+pub use mutations::GmailMutations;
+pub use sync::{GmailSync, cursor_stage, request_collection};
 
 pub use android::{
     AndroidAuthorizationRequest, AndroidOfflineExchange, GoogleAndroidHost, GoogleAndroidResult,
@@ -156,9 +164,35 @@ impl ProviderFactory for GoogleProviderFactory {
         // Build the client now so every capability of this session shares the
         // same per-account token source. This does not prove a credential
         // exists; the first authenticated call reports reauthentication.
-        let _client = self.client(&account.id)?;
-        Ok(ProviderSession::new(ProviderCapabilities::default())
-            .with_provider(ProviderId::from(GMAIL_PROVIDER)))
+        let client = self.client(&account.id)?;
+        // Gmail accepts `me` for the authenticated user; the account's Google
+        // user id is not the Gmail resource id.
+        let user = "me";
+
+        let mut session = ProviderSession::new(ProviderCapabilities {
+            mailbox: true,
+            sync: true,
+            mutations: MutationCapabilities {
+                read: true,
+                star: true,
+                labels: true,
+                move_messages: true,
+                archive: true,
+                trash: true,
+                // v1 holds gmail.modify, which cannot permanently delete.
+                permanent_delete: false,
+            },
+            // Submission is G4; contacts are G3.
+            submission: false,
+            contacts: Default::default(),
+            server_search: false,
+        })
+        .with_provider(ProviderId::from(GMAIL_PROVIDER));
+
+        session.mailbox = Some(Box::new(GmailMailbox::new(client.clone(), user)));
+        session.sync = Some(Box::new(GmailSync::new(client.clone(), user)));
+        session.mutations = Some(Box::new(GmailMutations::new(client, user)));
+        Ok(session)
     }
 }
 
