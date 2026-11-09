@@ -153,10 +153,9 @@ impl ProviderFactory for GoogleProviderFactory {
         if !matches!(account.backend, MailBackend::Gmail { .. }) {
             return Err(ProviderError::unsupported("Gmail for this account"));
         }
-        // Resolve the authenticated client at open time so an account without a
-        // usable session fails before any capability work starts. The mailbox,
-        // history, mutation, submission, and People services arrive in G2/G3
-        // and all receive a client built from this same token source.
+        // Build the client now so every capability of this session shares the
+        // same per-account token source. This does not prove a credential
+        // exists; the first authenticated call reports reauthentication.
         let _client = self.client(&account.id)?;
         Ok(ProviderSession::new(ProviderCapabilities::default())
             .with_provider(ProviderId::from(GMAIL_PROVIDER)))

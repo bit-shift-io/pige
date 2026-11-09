@@ -29,11 +29,11 @@ use pige_core::auth::{
 use pige_core::platform::CredentialStore;
 use pige_core::platform::fake::FakeCredentials;
 use pige_core::providers::google::{
-    AndroidAuthorizationRequest, CONTACTS_OTHER_READONLY_SCOPE, CONTACTS_READONLY_SCOPE,
-    GMAIL_MODIFY_SCOPE, GoogleAndroidHost, GoogleAndroidResult, GoogleAuthentication,
-    GoogleAuthorizationOutcome, GoogleAuthorizationResult, GoogleEndpoints, GoogleIdentity,
-    GoogleOAuthConfig, GoogleProviderFactory, GoogleTokenRefresher, GoogleTokenSourceProvider,
-    deliver_native_result, take_native_result,
+    AndroidAuthorizationRequest, AndroidOfflineExchange, CONTACTS_OTHER_READONLY_SCOPE,
+    CONTACTS_READONLY_SCOPE, GMAIL_MODIFY_SCOPE, GoogleAndroidHost, GoogleAndroidResult,
+    GoogleAuthentication, GoogleAuthorizationOutcome, GoogleAuthorizationResult, GoogleEndpoints,
+    GoogleIdentity, GoogleOAuthConfig, GoogleProviderFactory, GoogleTokenRefresher,
+    GoogleTokenSourceProvider, deliver_native_result, take_native_result,
 };
 use pige_core::providers::{
     AuthAttemptId, ErrorKind, GMAIL_PROVIDER, OperationContext, ProviderId,
@@ -115,6 +115,27 @@ impl Harness {
         )
     }
 
+    fn android_offline(
+        &self,
+        token_url: Url,
+        host: Arc<RecordingAndroidHost>,
+        exchange_url: Url,
+        ttl: Duration,
+    ) -> GoogleAuthentication {
+        GoogleAuthentication::android(
+            self.secrets.clone(),
+            self.sessions.clone(),
+            self.store.clone(),
+            self.oauth(token_url),
+            host,
+            Some(AndroidOfflineExchange {
+                server_client_id: "web-client-id".to_string(),
+                exchange_url,
+            }),
+            ttl,
+        )
+    }
+
     fn context(&self, account: &AccountId) -> OperationContext {
         self.sessions
             .context(account, Duration::from_secs(30))
@@ -186,6 +207,7 @@ impl pige_core::providers::google::DesktopRedirect for FixedRedirect {
 struct RecordingAndroidHost {
     launches: Mutex<Vec<AndroidAuthorizationRequest>>,
     cancelled: Mutex<Vec<AuthAttemptId>>,
+    acquires: Mutex<usize>,
 }
 
 impl RecordingAndroidHost {
@@ -193,11 +215,16 @@ impl RecordingAndroidHost {
         Self {
             launches: Mutex::new(Vec::new()),
             cancelled: Mutex::new(Vec::new()),
+            acquires: Mutex::new(0),
         }
     }
 
     fn launches(&self) -> Vec<AndroidAuthorizationRequest> {
         self.launches.lock().expect("launches").clone()
+    }
+
+    fn acquires(&self) -> usize {
+        *self.acquires.lock().expect("acquires")
     }
 }
 
@@ -224,6 +251,7 @@ impl GoogleAndroidHost for RecordingAndroidHost {
         _account: &AccountId,
         _scopes: &[String],
     ) -> Result<GoogleAndroidResult, pige_core::providers::ProviderError> {
+        *self.acquires.lock().expect("acquires") += 1;
         Err(pige_core::providers::ProviderError::reauthenticate(
             "no live Android grant in this test",
         ))
@@ -350,6 +378,124 @@ async fn cancelled_attempt_cannot_store_secret() {
 }
 
 #[tokio::test]
+async fn stale_desktop_attempt_makes_no_exchange() {
+    let mock = MockServer::start(vec![token_ok(
+        "access-1",
+        Some("refresh-1"),
+        GMAIL_MODIFY_SCOPE,
+    )])
+    .await;
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let mut auth = harness.desktop(mock.url(), Duration::from_secs(300));
+
+    let (attempt, url) = begin_desktop(&mut auth, harness.request(&account, false)).await;
+    let state = query_value(&url, "state");
+    // The account is re-authenticated/invalidated while the browser is open.
+    harness.sessions.invalidate(&account).expect("invalidate");
+
+    let error = auth
+        .respond(
+            &attempt,
+            AuthAnswer::Browser(BrowserAnswer {
+                redirect_url: redirect_with("http://127.0.0.1:45678", "auth-code", &state),
+            }),
+        )
+        .await
+        .expect_err("a stale attempt must not exchange its single-use code");
+
+    assert!(
+        matches!(error.kind, ErrorKind::Cancelled | ErrorKind::Conflict),
+        "unexpected error kind {:?}",
+        error.kind
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "a stale attempt must not burn the single-use code"
+    );
+    assert!(
+        harness
+            .store
+            .pending_auth(&attempt)
+            .expect("pending")
+            .is_none(),
+        "the stale attempt is discarded immediately"
+    );
+    assert!(
+        harness
+            .secrets
+            .load_staged(&staged_ref(&attempt))
+            .expect("load staged")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn stale_finish_discards_the_attempt_instead_of_waiting_for_ttl() {
+    let harness = Harness::new();
+    let account = AccountId::new();
+    // The token endpoint invalidates the account after the pre-exchange fence
+    // but before the response returns, so `finish` observes a stale attempt.
+    let sessions = harness.sessions.clone();
+    let hook_account = account.clone();
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = sessions.invalidate(&hook_account);
+    });
+    let mock = MockServer::start_with_hook(
+        vec![token_ok("access-1", Some("refresh-1"), GMAIL_MODIFY_SCOPE)],
+        Some(hook),
+    )
+    .await;
+    let mut auth = harness.desktop(mock.url(), Duration::from_secs(300));
+
+    let (attempt, url) = begin_desktop(&mut auth, harness.request(&account, false)).await;
+    let state = query_value(&url, "state");
+    let error = auth
+        .respond(
+            &attempt,
+            AuthAnswer::Browser(BrowserAnswer {
+                redirect_url: redirect_with("http://127.0.0.1:45678", "auth-code", &state),
+            }),
+        )
+        .await
+        .expect_err("the invalidated attempt cannot finish");
+    assert!(
+        matches!(error.kind, ErrorKind::Cancelled | ErrorKind::Conflict),
+        "unexpected error kind {:?}",
+        error.kind
+    );
+    assert_eq!(mock.requests().len(), 1);
+    assert!(
+        harness
+            .store
+            .pending_auth(&attempt)
+            .expect("pending")
+            .is_none(),
+        "finish failure must discard the pending attempt, not wait for the TTL"
+    );
+    assert!(
+        harness
+            .secrets
+            .load_staged(&staged_ref(&attempt))
+            .expect("load staged")
+            .is_none()
+    );
+
+    // A recycled callback cannot resurrect the discarded attempt.
+    let again = auth
+        .respond(
+            &attempt,
+            AuthAnswer::Browser(BrowserAnswer {
+                redirect_url: redirect_with("http://127.0.0.1:45678", "auth-code", &state),
+            }),
+        )
+        .await
+        .expect_err("a discarded attempt stays gone");
+    assert_eq!(again.kind, ErrorKind::NotFound);
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn android_result_after_activity_recreation_is_bound() {
     let mock = MockServer::start(vec![token_ok("unused", None, GMAIL_MODIFY_SCOPE)]).await;
     let harness = Harness::new();
@@ -399,6 +545,8 @@ async fn android_result_after_activity_recreation_is_bound() {
         panic!("expected completion");
     };
     assert_eq!(completed.account.id, account);
+    assert_eq!(completed.account.email, "person@example.com");
+    assert_eq!(completed.account.label, "Person");
     let staged = harness
         .secrets
         .load_staged(&completed.credential_ref)
@@ -418,6 +566,169 @@ async fn android_result_after_activity_recreation_is_bound() {
             .pending_auth(&second)
             .expect("pending")
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn android_offline_request_carries_server_client_id() {
+    let mock = MockServer::start(vec![token_ok("unused", None, GMAIL_MODIFY_SCOPE)]).await;
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let host = Arc::new(RecordingAndroidHost::new());
+    let mut auth = harness.android_offline(
+        mock.url(),
+        host.clone(),
+        mock.url(),
+        Duration::from_secs(300),
+    );
+
+    auth.begin(harness.request(&account, false))
+        .await
+        .expect("begin");
+    let launches = host.launches();
+    assert_eq!(launches.len(), 1);
+    assert!(launches[0].request_offline_access);
+    assert_eq!(
+        launches[0].server_client_id.as_deref(),
+        Some("web-client-id"),
+        "Kotlin requestOfflineAccess needs the Web client id"
+    );
+
+    // Without the exchange, the host is told not to request offline access and
+    // gets no server client id.
+    let plain_host = Arc::new(RecordingAndroidHost::new());
+    let mut plain = harness.android(mock.url(), plain_host.clone(), Duration::from_secs(300));
+    plain
+        .begin(harness.request(&AccountId::new(), false))
+        .await
+        .expect("begin without offline");
+    let launches = plain_host.launches();
+    assert!(!launches[0].request_offline_access);
+    assert_eq!(launches[0].server_client_id, None);
+}
+
+#[tokio::test]
+async fn android_offline_refresh_used_after_restart() {
+    let mock = MockServer::start(vec![token_ok(
+        "android-access-2",
+        Some("android-refresh-2"),
+        GMAIL_MODIFY_SCOPE,
+    )])
+    .await;
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let oauth = harness.oauth(mock.url());
+    let ctx = harness.context(&account);
+    harness
+        .secrets
+        .save(
+            &ctx,
+            &SecretEnvelope::google(GoogleSessionSecret {
+                access_token: Some(SecretString::from("expired-access")),
+                refresh_token: Some(SecretString::from("android-refresh-1")),
+                expires_at_ms: Some(1),
+                scopes: vec![GMAIL_MODIFY_SCOPE.to_string()],
+            }),
+        )
+        .expect("seed offline refresh token");
+
+    // Restart: only the persisted credential and the platform credential store
+    // survive; the in-process authentication/attempt state does not.
+    let db_path = harness.dir.path().join("pige.db");
+    drop(ctx);
+    drop(harness.sessions);
+    drop(harness.secrets);
+    drop(harness.store);
+
+    let restarted_store = Arc::new(Store::open(&db_path).expect("reopen store"));
+    restarted_store.migrate().expect("migrate reopened store");
+    let restarted_sessions = Arc::new(pige_core::auth::AccountSessionManager::new(
+        restarted_store.clone(),
+    ));
+    let restarted_secrets = Arc::new(CredentialSecretRepository::with_gate(
+        harness.credentials.clone() as Arc<dyn CredentialStore>,
+        restarted_store.clone(),
+    ));
+    let host = Arc::new(RecordingAndroidHost::new());
+    let auth = GoogleAuthentication::android(
+        restarted_secrets.clone(),
+        restarted_sessions.clone(),
+        restarted_store,
+        oauth,
+        host.clone(),
+        Some(AndroidOfflineExchange {
+            server_client_id: "web-client-id".to_string(),
+            exchange_url: mock.url(),
+        }),
+        Duration::from_secs(300),
+    );
+
+    let ctx = restarted_sessions
+        .context(&account, Duration::from_secs(30))
+        .expect("context");
+    let source = auth.provider_token_source(&account);
+    let token = source
+        .access_token(&ctx)
+        .await
+        .expect("the persisted refresh token must work after restart");
+    assert_eq!(token.expose_secret(), "android-access-2");
+    assert_eq!(
+        host.acquires(),
+        0,
+        "a stored refresh token must take precedence over host acquire"
+    );
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(form_value(&requests[0].body, "grant_type"), "refresh_token");
+    assert_eq!(form_value(&requests[0].body, "client_id"), "web-client-id");
+    assert_eq!(
+        form_value(&requests[0].body, "refresh_token"),
+        "android-refresh-1"
+    );
+    assert!(
+        form_value(&requests[0].body, "client_secret").is_empty(),
+        "the device never sends the server's Google secret"
+    );
+
+    let stored = restarted_secrets
+        .load(&account)
+        .expect("load")
+        .expect("present");
+    assert_eq!(
+        google_secret(&stored)
+            .refresh_token
+            .as_ref()
+            .map(ExposeSecret::expose_secret),
+        Some("android-refresh-2"),
+        "the exchange's rotated refresh token is persisted"
+    );
+}
+
+#[tokio::test]
+async fn android_without_refresh_token_falls_back_to_host_acquire() {
+    let mock = MockServer::start(Vec::new()).await;
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let host = Arc::new(RecordingAndroidHost::new());
+    let auth = harness.android_offline(
+        mock.url(),
+        host.clone(),
+        mock.url(),
+        Duration::from_secs(300),
+    );
+
+    let ctx = harness.context(&account);
+    let source = auth.provider_token_source(&account);
+    let error = source
+        .access_token(&ctx)
+        .await
+        .expect_err("no refresh token and no live platform grant");
+    assert_eq!(error.kind, ErrorKind::Reauthenticate);
+    assert_eq!(host.acquires(), 1);
+    assert!(
+        mock.requests().is_empty(),
+        "without a refresh token the exchange must not be called"
     );
 }
 
@@ -609,6 +920,75 @@ async fn refresh_rotation_saved_before_reuse() {
 }
 
 #[tokio::test]
+async fn refresh_token_is_not_returned_before_rotation_is_persisted() {
+    let mock = MockServer::start(vec![token_ok(
+        "rotated-access",
+        Some("rotated-refresh"),
+        GMAIL_MODIFY_SCOPE,
+    )])
+    .await;
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let ctx = harness.context(&account);
+    harness
+        .secrets
+        .save(
+            &ctx,
+            &SecretEnvelope::google(GoogleSessionSecret {
+                access_token: Some(SecretString::from("expired-access")),
+                refresh_token: Some(SecretString::from("refresh-1")),
+                expires_at_ms: Some(1),
+                scopes: vec![GMAIL_MODIFY_SCOPE.to_string()],
+            }),
+        )
+        .expect("seed token");
+
+    // Force the credential write fence to fail after the token endpoint has
+    // already answered. Ordering proof: the fresh access token must not be
+    // handed to the caller unless the rotated refresh token was persisted first.
+    let sessions = harness.sessions.clone();
+    let hook_account = account.clone();
+    harness.secrets.set_pre_write_hook(Arc::new(move || {
+        let _ = sessions.invalidate(&hook_account);
+    }));
+
+    let refresher = GoogleTokenRefresher::new(harness.secrets.clone(), harness.oauth(mock.url()));
+    let error = refresher
+        .refresh(&ctx)
+        .await
+        .expect_err("persistence is a precondition for returning the access token");
+    assert!(
+        matches!(error.kind, ErrorKind::Cancelled | ErrorKind::Conflict),
+        "unexpected error kind {:?}",
+        error.kind
+    );
+    assert_eq!(mock.requests().len(), 1);
+
+    let stored = harness
+        .secrets
+        .load(&account)
+        .expect("load")
+        .expect("present");
+    let secret = google_secret(&stored);
+    assert_eq!(
+        secret
+            .refresh_token
+            .as_ref()
+            .map(ExposeSecret::expose_secret),
+        Some("refresh-1"),
+        "an unpersisted rotation is never observable"
+    );
+    assert_eq!(
+        secret
+            .access_token
+            .as_ref()
+            .map(ExposeSecret::expose_secret),
+        Some("expired-access"),
+        "the caller cannot reuse an access token whose rotation was not saved"
+    );
+}
+
+#[tokio::test]
 async fn refresh_failure_reauths_without_password_prompt() {
     let mock = MockServer::start(vec![MockResponse::json(
         400,
@@ -791,7 +1171,11 @@ fn android_jni_payload_is_validated_before_queueing() {
         deliver_native_result(&payload).expect("valid payload"),
         attempt
     );
-    assert!(take_native_result(&attempt).is_some());
+    let queued = take_native_result(&attempt).expect("queued result");
+    let GoogleAuthorizationOutcome::Authorized(queued) = queued.result else {
+        panic!("expected an authorized result");
+    };
+    assert_eq!(queued.identity.email.as_deref(), Some("person@example.com"));
 
     // Arbitrary browser/redirect parameters are not part of the frozen bridge.
     let unexpected = serde_json::json!({
@@ -896,6 +1280,13 @@ struct MockServer {
 
 impl MockServer {
     async fn start(responses: Vec<MockResponse>) -> Self {
+        Self::start_with_hook(responses, None).await
+    }
+
+    async fn start_with_hook(
+        responses: Vec<MockResponse>,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind mock token endpoint");
@@ -910,11 +1301,15 @@ impl MockServer {
                 };
                 let recorded = recorded.clone();
                 let queue = queue.clone();
+                let hook = hook.clone();
                 tokio::spawn(async move {
                     let Some(request) = read_request(&mut socket).await else {
                         return;
                     };
                     recorded.lock().expect("record request").push(request);
+                    if let Some(hook) = &hook {
+                        hook();
+                    }
                     let response = queue
                         .lock()
                         .expect("response queue")

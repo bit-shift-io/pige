@@ -153,6 +153,15 @@ object GoogleAuthorization {
             return
         }
         val granted = result.grantedScopes
+        // GIS carries the consented account on the result; without it Rust has
+        // no email/name and labels the account the generic "Google account".
+        val identity = JSONObject().apply {
+            result.toGoogleSignInAccount()?.let { account ->
+                account.id?.let { put("userId", it) }
+                account.email?.let { put("email", it) }
+                account.displayName?.let { put("displayName", it) }
+            }
+        }
         val payload = JSONObject()
             .put("attempt", attempt)
             .put(
@@ -162,6 +171,7 @@ object GoogleAuthorization {
                     .put("accessToken", token)
                     .put("expiresAtMs", System.currentTimeMillis() + ACCESS_TOKEN_LIFETIME_MS)
                     .put("scopes", JSONArray(granted))
+                    .put("identity", identity)
                     .apply {
                         result.serverAuthCode?.let { put("serverAuthCode", it) }
                     },

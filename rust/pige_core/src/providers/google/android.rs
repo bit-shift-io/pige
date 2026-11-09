@@ -188,6 +188,10 @@ pub struct AndroidAuthorizationRequest {
     pub attempt: AuthAttemptId,
     pub scopes: Vec<String>,
     pub request_offline_access: bool,
+    /// The Web application client id required by
+    /// `requestOfflineAccess(serverClientId)` when `request_offline_access` is
+    /// true; `None` for the on-demand, no-device-refresh-token flow.
+    pub server_client_id: Option<String>,
 }
 
 /// The server-side exchange configuration for `requestOfflineAccess` /

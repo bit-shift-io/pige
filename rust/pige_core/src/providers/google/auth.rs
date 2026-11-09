@@ -155,15 +155,34 @@ impl GoogleTokenClient {
     }
 
     async fn refresh(&self, refresh_token: &SecretString) -> Result<GoogleTokenSet, ProviderError> {
+        self.refresh_with(
+            self.oauth.token_url.clone(),
+            &self.oauth.client_id,
+            self.oauth.client_secret.as_ref(),
+            refresh_token,
+        )
+        .await
+    }
+
+    /// Refresh against an explicit endpoint/client. The Android offline exchange
+    /// uses the Pige-operated endpoint and the Web client id; the server holds
+    /// the client secret, so none is sent from the device.
+    async fn refresh_with(
+        &self,
+        url: Url,
+        client_id: &str,
+        client_secret: Option<&SecretString>,
+        refresh_token: &SecretString,
+    ) -> Result<GoogleTokenSet, ProviderError> {
         let mut form: Vec<(&str, &str)> = vec![
-            ("client_id", &self.oauth.client_id),
+            ("client_id", client_id),
             ("refresh_token", refresh_token.expose_secret()),
             ("grant_type", "refresh_token"),
         ];
-        if let Some(secret) = &self.oauth.client_secret {
+        if let Some(secret) = client_secret {
             form.push(("client_secret", secret.expose_secret()));
         }
-        self.post(form).await
+        self.post_to(url, form).await
     }
 
     async fn exchange_server_auth_code(
@@ -280,7 +299,19 @@ fn map_token_error(status: reqwest::StatusCode, body: &str) -> ProviderError {
 pub struct GoogleTokenRefresher {
     secrets: Arc<dyn SecretRepository>,
     tokens: GoogleTokenClient,
+    refresh_endpoint: Option<RefreshEndpoint>,
     serial: AsyncMutex<()>,
+}
+
+/// The refresh destination when it differs from [`GoogleOAuthConfig::token_url`].
+///
+/// Android's offline exchange keeps the refresh token server-side; the device
+/// sends only `client_id`, `grant_type`, and the refresh token to the Pige
+/// endpoint, which holds the Google Web client secret.
+#[derive(Clone)]
+struct RefreshEndpoint {
+    token_url: Url,
+    client_id: String,
 }
 
 impl GoogleTokenRefresher {
@@ -288,6 +319,26 @@ impl GoogleTokenRefresher {
         Self {
             secrets,
             tokens: GoogleTokenClient::new(oauth),
+            refresh_endpoint: None,
+            serial: AsyncMutex::new(()),
+        }
+    }
+
+    /// Refreshes through an explicit endpoint instead of the OAuth token URL.
+    /// Used by the Android offline exchange, where the server owns the secret.
+    pub fn with_refresh_endpoint(
+        secrets: Arc<dyn SecretRepository>,
+        oauth: GoogleOAuthConfig,
+        token_url: Url,
+        client_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            secrets,
+            tokens: GoogleTokenClient::new(oauth),
+            refresh_endpoint: Some(RefreshEndpoint {
+                token_url,
+                client_id: client_id.into(),
+            }),
             serial: AsyncMutex::new(()),
         }
     }
@@ -325,7 +376,19 @@ impl TokenRefresher for GoogleTokenRefresher {
         let refresh_token = secret.refresh_token.ok_or_else(|| {
             ProviderError::reauthenticate("Google sign-in has expired; sign in again")
         })?;
-        let fresh = self.tokens.refresh(&refresh_token).await?;
+        let fresh = match &self.refresh_endpoint {
+            Some(endpoint) => {
+                self.tokens
+                    .refresh_with(
+                        endpoint.token_url.clone(),
+                        &endpoint.client_id,
+                        None,
+                        &refresh_token,
+                    )
+                    .await?
+            }
+            None => self.tokens.refresh(&refresh_token).await?,
+        };
         ctx.ensure_active()?;
 
         let scopes = if fresh.scopes.is_empty() {
@@ -347,24 +410,47 @@ impl TokenRefresher for GoogleTokenRefresher {
     }
 }
 
-/// Android's platform-owned token source: no refresh token is stored on device.
-/// While the grant lives, the host returns a fresh access token without a
-/// prompt; after revocation the host returns `Reauthenticate`.
+/// Android's provider token source.
+///
+/// When the optional offline exchange persisted a refresh token, that token is
+/// preferred and refreshed through the configured endpoint, so a restart keeps
+/// working without the platform host. Only accounts with no stored refresh token
+/// fall back to the platform-owned on-demand `acquire` model.
 pub struct GoogleAndroidTokenSource {
     host: Arc<dyn GoogleAndroidHost>,
+    secrets: Arc<dyn SecretRepository>,
+    refresher: Arc<GoogleTokenRefresher>,
     account: AccountId,
     scopes: Vec<String>,
     cached: AsyncMutex<Option<(SecretString, i64)>>,
 }
 
 impl GoogleAndroidTokenSource {
-    pub fn new(host: Arc<dyn GoogleAndroidHost>, account: AccountId, scopes: Vec<String>) -> Self {
+    pub fn new(
+        host: Arc<dyn GoogleAndroidHost>,
+        secrets: Arc<dyn SecretRepository>,
+        refresher: Arc<GoogleTokenRefresher>,
+        account: AccountId,
+        scopes: Vec<String>,
+    ) -> Self {
         Self {
             host,
+            secrets,
+            refresher,
             account,
             scopes,
             cached: AsyncMutex::new(None),
         }
+    }
+
+    fn has_stored_refresh_token(&self) -> Result<bool, ProviderError> {
+        let Some(envelope) = self.secrets.load(&self.account)? else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            envelope.credentials,
+            crate::auth::StoredCredentials::Google(secret) if secret.refresh_token.is_some()
+        ))
     }
 }
 
@@ -372,6 +458,12 @@ impl GoogleAndroidTokenSource {
 impl TokenSource for GoogleAndroidTokenSource {
     async fn access_token(&self, ctx: &OperationContext) -> Result<SecretString, ProviderError> {
         ctx.ensure_active()?;
+        // The offline exchange exists so refresh works after a restart. Prefer
+        // the persisted refresh token; the host acquire path is only for grants
+        // that intentionally kept no device refresh token.
+        if self.has_stored_refresh_token()? {
+            return self.refresher.refresh(ctx).await;
+        }
         let mut cached = self.cached.lock().await;
         ctx.ensure_active()?;
         if let Some((token, expires_at)) = cached.as_ref()
@@ -478,9 +570,10 @@ impl GoogleAuthentication {
         }
     }
 
-    /// A per-account token source for the Gmail/People adapters. Desktop refresh
-    /// uses F3's single-flight cache; Android calls the platform host on demand
-    /// rather than storing a refresh token.
+    /// A per-account token source for the Gmail/People adapters. Desktop uses
+    /// F3's single-flight cache. Android prefers a persisted offline refresh
+    /// token (refreshed through the configured exchange), falling back to the
+    /// platform host only when the account has no refresh token.
     pub fn provider_token_source(&self, account: &AccountId) -> Arc<dyn TokenSource> {
         match &self.platform {
             AuthPlatform::Desktop(_) => Arc::new(CachedTokenSource::new(
@@ -490,11 +583,24 @@ impl GoogleAuthentication {
                 )),
                 Duration::from_secs(60),
             )),
-            AuthPlatform::Android { host, .. } => Arc::new(GoogleAndroidTokenSource::new(
-                host.clone(),
-                account.clone(),
-                mail_scopes(),
-            )),
+            AuthPlatform::Android { host, offline } => {
+                let refresher = match offline {
+                    Some(exchange) => GoogleTokenRefresher::with_refresh_endpoint(
+                        self.secrets.clone(),
+                        self.oauth.clone(),
+                        exchange.exchange_url.clone(),
+                        exchange.server_client_id.clone(),
+                    ),
+                    None => GoogleTokenRefresher::new(self.secrets.clone(), self.oauth.clone()),
+                };
+                Arc::new(GoogleAndroidTokenSource::new(
+                    host.clone(),
+                    self.secrets.clone(),
+                    Arc::new(refresher),
+                    account.clone(),
+                    mail_scopes(),
+                ))
+            }
         }
     }
 
@@ -581,8 +687,12 @@ impl GoogleAuthentication {
             ));
         };
         // Re-check after the network exchange: the account may have been
-        // invalidated while Google was answering.
-        self.ensure_attempt_active(attempt)?;
+        // invalidated while Google was answering. A stale attempt must not wait
+        // for its TTL to release the staged candidate.
+        if let Err(error) = self.ensure_attempt_active(attempt) {
+            self.discard_attempt(attempt_id);
+            return Err(error);
+        }
         if !secret
             .scopes
             .iter()
@@ -706,10 +816,14 @@ impl AuthenticationService for GoogleAuthentication {
             }
             AuthPlatform::Android { host, offline } => {
                 let request_offline_access = offline.is_some();
+                let server_client_id = offline
+                    .as_ref()
+                    .map(|exchange| exchange.server_client_id.clone());
                 let launch = AndroidAuthorizationRequest {
                     attempt: attempt_id.clone(),
                     scopes: scopes.clone(),
                     request_offline_access,
+                    server_client_id,
                 };
                 self.attempts.insert(
                     attempt_id.clone(),
@@ -803,6 +917,15 @@ impl AuthenticationService for GoogleAuthentication {
                 _ => {}
             }
         }
+        // The state is the authenticating proof. Only a response that carries
+        // our state may cancel this attempt, so an unsolicited loopback request
+        // with `?error=access_denied` cannot kill a live sign-in.
+        if returned_state.as_deref() != Some(expected_state.as_str()) {
+            self.discard_attempt(attempt);
+            return Err(ProviderError::forbidden(
+                "the Google sign-in response did not match this attempt",
+            ));
+        }
         if let Some(error) = error_code {
             self.discard_attempt(attempt);
             return Err(if error == "access_denied" {
@@ -810,12 +933,6 @@ impl AuthenticationService for GoogleAuthentication {
             } else {
                 ProviderError::reauthenticate("Google sign-in did not complete; sign in again")
             });
-        }
-        if returned_state.as_deref() != Some(expected_state.as_str()) {
-            self.discard_attempt(attempt);
-            return Err(ProviderError::forbidden(
-                "the Google sign-in response did not match this attempt",
-            ));
         }
         let Some(code) = code.filter(|code| !code.is_empty()) else {
             self.discard_attempt(attempt);
@@ -828,6 +945,20 @@ impl AuthenticationService for GoogleAuthentication {
             return Err(ProviderError::transient(
                 "the Google sign-in code was invalid",
             ));
+        }
+
+        // Fence the single-use code: if the account was invalidated or the
+        // attempt cancelled while the browser was open, no network exchange may
+        // run (which would burn the code) and no secret may be staged.
+        let activation = match self.attempts.get(attempt) {
+            Some(state) => self.ensure_attempt_active(state),
+            None => Err(ProviderError::not_found(
+                "the authentication attempt is no longer active",
+            )),
+        };
+        if let Err(error) = activation {
+            self.discard_attempt(attempt);
+            return Err(error);
         }
 
         let tokens = GoogleTokenClient::new(self.oauth.clone())

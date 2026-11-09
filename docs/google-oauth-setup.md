@@ -13,7 +13,7 @@ No client id, client secret, token, or account is committed to the repository.
 | --- | --- |
 | Desktop | System browser → `https://accounts.google.com/o/oauth2/v2/auth`; loopback redirect `http://127.0.0.1:<random port>/`; PKCE S256 + exact `state`; code exchange at `https://oauth2.googleapis.com/token` with no client secret (public desktop client). |
 | Android | Google Identity Services `Identity.getAuthorizationClient(activity).authorize(...)` (`play-services-auth`); consent returns through a `PendingIntent`; no redirect URI, loopback, OOB code, or WebView. |
-| Refresh | Desktop stores the rotated refresh token in the per-account F3 secret envelope and refreshes single-flight. Android keeps **no device refresh token**; the host returns a fresh access token while the grant lives. |
+| Refresh | Refresh tokens are persisted in the per-account F3 secret envelope and refreshed single-flight. Desktop refreshes at `https://oauth2.googleapis.com/token`. Android with the offline exchange refreshes through the configured Pige exchange endpoint (the server holds the Web client secret), so it survives process restart; without the exchange Android keeps **no device refresh token** and the host returns a fresh access token while the grant lives. |
 
 Scopes requested:
 
@@ -41,11 +41,17 @@ Scopes requested:
 5. Optional, only for Android offline/background refresh after process restart:
    create a **Web application** client and supply its id/secret as
    `GOOGLE_WEB_SERVER_CLIENT_ID` plus a Pige auth-server exchange URL whose
-   server holds `GOOGLE_WEB_SERVER_CLIENT_SECRET`. The app passes the client id
-   to `requestOfflineAccess`, receives a `serverAuthCode`, and sends it to that
-   server endpoint (`AndroidOfflineExchange { server_client_id, exchange_url }`);
-   the device never carries the Google client secret. Without this, Android uses
-   on-demand `authorize()` and keeps no refresh token on device. This choice is
+   server holds `GOOGLE_WEB_SERVER_CLIENT_SECRET`. The app passes the server
+   client id to `requestOfflineAccess` (via
+   `AndroidAuthorizationRequest::server_client_id`), receives a
+   `serverAuthCode`, and sends it to that server endpoint
+   (`AndroidOfflineExchange { server_client_id, exchange_url }`); the device
+   never carries the Google client secret. The endpoint must also accept a
+   `grant_type=refresh_token` request (client id, refresh token) and return a
+   fresh access token, optionally rotating the refresh token; that is the path
+   `provider_token_source` prefers whenever a refresh token is stored. Without
+   this configuration Android uses on-demand `authorize()`, keeps no refresh
+   token on device, and falls back to the host `acquire` path. This choice is
    the user distribution decision recorded in S2 §9.9.
 6. Use a **disposable Google account** for live testing. Do not use a personal
    account, and separately authorize the single test send when G4 is verified.
