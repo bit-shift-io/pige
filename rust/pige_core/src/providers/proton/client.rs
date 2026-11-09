@@ -51,11 +51,14 @@ impl ProtonEndpoints {
         Ok(Self { base_url })
     }
 
-    /// Inject a local mock API root in debug/test builds only.
+    /// Inject a local mock API root for this crate's tests only.
     ///
-    /// Release builds do not compile this constructor, so a shipped binary
-    /// cannot be pointed at a cleartext endpoint that would expose tokens.
-    #[cfg(debug_assertions)]
+    /// The constructor is compiled only for `cfg(test)` or when the
+    /// `provider-proton-test-support` feature is enabled (the package's own
+    /// dev-dependency does that for integration tests). Product builds, debug or
+    /// release, cannot be pointed at a cleartext endpoint that would expose
+    /// tokens.
+    #[cfg(any(test, feature = "provider-proton-test-support"))]
     pub fn new_insecure_for_tests(base_url: impl Into<String>) -> Result<Self, ProviderError> {
         let base_url = trim_base_url(base_url.into());
         if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {

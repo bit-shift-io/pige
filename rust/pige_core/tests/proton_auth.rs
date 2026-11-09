@@ -1130,6 +1130,52 @@ async fn resume_generation_fence_prevents_key_resurrection() {
 }
 
 #[tokio::test]
+async fn revoke_racing_key_install_cannot_leave_keys_unlocked() {
+    let mut harness = Harness::new(MockConfig::default()).await;
+    let account = harness.account_id();
+
+    // Land an invalidation exactly where a concurrent `revoke` would: after the
+    // pre-install activity check has passed and before the key install. This is
+    // the window where the install used to run outside the account gate.
+    let sessions = harness.sessions.clone();
+    let keys = harness.keys.clone();
+    let raced_account = account.clone();
+    harness.auth.set_install_hook(move || {
+        sessions
+            .invalidate(&raced_account)
+            .expect("race invalidation");
+        keys.lock_and_remove(&raced_account);
+    });
+
+    let (attempt, _) = challenge_attempt(harness.begin().await);
+    let error = harness
+        .auth
+        .respond(
+            &attempt,
+            AuthAnswer::Password(SecretString::from("account-password")),
+        )
+        .await
+        .expect_err("a revocation that won the race must fence the install");
+    assert!(
+        matches!(error.kind, ErrorKind::Conflict | ErrorKind::Cancelled),
+        "a revocation that won the race must fence the install, got {:?}",
+        error.kind
+    );
+    assert!(
+        !harness.keys_unlocked(),
+        "a revoked sign-in must not leave unlocked keys"
+    );
+    assert!(
+        harness.keys.get(&account).is_none(),
+        "the fenced install must not recreate a key store"
+    );
+    assert!(
+        !harness.staged_present(&attempt),
+        "no credential may be staged after a lost race"
+    );
+}
+
+#[tokio::test]
 async fn logout_unreachable_server_still_locks_and_cancels() {
     let mut harness = Harness::new(MockConfig::default()).await;
     let (attempt, _) = challenge_attempt(harness.begin().await);
@@ -1209,13 +1255,17 @@ async fn proton_registration_resolves_provider_and_auth() {
     let ctx = harness.context();
     let request = harness.request();
     let account = harness.account.clone();
-    let registration =
-        pige_core::providers::proton::proton_registration(factory, harness.auth)
-            .expect("register Proton");
+    let factory_refresher = factory.refresher();
+    let registration = pige_core::providers::proton::proton_registration(factory, harness.auth)
+        .expect("register Proton");
     assert!(
         registration
             .registry
             .contains(&ProviderId::from(PROTON_PROVIDER))
+    );
+    assert!(
+        Arc::ptr_eq(&registration.refresher, &factory_refresher),
+        "the registered auth service and factory must share one refresher"
     );
     let session = registration
         .registry

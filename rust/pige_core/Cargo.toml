@@ -15,6 +15,9 @@ provider-proton = [
     "dep:proton-srp",
     "dep:zeroize",
 ]
+# Test-only surface (mock cleartext endpoints, deterministic install hook).
+# Enabled only by this package's self dev-dependency; never by a product build.
+provider-proton-test-support = []
 
 [dependencies]
 ammonia = "4"
@@ -64,6 +67,9 @@ notify-rust = "4"
 jni = "0.21"
 
 [dev-dependencies]
+# Enable the cfg-gated test-support surface for this package's own unit and
+# integration tests without compiling it into product builds.
+pige_core = { path = ".", features = ["provider-proton-test-support"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"
 # Synthetic HTTP fixtures for the native Proton auth tests. This is a

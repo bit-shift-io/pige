@@ -8,6 +8,32 @@ use std::sync::Arc;
 
 use pige_core::api;
 
+/// Open the same Pige store the core API will use, for a provider factory that
+/// needs session/key generation state before `api::init` runs. Both handles
+/// point at one SQLite file, so durable generations stay shared.
+#[cfg(all(
+    any(feature = "provider-google", feature = "provider-proton"),
+    any(target_os = "linux", target_os = "android")
+))]
+fn open_store(data_dir: &std::path::Path) -> Option<Arc<pige_core::store::Store>> {
+    if let Err(error) = std::fs::create_dir_all(data_dir) {
+        log::warn!("create provider data dir: {error}");
+        return None;
+    }
+    let store = match pige_core::store::Store::open(data_dir.join(pige_core::api::DB_FILE_NAME)) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            log::warn!("open provider store: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = store.migrate() {
+        log::warn!("migrate provider store: {error}");
+        return None;
+    }
+    Some(store)
+}
+
 /// Native Google shell construction (G5).
 ///
 /// Client ids are configuration, never credentials: they come from environment
@@ -27,7 +53,6 @@ mod google {
 
     use tokio::sync::Mutex as AsyncMutex;
 
-    use pige_core::api::DB_FILE_NAME;
     use pige_core::auth::{
         AccountSessionManager, AuthenticationService, CredentialSecretRepository,
     };
@@ -37,7 +62,6 @@ mod google {
         GoogleAuthentication, GoogleEndpoints, GoogleOAuthConfig, google_auth_service,
         google_registry,
     };
-    use pige_core::store::Store;
 
     const ATTEMPT_TTL: Duration = Duration::from_secs(300);
 
@@ -107,7 +131,7 @@ mod google {
 
         let settings = settings(config_dir);
         let client_id = settings.desktop_client_id?;
-        let store = open_store(data_dir)?;
+        let store = super::open_store(data_dir)?;
         let sessions = Arc::new(AccountSessionManager::new(store.clone()));
         let secrets = Arc::new(CredentialSecretRepository::with_gate(
             credentials,
@@ -161,7 +185,7 @@ mod google {
                         exchange_url,
                     })
             });
-        let store = open_store(data_dir)?;
+        let store = super::open_store(data_dir)?;
         let sessions = Arc::new(AccountSessionManager::new(store.clone()));
         let secrets = Arc::new(CredentialSecretRepository::with_gate(
             credentials,
@@ -194,24 +218,75 @@ mod google {
             auth: google_auth_service(make()),
         })
     }
+}
 
-    fn open_store(data_dir: &Path) -> Option<Arc<Store>> {
-        if let Err(error) = std::fs::create_dir_all(data_dir) {
-            log::warn!("create Google bootstrap data dir: {error}");
-            return None;
-        }
-        let store = match Store::open(data_dir.join(DB_FILE_NAME)) {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                log::warn!("open Google bootstrap store: {error}");
-                return None;
-            }
+/// Native Proton provider registration.
+///
+/// This wires only the provider factory. Interactive Proton authentication is
+/// still a P5 shell decision because [`api::Config::auth`] is a single provider
+/// slot; core callers compose both halves with
+/// `pige_core::providers::proton::proton_registration`.
+#[cfg(all(
+    feature = "provider-proton",
+    any(target_os = "linux", target_os = "android")
+))]
+mod proton {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use pige_core::auth::{AccountSessionManager, CredentialSecretRepository};
+    use pige_core::platform::CredentialStore;
+    use pige_core::providers::ProviderRegistry;
+    use pige_core::providers::proton::{
+        ProtonEndpoints, ProtonKeyStores, ProtonProviderFactory, register_proton,
+    };
+
+    pub(super) fn register(
+        registry: &mut ProviderRegistry,
+        data_dir: &Path,
+        credentials: Arc<dyn CredentialStore>,
+    ) {
+        let Some(store) = super::open_store(data_dir) else {
+            return;
         };
-        if let Err(error) = store.migrate() {
-            log::warn!("migrate Google bootstrap store: {error}");
-            return None;
+        let sessions = Arc::new(AccountSessionManager::new(store.clone()));
+        let secrets = Arc::new(CredentialSecretRepository::with_gate(
+            credentials,
+            store.clone(),
+        ));
+        let factory = ProtonProviderFactory::new(
+            sessions,
+            secrets,
+            ProtonEndpoints::production(),
+            Arc::new(ProtonKeyStores::new()),
+        );
+        if let Err(error) = register_proton(registry, factory) {
+            log::warn!("register Proton provider: {}", error.safe_message);
         }
-        Some(store)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use pige_core::platform::fake::FakeCredentials;
+        use pige_core::providers::{PROTON_PROVIDER, ProviderId};
+
+        #[test]
+        fn enabling_provider_proton_registers_the_factory() {
+            let data_dir = std::env::temp_dir().join(format!(
+                "pige-proton-registry-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let credentials: Arc<dyn CredentialStore> = Arc::new(FakeCredentials::default());
+            let mut registry = ProviderRegistry::new();
+            register(&mut registry, &data_dir, credentials);
+            assert!(
+                registry.contains(&ProviderId::from(PROTON_PROVIDER)),
+                "the provider-proton feature must register the Proton factory"
+            );
+            let _ = std::fs::remove_dir_all(&data_dir);
+        }
     }
 }
 
@@ -232,7 +307,10 @@ pub(crate) fn config() -> api::Config {
     let data_dir = xdg_dir("XDG_DATA_HOME", ".local/share");
     let cache_dir = xdg_dir("XDG_CACHE_HOME", ".cache");
     let config_dir = config_dir();
-    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(feature = "provider-google", feature = "provider-proton")),
+        allow(unused_mut)
+    )]
     let mut registry =
         pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone());
     #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
@@ -244,6 +322,8 @@ pub(crate) fn config() -> api::Config {
             Err(error) => log::warn!("compose Google provider: {}", error.safe_message),
         }
     }
+    #[cfg(feature = "provider-proton")]
+    proton::register(&mut registry, &data_dir, credentials.clone());
     let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(registry);
     api::Config {
         data_dir,
@@ -286,7 +366,10 @@ pub(crate) fn config() -> api::Config {
     let transport: Arc<dyn TransportFactory> = Arc::new(
         pige_core::platform::android::AndroidTransportFactory::new(credentials.clone()),
     );
-    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(feature = "provider-google", feature = "provider-proton")),
+        allow(unused_mut)
+    )]
     let mut registry =
         pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone());
     #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
@@ -298,6 +381,8 @@ pub(crate) fn config() -> api::Config {
             Err(error) => log::warn!("compose Google provider: {}", error.safe_message),
         }
     }
+    #[cfg(feature = "provider-proton")]
+    proton::register(&mut registry, &paths.data_dir, credentials.clone());
     let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(registry);
     api::Config {
         config_dir: paths.config_dir,

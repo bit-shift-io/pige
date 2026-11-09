@@ -43,10 +43,14 @@ pub use proton_srp;
 /// The per-account token source builder used by the factory.
 pub struct ProtonProviderFactory {
     sessions: Arc<AccountSessionManager>,
-    secrets: Arc<dyn SecretRepository>,
     endpoints: ProtonEndpoints,
     keys: Arc<ProtonKeyStores>,
     token_sources: Mutex<HashMap<AccountId, Arc<dyn TokenSource>>>,
+    /// One refresher for every token source this factory builds (and, via
+    /// [`proton_registration`], for the interactive auth service). A refresher
+    /// serializes rotation per instance; sharing it keeps a cold resume and a
+    /// provider request from rotating the same refresh token concurrently.
+    refresher: Arc<crate::auth::proton::ProtonTokenRefresher>,
 }
 
 impl ProtonProviderFactory {
@@ -56,13 +60,26 @@ impl ProtonProviderFactory {
         endpoints: ProtonEndpoints,
         keys: Arc<ProtonKeyStores>,
     ) -> Self {
+        let refresher = Arc::new(crate::auth::proton::ProtonTokenRefresher::new(
+            secrets.clone(),
+            endpoints.clone(),
+        ));
         Self {
             sessions,
-            secrets,
             endpoints,
             keys,
             token_sources: Mutex::new(HashMap::new()),
+            refresher,
         }
+    }
+
+    /// The refresher shared by every token source this factory builds.
+    ///
+    /// [`proton_registration`] gives the same instance to the interactive
+    /// authentication service, so resume and provider refreshes cannot rotate
+    /// one account's refresh token in parallel.
+    pub fn refresher(&self) -> Arc<crate::auth::proton::ProtonTokenRefresher> {
+        self.refresher.clone()
     }
 
     pub fn sessions(&self) -> &Arc<AccountSessionManager> {
@@ -87,12 +104,10 @@ impl ProtonProviderFactory {
         if let Some(source) = cached.get(account) {
             return source.clone();
         }
-        let refresher = Arc::new(crate::auth::proton::ProtonTokenRefresher::new(
-            self.secrets.clone(),
-            self.endpoints.clone(),
+        let source: Arc<dyn TokenSource> = Arc::new(CachedTokenSource::new(
+            self.refresher.clone(),
+            Duration::from_secs(60),
         ));
-        let source: Arc<dyn TokenSource> =
-            Arc::new(CachedTokenSource::new(refresher, Duration::from_secs(60)));
         cached.insert(account.clone(), source.clone());
         source
     }
@@ -170,16 +185,24 @@ pub fn proton_registry(factory: ProtonProviderFactory) -> Result<ProviderRegistr
 pub struct ProtonRegistration {
     pub registry: ProviderRegistry,
     pub authentication: Arc<AsyncMutex<Box<dyn AuthenticationService>>>,
+    /// The single refresher now shared by the factory's token sources and the
+    /// interactive authentication service.
+    pub refresher: Arc<crate::auth::proton::ProtonTokenRefresher>,
 }
 
-/// Build the registered Proton provider and authentication service together.
+/// Build the registered Proton provider and authentication service together,
+/// sharing one token refresher so resume and provider requests serialize
+/// rotation of the same refresh token.
 pub fn proton_registration(
     factory: ProtonProviderFactory,
     authentication: ProtonAuthentication,
 ) -> Result<ProtonRegistration, ProviderError> {
+    let refresher = factory.refresher();
+    let authentication = authentication.with_refresher(refresher.clone());
     Ok(ProtonRegistration {
         registry: proton_registry(factory)?,
         authentication: proton_auth_service(authentication),
+        refresher,
     })
 }
 

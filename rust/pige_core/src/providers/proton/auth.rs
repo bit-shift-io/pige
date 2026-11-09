@@ -382,6 +382,11 @@ pub struct ProtonAuthentication {
     logout_timeout: Duration,
     refresher: Arc<crate::auth::proton::ProtonTokenRefresher>,
     attempts: HashMap<AuthAttemptId, Attempt>,
+    /// Test-only seam that runs after key unlock/activity checks and before the
+    /// fenced key install. Tests use it to land a revocation in that window
+    /// deterministically; product builds do not compile it.
+    #[cfg(any(test, feature = "provider-proton-test-support"))]
+    install_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ProtonAuthentication {
@@ -407,7 +412,36 @@ impl ProtonAuthentication {
             logout_timeout: DEFAULT_LOGOUT_TIMEOUT,
             refresher,
             attempts: HashMap::new(),
+            #[cfg(any(test, feature = "provider-proton-test-support"))]
+            install_hook: None,
         }
+    }
+
+    #[cfg(any(test, feature = "provider-proton-test-support"))]
+    #[doc(hidden)]
+    pub fn set_install_hook(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.install_hook = Some(Arc::new(hook));
+    }
+
+    /// Replace the token refresher, for callers that must share one instance
+    /// with the [`super::ProtonProviderFactory`].
+    ///
+    /// One [`crate::auth::proton::ProtonTokenRefresher`] has one serial mutex;
+    /// two independently constructed instances can race to rotate the same
+    /// refresh token. [`super::proton_registration`] wires the factory and auth
+    /// service to the same instance.
+    #[must_use]
+    pub fn with_refresher(
+        mut self,
+        refresher: Arc<crate::auth::proton::ProtonTokenRefresher>,
+    ) -> Self {
+        self.refresher = refresher;
+        self
+    }
+
+    #[must_use]
+    pub fn refresher(&self) -> Arc<crate::auth::proton::ProtonTokenRefresher> {
+        self.refresher.clone()
     }
 
     #[must_use]
@@ -571,6 +605,45 @@ impl ProtonAuthentication {
             ));
         }
         Ok(())
+    }
+
+    /// Install freshly unlocked keys under the account gate shared with
+    /// [`AccountSessionManager::invalidate`] and account removal.
+    ///
+    /// Both `resume` and `finish_with_password` use this helper. Checking
+    /// activity before the install is not enough: a revocation can land between
+    /// that check and the install. Inside the gate the durable generation is
+    /// re-read, so a stale sign-in/resume wipes its material and installs
+    /// nothing instead of resurrecting unlocked keys after logout.
+    fn install_keys_fenced(
+        &self,
+        account: &AccountId,
+        ctx: &OperationContext,
+        uid: String,
+        keys: proton_core::crypto::keys::KeyStore,
+    ) -> Result<Arc<super::keys::UnlockedKeyStore>, ProviderError> {
+        self.store.with_account_gate(account, || {
+            let fenced = (|| {
+                ctx.ensure_active()?;
+                if self.sessions.generation(account)? != ctx.generation {
+                    return Err(ProviderError::conflict(
+                        "the account changed while installing Proton keys",
+                    ));
+                }
+                Ok(())
+            })();
+            match fenced {
+                Ok(()) => {
+                    let store = self.keys.get_or_create(account);
+                    store.install(uid, keys);
+                    Ok(store)
+                }
+                Err(error) => {
+                    crate::providers::proton::keys::wipe_key_store(keys);
+                    Err(error)
+                }
+            }
+        })
     }
 
     async fn answer_password(
@@ -830,10 +903,23 @@ impl ProtonAuthentication {
             return Err(error);
         }
 
-        // Install only after a successful unlock. If staging or the pending row
-        // then fails, wipe the material so a failed attempt leaves nothing open.
-        let key_store = self.keys.get_or_create(&account_id);
-        key_store.install(uid.clone(), keys);
+        // Test seam: a revocation in this window used to install keys after
+        // logout had already wiped them.
+        #[cfg(any(test, feature = "provider-proton-test-support"))]
+        if let Some(hook) = &self.install_hook {
+            hook();
+        }
+
+        // Install only after a successful unlock, under the same account gate as
+        // `invalidate`/removal and with a durable generation recheck. If the
+        // install is fenced out, the helper wipes the material.
+        let key_store = match self.install_keys_fenced(&account_id, &ctx, uid.clone(), keys) {
+            Ok(key_store) => key_store,
+            Err(error) => {
+                self.discard_attempt(attempt_id);
+                return Err(error);
+            }
+        };
 
         let envelope = crate::auth::proton::proton_envelope(
             uid,
@@ -949,28 +1035,7 @@ impl ProtonAuthentication {
         // resume that lost the race must not recreate a key store after logout,
         // and the durable generation is checked inside the same gate as the
         // install.
-        let fence_ctx = ctx.clone();
-        self.store.with_account_gate(account, || {
-            let fenced = (|| {
-                fence_ctx.ensure_active()?;
-                if self.sessions.generation(account)? != fence_ctx.generation {
-                    return Err(ProviderError::conflict(
-                        "the account changed during Proton resume",
-                    ));
-                }
-                Ok(())
-            })();
-            match fenced {
-                Ok(()) => {
-                    self.keys.get_or_create(account).install(uid, keys);
-                    Ok(())
-                }
-                Err(error) => {
-                    crate::providers::proton::keys::wipe_key_store(keys);
-                    Err(error)
-                }
-            }
-        })?;
+        self.install_keys_fenced(account, &ctx, uid, keys)?;
 
         let email = self
             .store

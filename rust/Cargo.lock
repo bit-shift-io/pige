@@ -4721,6 +4721,7 @@ dependencies = [
  "mail-parser 1.0.1",
  "markup5ever_rcdom",
  "notify-rust",
+ "pige_core",
  "proton-core",
  "proton-crypto",
  "proton-srp",
