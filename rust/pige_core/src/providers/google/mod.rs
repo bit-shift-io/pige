@@ -36,6 +36,8 @@ pub use people::{GOOGLE_OTHER_CONTACTS_SOURCE, GOOGLE_SAVED_CONTACTS_SOURCE, Goo
 pub use submission::GmailSubmission;
 pub use sync::{GmailSync, cursor_stage, request_collection};
 
+#[cfg(target_os = "android")]
+pub use android::AndroidPlatformHost;
 pub use android::{
     AndroidAuthorizationRequest, AndroidOfflineExchange, GoogleAndroidHost, GoogleAndroidResult,
     GoogleAuthorizationOutcome, GoogleAuthorizationResult, GoogleIdentity, deliver_native_result,
@@ -212,16 +214,27 @@ impl ProviderFactory for GoogleProviderFactory {
 }
 
 /// Register the Gmail adapter in an application-owned registry.
+pub fn register_google(
+    registry: &mut ProviderRegistry,
+    auth: Arc<AccountSessionManager>,
+    endpoints: GoogleEndpoints,
+    authentication: Arc<GoogleAuthentication>,
+) -> Result<(), ProviderError> {
+    registry.register(
+        ProviderId::from(GMAIL_PROVIDER),
+        Arc::new(GoogleProviderFactory::new(auth, endpoints).with_authentication(authentication)),
+    )
+}
+
+/// A standalone registry containing only Gmail. The application shell composes
+/// this with its IMAP registry through [`ProviderRegistry::merge`].
 pub fn google_registry(
     auth: Arc<AccountSessionManager>,
     endpoints: GoogleEndpoints,
     authentication: Arc<GoogleAuthentication>,
 ) -> Result<ProviderRegistry, ProviderError> {
     let mut registry = ProviderRegistry::new();
-    registry.register(
-        ProviderId::from(GMAIL_PROVIDER),
-        Arc::new(GoogleProviderFactory::new(auth, endpoints).with_authentication(authentication)),
-    )?;
+    register_google(&mut registry, auth, endpoints, authentication)?;
     Ok(registry)
 }
 

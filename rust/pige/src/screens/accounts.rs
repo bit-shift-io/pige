@@ -36,6 +36,15 @@ pub enum AccountField {
     SmtpPort,
 }
 
+/// How a new account authenticates. Native Google is deliberately separate from
+/// the existing Gmail-over-IMAP preset: an existing Gmail IMAP account keeps
+/// editing its servers until the user explicitly switches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountMethod {
+    Google,
+    Imap,
+}
+
 /// The result of the last connection test.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TestState {
@@ -50,6 +59,13 @@ pub enum TestState {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AccountForm {
     pub editing: Option<AccountId>,
+    pub method: AccountMethod,
+    /// True when editing an account that has no IMAP endpoints (native Gmail).
+    /// Such an account can only reconnect through Google sign-in.
+    pub native: bool,
+    /// The user's optional Google People opt-in for a new or re-authenticated
+    /// Google account.
+    pub google_contacts: bool,
     pub label: String,
     pub email: String,
     pub display_name: String,
@@ -71,6 +87,9 @@ impl std::fmt::Debug for AccountForm {
         formatter
             .debug_struct("AccountForm")
             .field("editing", &self.editing)
+            .field("method", &self.method)
+            .field("native", &self.native)
+            .field("google_contacts", &self.google_contacts)
             .field("label", &self.label)
             .field("email", &self.email)
             .field("display_name", &self.display_name)
@@ -96,6 +115,9 @@ impl AccountForm {
         let defaults = preset(ProviderPreset::Gmail);
         Self {
             editing: None,
+            method: AccountMethod::Imap,
+            native: false,
+            google_contacts: false,
             label: "Personal".to_string(),
             email: String::new(),
             display_name: String::new(),
@@ -147,8 +169,19 @@ impl AccountForm {
             Some(_) => detect(&imap_host, &smtp_host),
             None => ProviderPreset::Manual,
         };
+        let native = imap_smtp.is_none();
+        let google_contacts = account.contact_sources.iter().any(|source| {
+            source.id.as_str() == pige_core::account::GOOGLE_SAVED_CONTACTS_SOURCE_ID
+        });
         Self {
             editing: Some(account.id.clone()),
+            method: if native {
+                AccountMethod::Google
+            } else {
+                AccountMethod::Imap
+            },
+            native,
+            google_contacts,
             label: account.label.clone(),
             email: account.email.clone(),
             display_name: account.display_name.clone(),
@@ -205,6 +238,18 @@ impl AccountForm {
         }
         self.imap_security = defaults.security;
         self.smtp_security = defaults.security;
+        self.test = TestState::Idle;
+    }
+
+    /// Select the native Google or manual IMAP/SMTP path. Switching to IMAP
+    /// leaves whatever server fields were last shown; the form still requires
+    /// the user to save an IMAP account explicitly.
+    pub fn choose_method(&mut self, method: AccountMethod) {
+        if self.native {
+            self.method = AccountMethod::Google;
+            return;
+        }
+        self.method = method;
         self.test = TestState::Idle;
     }
 
@@ -283,7 +328,17 @@ impl AccountsState {
     }
 
     pub fn start_new(&mut self) {
-        self.form = Some(AccountForm::new());
+        self.start_new_with_google(false);
+    }
+
+    /// Start the add-account form. When this build registers native Google, the
+    /// Google path is the default; manual IMAP stays one chip away.
+    pub fn start_new_with_google(&mut self, google_available: bool) {
+        let mut form = AccountForm::new();
+        if google_available {
+            form.choose_method(AccountMethod::Google);
+        }
+        self.form = Some(form);
         self.confirm_remove = None;
         self.notice = None;
     }
@@ -327,7 +382,12 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
     }
 
     let body: Element<'a, Message> = if let Some(form) = &app.accounts.form {
-        form_view(form)
+        let google_available = app
+            .snapshot
+            .available_providers
+            .iter()
+            .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
+        form_view(form, google_available)
     } else {
         list_view(app)
     };
@@ -382,6 +442,11 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
             "Add your first mailbox to start syncing mail.",
         );
     }
+    let google_available = app
+        .snapshot
+        .available_providers
+        .iter()
+        .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
 
     let mut list = column![].spacing(palette.space.md).width(Fill);
     for account in &app.snapshot.accounts {
@@ -390,6 +455,12 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
             .label_drafts
             .get(&account.id)
             .unwrap_or(&account.label);
+        let provider_label = match account.provider.as_str() {
+            "gmail" => "Native Google",
+            "imap-smtp" if looks_like_gmail(&account.email) => "Gmail over IMAP",
+            "imap-smtp" => "IMAP/SMTP",
+            other => other,
+        };
 
         let header = row![
             styled(
@@ -428,16 +499,77 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
         .align_y(Alignment::End)
         .width(Fill);
 
+        let provider_row = row![
+            styled(provider_label, TextRole::LabelMedium, palette.on_surface),
+            styled(
+                account.unavailable_reason.clone().unwrap_or_default(),
+                TextRole::LabelMedium,
+                palette.error,
+            )
+            .width(Fill),
+        ]
+        .spacing(palette.space.sm)
+        .align_y(Alignment::Center)
+        .width(Fill);
+
+        let mut google_actions = row![].spacing(palette.space.sm).align_y(Alignment::Center);
+        if account.provider == pige_core::providers::GMAIL_PROVIDER && google_available {
+            google_actions = google_actions.push(components::button(
+                "Reconnect",
+                ButtonVariant::Outlined,
+                Message::GoogleAuth {
+                    account: Some(account.id.clone()),
+                    enable_contacts: false,
+                    switch_backend: false,
+                },
+            ));
+            let contacts_on = account.contact_sources.iter().any(|source| {
+                source.source.as_str() == pige_core::account::GOOGLE_SAVED_CONTACTS_SOURCE_ID
+                    && source.enabled
+            });
+            google_actions = google_actions.push(components::button(
+                if contacts_on {
+                    "Disable Google contacts"
+                } else {
+                    "Enable Google contacts"
+                },
+                ButtonVariant::Text,
+                Message::GoogleContactsToggle(account.id.clone(), !contacts_on),
+            ));
+        } else if account.provider == pige_core::providers::IMAP_SMTP_PROVIDER
+            && google_available
+            && looks_like_gmail(&account.email)
+        {
+            google_actions = google_actions.push(components::button(
+                "Switch to native Google",
+                ButtonVariant::Outlined,
+                Message::GoogleAuth {
+                    account: Some(account.id.clone()),
+                    enable_contacts: false,
+                    switch_backend: true,
+                },
+            ));
+        }
+
         list = list.push(
-            container(column![label_row, header, color_picker(account)].spacing(palette.space.sm))
-                .width(Fill)
-                .padding(palette.space.lg)
-                .style(move |_| container::Style {
-                    background: Some(palette.surface_container.into()),
-                    text_color: Some(palette.on_surface),
-                    border: iced::border::rounded(palette.radius.md),
-                    ..Default::default()
-                }),
+            container(
+                column![
+                    label_row,
+                    header,
+                    provider_row,
+                    google_actions,
+                    color_picker(account)
+                ]
+                .spacing(palette.space.sm),
+            )
+            .width(Fill)
+            .padding(palette.space.lg)
+            .style(move |_| container::Style {
+                background: Some(palette.surface_container.into()),
+                text_color: Some(palette.on_surface),
+                border: iced::border::rounded(palette.radius.md),
+                ..Default::default()
+            }),
         );
     }
     list.into()
@@ -493,104 +625,182 @@ fn color_picker<'a>(account: &'a AccountSummary) -> Element<'a, Message> {
     .into()
 }
 
-fn form_view<'a>(form: &'a AccountForm) -> Element<'a, Message> {
+fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, Message> {
     let palette = theme::active();
-    let title = if form.editing.is_some() {
+    let title = if form.native {
+        "Google account"
+    } else if form.editing.is_some() {
         "Edit account"
     } else {
         "Add account"
     };
+    let is_google = form.method == AccountMethod::Google;
 
-    let mut providers = row![].spacing(palette.space.sm).align_y(Alignment::Center);
-    for choice in ProviderPreset::CHOICES {
-        providers = providers.push(components::chip(
-            choice.label(),
-            form.preset == choice,
-            Message::AccountPresetChanged(choice),
-        ));
-    }
+    let mut fields = column![styled(title, TextRole::TitleMedium, palette.on_surface)]
+        .spacing(palette.space.md)
+        .width(Fill);
 
-    let mut fields = column![
-        styled(title, TextRole::TitleMedium, palette.on_surface),
-        components::text_field("Label", &form.label, |value| {
-            Message::AccountFieldChanged(AccountField::Label, value)
-        }),
-        components::text_field("Email", &form.email, |value| {
-            Message::AccountFieldChanged(AccountField::Email, value)
-        }),
-        components::text_field("Display name", &form.display_name, |value| {
-            Message::AccountFieldChanged(AccountField::DisplayName, value)
-        }),
-        components::text_field("Username", &form.username, |value| {
-            Message::AccountFieldChanged(AccountField::Username, value)
-        }),
-        components::password_field("Password", &form.password, |value| {
-            Message::AccountPasswordChanged(crate::message::Password::new(value))
-        }),
-        styled(
-            if form.editing.is_some() {
-                "Re-enter the password to test and save this account."
-            } else {
-                "Use an app password where your provider requires one."
-            },
-            TextRole::LabelMedium,
-            palette.on_surface_variant,
-        ),
-        styled("Provider", TextRole::LabelLarge, palette.on_surface),
-        providers,
-        styled(
-            form.preset.hint(),
-            TextRole::LabelMedium,
-            palette.on_surface_variant
-        ),
-        styled("IMAP", TextRole::LabelLarge, palette.on_surface),
-        components::text_field("Host", &form.imap_host, |value| {
-            Message::AccountFieldChanged(AccountField::ImapHost, value)
-        }),
-        components::text_field("Port", &form.imap_port, |value| {
-            Message::AccountFieldChanged(AccountField::ImapPort, value)
-        }),
-        security_row(
-            "IMAP security",
-            form.imap_security,
-            Message::AccountImapSecurityChanged(Security::Tls),
-            Message::AccountImapSecurityChanged(Security::StartTls),
-        ),
-        styled("SMTP", TextRole::LabelLarge, palette.on_surface),
-        components::text_field("Host", &form.smtp_host, |value| {
-            Message::AccountFieldChanged(AccountField::SmtpHost, value)
-        }),
-        components::text_field("Port", &form.smtp_port, |value| {
-            Message::AccountFieldChanged(AccountField::SmtpPort, value)
-        }),
-        security_row(
-            "SMTP security",
-            form.smtp_security,
-            Message::AccountSmtpSecurityChanged(Security::Tls),
-            Message::AccountSmtpSecurityChanged(Security::StartTls),
-        ),
-    ]
-    .spacing(palette.space.md)
-    .width(Fill);
-
-    match &form.test {
-        TestState::Idle => {}
-        TestState::Testing => {
-            fields = fields.push(styled(
-                "Testing connection…",
-                TextRole::BodyMedium,
+    if !form.native {
+        let mut methods = row![].spacing(palette.space.sm).align_y(Alignment::Center);
+        if google_available {
+            methods = methods.push(components::chip(
+                "Google account",
+                is_google,
+                Message::AccountMethodChanged(AccountMethod::Google),
+            ));
+        } else {
+            methods = methods.push(styled(
+                "Google account (not available in this build)",
+                TextRole::LabelMedium,
                 palette.on_surface_variant,
             ));
         }
-        TestState::Passed => {
+        methods = methods.push(components::chip(
+            "IMAP/SMTP",
+            !is_google,
+            Message::AccountMethodChanged(AccountMethod::Imap),
+        ));
+        fields = fields
+            .push(styled(
+                "Account type",
+                TextRole::LabelLarge,
+                palette.on_surface,
+            ))
+            .push(methods);
+    }
+
+    if is_google {
+        fields = fields.push(styled(
+            if form.native {
+                "Reconnect this account with Google. No password is stored, and existing local mail stays cached."
+            } else {
+                "Sign in with Google in your browser. Pige stores no password and uses Gmail's native API instead of IMAP."
+            },
+            TextRole::BodyMedium,
+            palette.on_surface_variant,
+        ));
+        if form.editing.is_some() {
             fields = fields.push(styled(
-                "Connection works.",
-                TextRole::BodyMedium,
-                palette.primary,
+                format!("{} — {}", form.label, form.email),
+                TextRole::LabelMedium,
+                palette.on_surface,
             ));
         }
-        TestState::Failed(error) => {
-            fields = fields.push(styled(error.clone(), TextRole::BodyMedium, palette.error));
+        if google_available {
+            fields = fields.push(components::chip(
+                "Sync Google contacts (optional)",
+                form.google_contacts,
+                Message::AccountGoogleContactsToggled(!form.google_contacts),
+            ));
+        }
+        if !form.native {
+            fields = fields
+                .push(components::text_field("Label", &form.label, |value| {
+                    Message::AccountFieldChanged(AccountField::Label, value)
+                }))
+                .push(components::text_field(
+                    "Display name",
+                    &form.display_name,
+                    |value| Message::AccountFieldChanged(AccountField::DisplayName, value),
+                ));
+        }
+    } else {
+        let mut providers = row![].spacing(palette.space.sm).align_y(Alignment::Center);
+        for choice in ProviderPreset::CHOICES {
+            providers = providers.push(components::chip(
+                choice.label(),
+                form.preset == choice,
+                Message::AccountPresetChanged(choice),
+            ));
+        }
+        fields = fields
+            .push(components::text_field("Label", &form.label, |value| {
+                Message::AccountFieldChanged(AccountField::Label, value)
+            }))
+            .push(components::text_field("Email", &form.email, |value| {
+                Message::AccountFieldChanged(AccountField::Email, value)
+            }))
+            .push(components::text_field(
+                "Display name",
+                &form.display_name,
+                |value| Message::AccountFieldChanged(AccountField::DisplayName, value),
+            ))
+            .push(components::text_field(
+                "Username",
+                &form.username,
+                |value| Message::AccountFieldChanged(AccountField::Username, value),
+            ))
+            .push(components::password_field(
+                "Password",
+                &form.password,
+                |value| Message::AccountPasswordChanged(crate::message::Password::new(value)),
+            ))
+            .push(styled(
+                if form.editing.is_some() {
+                    "Re-enter the password to test and save this account."
+                } else {
+                    "Use an app password where your provider requires one."
+                },
+                TextRole::LabelMedium,
+                palette.on_surface_variant,
+            ))
+            .push(styled(
+                "IMAP provider",
+                TextRole::LabelLarge,
+                palette.on_surface,
+            ))
+            .push(providers)
+            .push(styled(
+                form.preset.hint(),
+                TextRole::LabelMedium,
+                palette.on_surface_variant,
+            ))
+            .push(styled("IMAP", TextRole::LabelLarge, palette.on_surface))
+            .push(components::text_field("Host", &form.imap_host, |value| {
+                Message::AccountFieldChanged(AccountField::ImapHost, value)
+            }))
+            .push(components::text_field("Port", &form.imap_port, |value| {
+                Message::AccountFieldChanged(AccountField::ImapPort, value)
+            }))
+            .push(security_row(
+                "IMAP security",
+                form.imap_security,
+                Message::AccountImapSecurityChanged(Security::Tls),
+                Message::AccountImapSecurityChanged(Security::StartTls),
+            ))
+            .push(styled("SMTP", TextRole::LabelLarge, palette.on_surface))
+            .push(components::text_field("Host", &form.smtp_host, |value| {
+                Message::AccountFieldChanged(AccountField::SmtpHost, value)
+            }))
+            .push(components::text_field("Port", &form.smtp_port, |value| {
+                Message::AccountFieldChanged(AccountField::SmtpPort, value)
+            }))
+            .push(security_row(
+                "SMTP security",
+                form.smtp_security,
+                Message::AccountSmtpSecurityChanged(Security::Tls),
+                Message::AccountSmtpSecurityChanged(Security::StartTls),
+            ));
+
+        match &form.test {
+            TestState::Idle => {}
+            TestState::Testing => {
+                fields = fields.push(styled(
+                    "Testing connection…",
+                    TextRole::BodyMedium,
+                    palette.on_surface_variant,
+                ));
+            }
+            TestState::Passed => {
+                fields = fields.push(styled(
+                    "Connection works.",
+                    TextRole::BodyMedium,
+                    palette.primary,
+                ));
+            }
+            TestState::Failed(error) => {
+                fields = fields.push(styled(error.clone(), TextRole::BodyMedium, palette.error));
+            }
         }
     }
 
@@ -600,8 +810,32 @@ fn form_view<'a>(form: &'a AccountForm) -> Element<'a, Message> {
             TextRole::BodyMedium,
             palette.on_surface_variant
         )]
+    } else if is_google {
+        let mut actions = row![components::button(
+            "Cancel",
+            ButtonVariant::Text,
+            Message::AccountCancel
+        )]
+        .spacing(palette.space.sm)
+        .align_y(Alignment::Center);
+        if google_available {
+            actions = actions.push(components::button(
+                if form.editing.is_some() {
+                    "Reconnect with Google"
+                } else {
+                    "Sign in with Google"
+                },
+                ButtonVariant::Filled,
+                Message::GoogleAuth {
+                    account: form.editing.clone(),
+                    enable_contacts: form.google_contacts,
+                    switch_backend: false,
+                },
+            ));
+        }
+        actions
     } else {
-        row![
+        let mut actions = row![
             components::button(
                 "Test connection",
                 ButtonVariant::Outlined,
@@ -618,20 +852,36 @@ fn form_view<'a>(form: &'a AccountForm) -> Element<'a, Message> {
                 Message::AccountSave,
             ),
         ]
+        .spacing(palette.space.sm)
+        .align_y(Alignment::Center);
+        if form.editing.is_some() && google_available && looks_like_gmail(&form.email) {
+            actions = actions.push(components::button(
+                "Switch to native Google",
+                ButtonVariant::Outlined,
+                Message::GoogleAuth {
+                    account: form.editing.clone(),
+                    enable_contacts: form.google_contacts,
+                    switch_backend: true,
+                },
+            ));
+        }
+        actions
     };
 
     container(
-        column![
-            fields,
-            actions.spacing(palette.space.sm).align_y(Alignment::Center)
-        ]
-        .spacing(palette.space.lg)
-        .width(Fill)
-        .max_width(palette.metrics.dialog_width),
+        column![fields, actions]
+            .spacing(palette.space.lg)
+            .width(Fill)
+            .max_width(palette.metrics.dialog_width),
     )
     .width(Fill)
     .padding(palette.space.xl)
     .into()
+}
+
+fn looks_like_gmail(email: &str) -> bool {
+    let domain = email.rsplit('@').next().unwrap_or_default().to_lowercase();
+    domain == "gmail.com" || domain == "googlemail.com"
 }
 
 fn security_row<'a>(
@@ -689,6 +939,74 @@ mod tests {
         assert_eq!(form.smtp_port, "465");
         assert_eq!(form.label, "Personal");
         assert_eq!(form.test, TestState::Idle);
+    }
+
+    #[test]
+    fn google_onboarding_is_separate_from_the_gmail_imap_preset() {
+        let mut form = AccountForm::new();
+        form.choose_method(AccountMethod::Google);
+        assert_eq!(form.method, AccountMethod::Google);
+        // The Gmail preset is still IMAP; selecting Google never invents a
+        // password requirement or reuses the IMAP server fields.
+        form.choose_preset(ProviderPreset::Gmail);
+        assert_eq!(form.method, AccountMethod::Google);
+        assert_eq!(form.imap_host, "imap.gmail.com");
+    }
+
+    #[test]
+    fn an_existing_gmail_imap_account_still_edits_as_imap() {
+        let account = Account {
+            id: AccountId("imap-gmail".into()),
+            label: "Old Gmail".into(),
+            email: "person@gmail.com".into(),
+            display_name: "Person".into(),
+            backend: pige_core::account::MailBackend::ImapSmtp {
+                username: "person@gmail.com".into(),
+                imap: pige_core::account::ServerConfig {
+                    host: "imap.gmail.com".into(),
+                    port: 993,
+                    security: Security::Tls,
+                },
+                smtp: pige_core::account::ServerConfig {
+                    host: "smtp.gmail.com".into(),
+                    port: 465,
+                    security: Security::Tls,
+                },
+                auth: pige_core::account::AuthKind::Password,
+            },
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        };
+        let form = AccountForm::from_account(&account);
+        assert_eq!(form.method, AccountMethod::Imap);
+        assert!(!form.native);
+        assert_eq!(form.imap_host, "imap.gmail.com");
+        assert_eq!(form.smtp_host, "smtp.gmail.com");
+        assert!(looks_like_gmail(&form.email));
+    }
+
+    #[test]
+    fn a_native_google_account_cannot_be_saved_as_imap() {
+        let account = Account {
+            id: AccountId("native".into()),
+            label: "Google".into(),
+            email: "person@example.com".into(),
+            display_name: "Person".into(),
+            backend: pige_core::account::MailBackend::gmail("google-user"),
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        };
+        let mut form = AccountForm::from_account(&account);
+        assert_eq!(form.method, AccountMethod::Google);
+        assert!(form.native);
+        form.choose_method(AccountMethod::Imap);
+        assert_eq!(
+            form.method,
+            AccountMethod::Google,
+            "a native account has no IMAP endpoints to edit"
+        );
     }
 
     #[test]
@@ -784,6 +1102,9 @@ mod tests {
                 color: "#00897b".into(),
                 learning_paused: false,
                 contact_sources: Vec::new(),
+                provider: "imap-smtp".into(),
+                available: true,
+                unavailable_reason: None,
             }],
             ..ModelSnapshot::default()
         };

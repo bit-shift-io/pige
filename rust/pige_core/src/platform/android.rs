@@ -150,6 +150,26 @@ fn call_void_int(method: &str, value: i32) -> Result<()> {
     })
 }
 
+/// Launch Google Identity Services consent for one Rust auth attempt. The Kotlin
+/// helper forwards the validated result through
+/// `GoogleAuthorization.nativeResult`; `server_client_id` is empty when no
+/// offline exchange is configured.
+pub fn launch_google_authorization(
+    attempt: &str,
+    scopes_json: &str,
+    server_client_id: Option<&str>,
+) -> Result<()> {
+    call_void(
+        "launchGoogleAuthorization",
+        &[attempt, scopes_json, server_client_id.unwrap_or("")],
+    )
+}
+
+/// Dismiss the platform consent UI bound to one attempt, if it is still open.
+pub fn cancel_google_authorization(attempt: &str) -> Result<()> {
+    call_void("cancelGoogleAuthorization", &[attempt])
+}
+
 /// Replace the periodic background sync with one that runs every `minutes`.
 ///
 /// WorkManager enforces its own 15-minute minimum, and the settings layer

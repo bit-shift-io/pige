@@ -65,7 +65,7 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page
 FLAGS=()
 if [[ "$MODE" == release ]]; then FLAGS+=(--release); TASK=assembleRelease; else TASK=assembleDebug; fi
 cargo build --locked --manifest-path "$ROOT/rust/Cargo.toml" -p pige --lib \
-    --target aarch64-linux-android "${FLAGS[@]}"
+    --target aarch64-linux-android --features provider-google "${FLAGS[@]}"
 mkdir -p "$ROOT/android/app/src/main/jniLibs/arm64-v8a"
 cp "$ROOT/rust/target/aarch64-linux-android/$MODE/libpige.so" \
     "$ROOT/android/app/src/main/jniLibs/arm64-v8a/"

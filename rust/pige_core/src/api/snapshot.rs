@@ -23,6 +23,13 @@ pub struct AccountSummary {
     pub learning_paused: bool,
     /// Durable progress for this account's configured contact sources.
     pub contact_sources: Vec<ContactSyncSummary>,
+    /// The provider id that owns this account (`imap-smtp`, `gmail`, ...).
+    pub provider: String,
+    /// Whether this build's registry can open the provider. An unavailable
+    /// account is still listed and readable; it is never treated as corrupt.
+    pub available: bool,
+    /// A user-facing explanation when `available` is false.
+    pub unavailable_reason: Option<String>,
 }
 
 /// Read-only contact-source progress for settings and account rows.
@@ -135,6 +142,9 @@ pub struct ModelSnapshot {
     pub revision: u64,
     pub accounts: Vec<AccountSummary>,
     pub sections: Vec<AccountSection>,
+    /// Provider ids this build registered. The add-account UI offers native
+    /// Google only when `gmail` is present.
+    pub available_providers: Vec<String>,
     /// Unread across every account's Inbox folders; rendered above sections.
     pub unified_inbox_unread: u32,
     /// Whether the unified inbox, rather than one folder, is selected.

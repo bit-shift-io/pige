@@ -7,8 +7,10 @@ use iced::window;
 use iced::{Subscription, Task};
 use pige_core::account::AccountId;
 use pige_core::api::{self, AccountInput, ConfigOutcome, ModelSnapshot};
+use pige_core::auth::{AuthChallenge, AuthProgress, AuthRequest};
 use pige_core::mail::{FolderId, FolderKind, ThreadId};
 use pige_core::platform::credentials_unavailable;
+use pige_core::providers::{AuthAttemptId, ContactSourceId, GMAIL_PROVIDER, ProviderId};
 use pige_core::settings::{Settings, ThemeMode};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -321,7 +323,12 @@ impl App {
                 // First run goes straight to the form; afterwards the screen
                 // shows the list so labels and removals are one click away.
                 if self.snapshot.accounts.is_empty() {
-                    self.accounts.start_new();
+                    let google_available = self
+                        .snapshot
+                        .available_providers
+                        .iter()
+                        .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
+                    self.accounts.start_new_with_google(google_available);
                 }
             }
             Message::CloseAccounts => {
@@ -329,7 +336,14 @@ impl App {
                 self.accounts.close_form();
                 self.accounts.confirm_remove = None;
             }
-            Message::AccountNew => self.accounts.start_new(),
+            Message::AccountNew => {
+                let google_available = self
+                    .snapshot
+                    .available_providers
+                    .iter()
+                    .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
+                self.accounts.start_new_with_google(google_available);
+            }
             Message::AccountEdit(id) => {
                 return Task::perform(async move { api::account(&id) }, Message::AccountLoaded);
             }
@@ -354,6 +368,58 @@ impl App {
                     form.apply_field(AccountField::Password, password.into_inner());
                 }
             }
+            Message::AccountMethodChanged(method) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.choose_method(method);
+                }
+            }
+            Message::AccountGoogleContactsToggled(enabled) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.google_contacts = enabled;
+                }
+            }
+            Message::GoogleAuth {
+                account,
+                enable_contacts,
+                switch_backend,
+            } => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.busy = true;
+                    form.test = TestState::Testing;
+                }
+                return Task::perform(
+                    google_auth(account, enable_contacts, switch_backend),
+                    Message::GoogleAuthFinished,
+                );
+            }
+            Message::GoogleContactsToggle(account, enabled) => {
+                return Task::perform(
+                    set_google_contacts(account, enabled),
+                    Message::GoogleAuthFinished,
+                );
+            }
+            Message::GoogleAuthFinished(result) => match result {
+                Ok(Some(snapshot)) => {
+                    self.apply_snapshot(snapshot);
+                    self.accounts.close_form();
+                    self.accounts_open = false;
+                    return prefetch_task();
+                }
+                Ok(None) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.test = TestState::Idle;
+                    }
+                    self.accounts.notice = Some("Google sign-in was cancelled.".to_string());
+                }
+                Err(error) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.test = TestState::Failed(error.clone());
+                    }
+                    return self.show_toast(error);
+                }
+            },
             Message::AccountPresetChanged(preset) => {
                 if let Some(form) = self.accounts.form.as_mut() {
                     form.choose_preset(preset);
@@ -935,7 +1001,12 @@ impl App {
                 };
                 return Task::perform(
                     async move { api::clear_learned_recipients(&id) },
-                    |result| Message::LearningActionDone("Recipient suggestions cleared.".to_string(), result),
+                    |result| {
+                        Message::LearningActionDone(
+                            "Recipient suggestions cleared.".to_string(),
+                            result,
+                        )
+                    },
                 );
             }
             Message::LearningRebuildConfirmed => {
@@ -944,7 +1015,12 @@ impl App {
                 };
                 return Task::perform(
                     async move { api::rebuild_learned_recipients(&id) },
-                    |result| Message::LearningActionDone("Recipient suggestions rebuilt.".to_string(), result),
+                    |result| {
+                        Message::LearningActionDone(
+                            "Recipient suggestions rebuilt.".to_string(),
+                            result,
+                        )
+                    },
                 );
             }
             Message::LearningActionCancelled => self.learning_confirm = None,
@@ -1188,6 +1264,94 @@ impl App {
             }),
         ])
     }
+}
+
+/// Drive one native Google sign-in to completion and commit it.
+///
+/// `switch_backend` is the only path that converts an existing IMAP account and
+/// is gated by `can_switch_backend` before the browser/consent UI opens.
+/// Existing native accounts are re-authenticated; new accounts are created by
+/// `finish_auth`. Android results are polled from the validated JNI inbox so
+/// Cancel remains responsive; desktop waits on the loopback redirect.
+async fn google_auth(
+    account: Option<AccountId>,
+    enable_contacts: bool,
+    switch_backend: bool,
+) -> Result<Option<ModelSnapshot>, String> {
+    if !api::provider_available(GMAIL_PROVIDER)? {
+        return Err("Native Google is not available in this build".to_string());
+    }
+    if let (Some(id), true) = (&account, switch_backend) {
+        api::can_switch_backend(id)?;
+    }
+    let progress = api::begin_auth(AuthRequest {
+        provider: ProviderId::from(GMAIL_PROVIDER),
+        account: account.clone(),
+        enable_contacts,
+    })
+    .await?;
+    let AuthProgress::Challenge { attempt, challenge } = progress else {
+        return Err("Google sign-in returned no interactive step".to_string());
+    };
+    let AuthChallenge::Browser(browser) = challenge else {
+        return Err("Google sign-in returned an unsupported challenge".to_string());
+    };
+    let progress = if browser.url.starts_with("pige-google-android:") {
+        wait_for_android_auth(&attempt).await?
+    } else {
+        api::open_url(&browser.url)?;
+        api::await_platform_auth(&attempt).await?
+    };
+    match progress {
+        AuthProgress::Cancelled => Ok(None),
+        AuthProgress::Complete(authenticated) => {
+            let (id, snapshot) =
+                api::finish_auth_with_contacts(authenticated, enable_contacts).await?;
+            let snapshot = match api::sync_account(&id).await {
+                Ok(synced) => synced,
+                Err(error) => {
+                    log::warn!("first Google sync: {error}");
+                    snapshot
+                }
+            };
+            Ok(Some(snapshot))
+        }
+        AuthProgress::Challenge { .. } => {
+            Err("Google sign-in needs another step; start again".to_string())
+        }
+    }
+}
+
+async fn wait_for_android_auth(attempt: &AuthAttemptId) -> Result<AuthProgress, String> {
+    // Five minutes matches the attempt TTL; polling does not hold the auth
+    // service lock, so the user can still cancel.
+    for _ in 0..600 {
+        if let Some(progress) = api::poll_platform_auth(attempt).await? {
+            return Ok(progress);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let _ = api::cancel_auth(attempt).await;
+    Err("Google sign-in timed out; start again".to_string())
+}
+
+/// Toggle the two People sources. Enabling is a new authorization (the scopes
+/// are not assumed from the mail grant); disabling only changes sync intent and
+/// keeps cached contacts.
+async fn set_google_contacts(
+    account: AccountId,
+    enabled: bool,
+) -> Result<Option<ModelSnapshot>, String> {
+    if enabled {
+        return google_auth(Some(account), true, false).await;
+    }
+    for source in [
+        pige_core::account::GOOGLE_SAVED_CONTACTS_SOURCE_ID,
+        pige_core::account::GOOGLE_OTHER_CONTACTS_SOURCE_ID,
+    ] {
+        api::set_contact_sync(&account, &ContactSourceId::from(source), false)?;
+    }
+    Ok(Some(api::snapshot()))
 }
 
 /// Validate and save only. AccountSaved schedules the first sync separately.

@@ -16,6 +16,8 @@ provider-google = ["pige_core/provider-google"]
 
 [dependencies]
 pige_core = { path = "../pige_core" }
+serde_json = "1"
+url = "2"
 # Iced is pinned exactly as qlaunch does (bitshift, MIT), including the
 # `iced_android` fork that drives the Android surface. Android inherits
 # premultiplied surface alpha, so keep iced's default web-colors blend space.

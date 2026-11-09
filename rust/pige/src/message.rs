@@ -12,7 +12,7 @@ use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
 use pige_core::settings::{Settings, ThemeMode};
 
-use crate::screens::accounts::AccountField;
+use crate::screens::accounts::{AccountField, AccountMethod};
 use crate::screens::advanced::Row as AdvancedRow;
 use crate::screens::compose::{ComposeField, ComposeSeed, RecipientRequestKey};
 
@@ -251,6 +251,20 @@ pub enum Message {
     AccountLoaded(Result<Account, String>),
     AccountCancel,
     AccountFieldChanged(AccountField, String),
+    AccountMethodChanged(AccountMethod),
+    AccountGoogleContactsToggled(bool),
+    /// Start (or reconnect) native Google sign-in. `switch_backend` is the
+    /// explicit IMAP-to-Gmail conversion and is gated by `can_switch_backend`;
+    /// `enable_contacts` requests the optional People scopes.
+    GoogleAuth {
+        account: Option<AccountId>,
+        enable_contacts: bool,
+        switch_backend: bool,
+    },
+    /// Enable or disable the two Google People sources for an existing account.
+    GoogleContactsToggle(AccountId, bool),
+    /// A Google sign-in finished. `Ok(None)` means the user cancelled.
+    GoogleAuthFinished(Result<Option<ModelSnapshot>, String>),
     AccountPasswordChanged(Password),
     AccountPresetChanged(ProviderPreset),
     AccountImapSecurityChanged(Security),

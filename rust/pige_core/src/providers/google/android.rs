@@ -92,7 +92,6 @@ pub enum GoogleAuthorizationOutcome {
     Cancelled,
     Failed,
 }
-
 impl fmt::Debug for GoogleAuthorizationOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -251,6 +250,15 @@ pub fn take_native_result(attempt: &AuthAttemptId) -> Option<GoogleAuthorization
         .and_then(|index| inbox.remove(index))
 }
 
+/// Whether a validated result for `attempt` is waiting to be consumed. The UI
+/// polls this without taking the authentication service lock across a wait.
+pub fn native_result_pending(attempt: &AuthAttemptId) -> bool {
+    let inbox = native_results()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    inbox.iter().any(|result| &result.attempt == attempt)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireResult {
@@ -285,4 +293,67 @@ struct WireIdentity {
     email: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
+}
+
+/// The production Android host: launches the Kotlin `GoogleAuthorization`
+/// helper through `PigeBridge` and lets its validated result return through
+/// [`deliver_native_result`].
+///
+/// The app does not configure a server-side offline exchange (the user has no
+/// exchange server), so [`GoogleAndroidHost::acquire`] cannot mint a new token
+/// silently. A cached access token is used until it expires; afterwards the user
+/// signs in again on demand. That is the S2 §9.6 on-demand model.
+#[cfg(target_os = "android")]
+pub struct AndroidPlatformHost;
+
+#[cfg(target_os = "android")]
+impl AndroidPlatformHost {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Default for AndroidPlatformHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl GoogleAndroidHost for AndroidPlatformHost {
+    async fn launch(&self, request: AndroidAuthorizationRequest) -> Result<(), ProviderError> {
+        let scopes = serde_json::to_string(&request.scopes).map_err(|error| {
+            ProviderError::transient("could not prepare Google sign-in")
+                .with_source_detail(error.to_string())
+        })?;
+        crate::platform::android::launch_google_authorization(
+            request.attempt.as_str(),
+            &scopes,
+            request.server_client_id.as_deref(),
+        )
+        .map_err(|error| {
+            ProviderError::transient("could not start Google sign-in").with_source_detail(error)
+        })
+    }
+
+    fn cancel(&self, attempt: &AuthAttemptId) -> Result<(), ProviderError> {
+        crate::platform::android::cancel_google_authorization(attempt.as_str()).map_err(|error| {
+            ProviderError::transient("could not cancel Google sign-in").with_source_detail(error)
+        })
+    }
+
+    async fn acquire(
+        &self,
+        _account: &AccountId,
+        _scopes: &[String],
+    ) -> Result<GoogleAndroidResult, ProviderError> {
+        // No device refresh token is stored in the on-demand model, and a
+        // non-interactive acquisition cannot launch consent. Reauthentication is
+        // the correct, explicit outcome.
+        Err(ProviderError::reauthenticate(
+            "Google sign-in has expired; sign in again",
+        ))
+    }
 }

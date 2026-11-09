@@ -40,7 +40,8 @@ use crate::store::{PendingAuthRecord, Store};
 use super::GMAIL_MODIFY_SCOPE;
 use super::android::{
     AndroidAuthorizationRequest, AndroidOfflineExchange, GoogleAndroidHost,
-    GoogleAuthorizationOutcome, GoogleAuthorizationResult, GoogleIdentity,
+    GoogleAuthorizationOutcome, GoogleAuthorizationResult, GoogleIdentity, native_result_pending,
+    take_native_result,
 };
 use super::desktop::{DesktopRedirect, DesktopRedirectReceiver};
 
@@ -1053,6 +1054,36 @@ impl AuthenticationService for GoogleAuthentication {
         }
         self.secrets.delete(account)?;
         Ok(())
+    }
+
+    async fn await_platform_completion(
+        &mut self,
+        attempt: &AuthAttemptId,
+    ) -> Result<AuthProgress, ProviderError> {
+        if matches!(&self.platform, AuthPlatform::Desktop(_)) {
+            self.await_desktop_callback(attempt).await
+        } else {
+            // Android results arrive through the JNI inbox; holding this service
+            // across a wait would block Cancel. The shell polls
+            // `deliver_platform_result` instead.
+            Err(ProviderError::unsupported(
+                "a blocking Android consent callback",
+            ))
+        }
+    }
+
+    fn has_platform_result(&self, attempt: &AuthAttemptId) -> bool {
+        native_result_pending(attempt)
+    }
+
+    async fn deliver_platform_result(
+        &mut self,
+        attempt: &AuthAttemptId,
+    ) -> Result<Option<AuthProgress>, ProviderError> {
+        let Some(result) = take_native_result(attempt) else {
+            return Ok(None);
+        };
+        self.deliver_android_result(result).await.map(Some)
     }
 }
 

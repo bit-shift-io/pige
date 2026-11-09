@@ -136,11 +136,7 @@ pub enum MailBackend {
 
 impl MailBackend {
     /// Build the legacy IMAP/SMTP backend with password authentication.
-    pub fn imap_smtp(
-        username: impl Into<String>,
-        imap: ServerConfig,
-        smtp: ServerConfig,
-    ) -> Self {
+    pub fn imap_smtp(username: impl Into<String>, imap: ServerConfig, smtp: ServerConfig) -> Self {
         Self::ImapSmtp {
             username: username.into(),
             imap,
@@ -172,6 +168,34 @@ pub struct ContactSourceConfig {
     pub provider: ProviderId,
     pub kind: String,
     pub enabled: bool,
+}
+
+/// Native Google People saved contacts. The adapter owns the same stable id;
+/// it lives here so account setup can register the source without depending on
+/// the optional Google adapter module.
+pub const GOOGLE_SAVED_CONTACTS_SOURCE_ID: &str = "google.saved";
+/// Native Google People Other contacts.
+pub const GOOGLE_OTHER_CONTACTS_SOURCE_ID: &str = "google.other";
+
+/// The two R6 contact sources a native Google account gets when the user
+/// enables contacts. Order is deliberate: saved contacts rank above Other.
+pub fn google_contact_sources() -> Vec<ContactSourceConfig> {
+    [
+        GOOGLE_SAVED_CONTACTS_SOURCE_ID,
+        GOOGLE_OTHER_CONTACTS_SOURCE_ID,
+    ]
+    .into_iter()
+    .map(|id| ContactSourceConfig {
+        id: ContactSourceId::from(id),
+        provider: ProviderId::from(GMAIL_PROVIDER),
+        kind: if id == GOOGLE_OTHER_CONTACTS_SOURCE_ID {
+            "other".to_string()
+        } else {
+            "saved".to_string()
+        },
+        enabled: true,
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

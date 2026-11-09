@@ -11,7 +11,7 @@ mkdir -p "$ROOT/dist"
 find "$ROOT/dist" -maxdepth 1 -type f ! -name "pige-$VERSION-*" -delete
 
 if [[ "$MODE" == all || "$MODE" == desktop ]]; then
-    cargo build --locked --release --manifest-path "$ROOT/rust/Cargo.toml" -p pige --bin pige
+    cargo build --locked --release --manifest-path "$ROOT/rust/Cargo.toml" -p pige --bin pige --features provider-google
     install -m 0755 "$ROOT/rust/target/release/pige" \
         "$ROOT/dist/pige-$VERSION-linux-$(uname -m)"
 fi

@@ -13,4 +13,4 @@ if [[ -z "${WAYLAND_DISPLAY:-}" && -S "$XDG_RUNTIME_DIR/wayland-1" ]]; then
   export WAYLAND_DISPLAY=wayland-1
 fi
 
-exec cargo run -p pige --bin pige "$@"
+exec cargo run -p pige --bin pige --features provider-google "$@"

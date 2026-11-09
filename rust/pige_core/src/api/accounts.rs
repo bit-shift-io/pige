@@ -164,6 +164,78 @@ pub async fn cancel_auth(attempt: &AuthAttemptId) -> Result<(), String> {
         .map_err(|error| error.safe_message)
 }
 
+/// Wait for a desktop-owned interactive result (the loopback redirect). This
+/// holds the authentication service only for this one attempt; Android uses
+/// [`poll_platform_auth`] so Cancel stays responsive.
+pub async fn await_platform_auth(attempt: &AuthAttemptId) -> Result<AuthProgress, String> {
+    let service = auth_service()?;
+    let mut guard = service.lock().await;
+    guard
+        .await_platform_completion(attempt)
+        .await
+        .map_err(|error| error.safe_message)
+}
+
+/// Consume a validated Android/JNI result if one is waiting. `Ok(None)` means
+/// the consent UI has not answered yet; it is not an account and never an
+/// implicit success.
+pub async fn poll_platform_auth(attempt: &AuthAttemptId) -> Result<Option<AuthProgress>, String> {
+    let service = auth_service()?;
+    let mut guard = service.lock().await;
+    guard
+        .deliver_platform_result(attempt)
+        .await
+        .map_err(|error| error.safe_message)
+}
+
+/// Commit a completed native Google authentication, optionally attaching the
+/// R6 People contact sources the user opted into.
+///
+/// Contacts are a separate authorization (the attempt requested the contacts
+/// scopes), so the sources are registered only from this completed credential.
+/// The account/switch commit remains the same generation-fenced F10 path.
+pub async fn finish_auth_with_contacts(
+    mut authenticated: AuthenticatedAccount,
+    enable_contacts: bool,
+) -> Result<(AccountId, ModelSnapshot), String> {
+    if enable_contacts {
+        if authenticated.account.provider_id().as_str() != crate::providers::GMAIL_PROVIDER {
+            return Err("contacts can only be enabled for a native Google account".to_string());
+        }
+        for source in crate::account::google_contact_sources() {
+            match authenticated
+                .account
+                .contact_sources
+                .iter_mut()
+                .find(|existing| existing.id == source.id)
+            {
+                Some(existing) => existing.enabled = true,
+                None => authenticated.account.contact_sources.push(source),
+            }
+        }
+    }
+    let (id, snapshot) = finish_auth(authenticated).await?;
+    if enable_contacts {
+        // R6 owns the durable source state. Register the same ids the account
+        // configuration now lists so the next maintenance pass can run them.
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| not_initialized_message().to_string())?;
+        for source in crate::account::google_contact_sources() {
+            state
+                .store
+                .upsert_contact_source_with_kind(&id, &source.id, None, &source.kind)
+                .map_err(|error| format!("register contact source: {error}"))?;
+            state
+                .store
+                .set_contact_source_enabled(&id, &source.id, true)
+                .map_err(|error| format!("enable contact source: {error}"))?;
+        }
+    }
+    Ok((id, snapshot))
+}
+
 /// Ask the authentication adapter to revoke accounts' provider sessions. This
 /// is deliberately best-effort and runs in the background: local removal must
 /// still happen, and a provider that cannot be reached must not block it.

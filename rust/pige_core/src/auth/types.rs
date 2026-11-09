@@ -168,4 +168,32 @@ pub trait AuthenticationService: Send {
     async fn cancel(&mut self, attempt: &AuthAttemptId) -> Result<(), ProviderError>;
     async fn resume(&mut self, account: &AccountId) -> Result<AuthProgress, ProviderError>;
     async fn revoke(&mut self, account: &AccountId) -> Result<(), ProviderError>;
+
+    /// Wait for a platform-owned interactive result (desktop loopback or an
+    /// Android consent return). Providers with no platform callback keep the
+    /// default `Unsupported` answer.
+    async fn await_platform_completion(
+        &mut self,
+        _attempt: &AuthAttemptId,
+    ) -> Result<AuthProgress, ProviderError> {
+        Err(ProviderError::unsupported(
+            "a platform-owned authentication callback",
+        ))
+    }
+
+    /// Whether a validated platform result is already queued for `attempt`.
+    /// This is checked without holding the service across a wait so the UI can
+    /// poll an Android JNI result while Cancel remains responsive.
+    fn has_platform_result(&self, _attempt: &AuthAttemptId) -> bool {
+        false
+    }
+
+    /// Consume one queued platform result. `Ok(None)` means nothing arrived
+    /// yet; it is not a failure and must never create an account.
+    async fn deliver_platform_result(
+        &mut self,
+        _attempt: &AuthAttemptId,
+    ) -> Result<Option<AuthProgress>, ProviderError> {
+        Ok(None)
+    }
 }

@@ -218,6 +218,13 @@ pub trait ProviderFactory: Send + Sync {
         true
     }
 
+    /// The provider ids this factory can serve. A composite registry overrides
+    /// this so the UI can offer only providers that are actually registered;
+    /// the default is empty because an opaque factory cannot enumerate itself.
+    fn registered(&self) -> Vec<ProviderId> {
+        Vec::new()
+    }
+
     async fn open(
         &self,
         account: &Account,

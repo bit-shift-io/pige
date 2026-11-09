@@ -15,6 +15,7 @@ class MainActivity : IcedActivity() {
         // PigeBridge class for every later callback thread.
         System.loadLibrary("pige")
         PigeBridge.install(applicationContext)
+        PigeBridge.installActivity(this)
         nativeInit()
         GoogleAuthorization.restoreAttempt(savedInstanceState?.getString(KEY_GOOGLE_ATTEMPT))
         super.onCreate(savedInstanceState)
@@ -45,6 +46,11 @@ class MainActivity : IcedActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString(KEY_GOOGLE_ATTEMPT, GoogleAuthorization.savedAttempt())
         super.onSaveInstanceState(outState)
+    }
+
+    override fun onDestroy() {
+        PigeBridge.clearActivity(this)
+        super.onDestroy()
     }
 
     /// Forward a notification's account/thread extras exactly once, then drop

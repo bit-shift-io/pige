@@ -5,10 +5,12 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.app.Activity
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Log
 import androidx.core.content.FileProvider
 import org.json.JSONArray
 import androidx.work.BackoffPolicy
@@ -18,6 +20,7 @@ import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import java.io.File
+import java.lang.ref.WeakReference
 import java.util.concurrent.TimeUnit
 
 // Everything the Rust core asks the OS for. Rust owns all data and logic; this
@@ -30,6 +33,8 @@ object PigeBridge {
     private const val WORK_NAME = "pige-sync"
 
     private var appContext: Context? = null
+    // A weak reference avoids retaining a destroyed Activity across recreation.
+    private var activityRef: WeakReference<Activity>? = null
 
     /// Install the application context. Background sync is scheduled by Rust
     /// from the persisted settings after the core initializes (see
@@ -37,6 +42,20 @@ object PigeBridge {
     @JvmStatic
     fun install(context: Context) {
         appContext = context.applicationContext
+    }
+
+    /// Remember the foreground Activity that owns Google's consent UI. Called
+    /// from `MainActivity.onCreate`; cleared from `onDestroy`.
+    @JvmStatic
+    fun installActivity(activity: Activity) {
+        activityRef = WeakReference(activity)
+    }
+
+    @JvmStatic
+    fun clearActivity(activity: Activity) {
+        if (activityRef?.get() === activity) {
+            activityRef = null
+        }
     }
 
     /// Worker entry point: installs the context without re-enqueueing the
@@ -186,6 +205,39 @@ object PigeBridge {
             Intent(Intent.ACTION_VIEW, Uri.parse(url))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         )
+    }
+
+    /// Launch Google Identity Services consent for one Rust attempt. The scopes
+    /// arrive as a JSON array; `serverClientId` is empty unless the optional
+    /// server-side offline exchange is configured. The validated result returns
+    /// through `GoogleAuthorization.nativeResult`.
+    @JvmStatic
+    fun launchGoogleAuthorization(attempt: String, scopesJson: String, serverClientId: String) {
+        val activity = activityRef?.get()
+        if (activity == null) {
+            GoogleAuthorization.reportFailure(attempt)
+            return
+        }
+        val scopes = try {
+            val array = JSONArray(scopesJson)
+            List(array.length()) { array.getString(it) }
+        } catch (error: Exception) {
+            Log.w("pige", "invalid Google scope payload", error)
+            GoogleAuthorization.reportFailure(attempt)
+            return
+        }
+        GoogleAuthorization.authorize(
+            activity,
+            attempt,
+            scopes,
+            serverClientId.ifBlank { null },
+        )
+    }
+
+    /// Dismiss the consent UI bound to one attempt, if it is still open.
+    @JvmStatic
+    fun cancelGoogleAuthorization(attempt: String) {
+        GoogleAuthorization.cancel(attempt)
     }
 
     @JvmStatic

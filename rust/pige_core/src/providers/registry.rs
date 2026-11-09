@@ -52,12 +52,25 @@ impl ProviderRegistry {
     pub fn ids(&self) -> impl Iterator<Item = &ProviderId> {
         self.factories.keys()
     }
+
+    /// Merge another registry, rejecting duplicate ids rather than replacing a
+    /// configured adapter.
+    pub fn merge(&mut self, other: Self) -> Result<(), ProviderError> {
+        for (id, factory) in other.factories {
+            self.register(id, factory)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ProviderFactory for ProviderRegistry {
     fn supports(&self, id: &ProviderId) -> bool {
         self.factories.contains_key(id)
+    }
+
+    fn registered(&self) -> Vec<ProviderId> {
+        self.factories.keys().cloned().collect()
     }
 
     async fn open(

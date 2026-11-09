@@ -61,7 +61,8 @@ pub use crate::contacts::{RecipientQuery, RecipientSuggestion, SuggestionSource}
 pub use crate::sync::history::LearningProgress;
 pub use crate::settings::{Settings, ThemeMode};
 pub use accounts::{
-    answer_auth, begin_auth, can_switch_backend, cancel_auth, finish_auth, switch_backend,
+    answer_auth, await_platform_auth, begin_auth, can_switch_backend, cancel_auth, finish_auth,
+    finish_auth_with_contacts, poll_platform_auth, switch_backend,
 };
 #[doc(hidden)]
 pub use accounts::{
@@ -437,6 +438,29 @@ impl AppState {
                 });
             }
 
+            // Provider availability is a build/registry property, not a reason
+            // to hide or quarantine an account. A native account restored into a
+            // build without its adapter stays visible with a readable reason.
+            let configured = self
+                .config_doc
+                .accounts
+                .iter()
+                .find(|candidate| candidate.id == section.account.id);
+            let provider = configured
+                .map(|account| account.provider_id().as_str().to_string())
+                .unwrap_or_default();
+            let available = configured
+                .is_some_and(|account| self.config.providers.supports(&account.provider_id()));
+            let unavailable_reason = if available {
+                None
+            } else if configured.is_some() {
+                Some(format!(
+                    "the `{provider}` provider is not available in this build"
+                ))
+            } else {
+                Some("this account is not present in the saved configuration".to_string())
+            };
+
             // `scanned` resets with each snapshot generation and counts page
             // changes, so show the actual distinct cached contacts instead.
             let mut cached_contacts: HashMap<ContactSourceId, HashSet<RemoteContactId>> =
@@ -501,6 +525,9 @@ impl AppState {
                     .map(|state| state.paused)
                     .unwrap_or(false),
                 contact_sources,
+                provider: provider.clone(),
+                available,
+                unavailable_reason,
             });
             sections.push(AccountSection {
                 account_id: section.account.id.clone(),
@@ -556,6 +583,13 @@ impl AppState {
             status: self.status.clone(),
             has_more,
             drafts,
+            available_providers: self
+                .config
+                .providers
+                .registered()
+                .into_iter()
+                .map(|id| id.as_str().to_string())
+                .collect(),
         }
     }
 }
@@ -832,6 +866,20 @@ pub fn snapshot() -> ModelSnapshot {
         Some(state) => state.build_snapshot(),
         None => ModelSnapshot::default(),
     }
+}
+
+/// Whether this build's registry can open `provider`. The onboarding UI uses
+/// this rather than probing the network; it keeps native actions disabled until
+/// an adapter is registered.
+pub fn provider_available(provider: &str) -> Result<bool, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| not_initialized_message().to_string())?;
+    Ok(state
+        .config
+        .providers
+        .supports(&crate::providers::ProviderId::from(provider)))
 }
 
 /// Whether [`init`] has installed the process-wide state.

@@ -34,9 +34,9 @@ use crate::providers::{
 use super::client::{GoogleClient, with_query};
 
 /// The stable source id for People saved contacts.
-pub const GOOGLE_SAVED_CONTACTS_SOURCE: &str = "google.saved";
+pub const GOOGLE_SAVED_CONTACTS_SOURCE: &str = crate::account::GOOGLE_SAVED_CONTACTS_SOURCE_ID;
 /// The stable source id for People Other contacts.
-pub const GOOGLE_OTHER_CONTACTS_SOURCE: &str = "google.other";
+pub const GOOGLE_OTHER_CONTACTS_SOURCE: &str = crate::account::GOOGLE_OTHER_CONTACTS_SOURCE_ID;
 
 const CURSOR_VERSION: u32 = 1;
 const PAGE_SIZE: u32 = 100;

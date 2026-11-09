@@ -8,6 +8,213 @@ use std::sync::Arc;
 
 use pige_core::api;
 
+/// Native Google shell construction (G5).
+///
+/// Client ids are configuration, never credentials: they come from environment
+/// variables or `<config_dir>/google-oauth.json`. No token, secret, or account
+/// address is stored in that file. When the desktop id is absent, or any setup
+/// step fails, the shell simply omits the Google provider; native Gmail accounts
+/// then appear as an unavailable-provider account state instead of breaking
+/// startup.
+#[cfg(all(
+    feature = "provider-google",
+    any(target_os = "linux", target_os = "android")
+))]
+mod google {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::Mutex as AsyncMutex;
+
+    use pige_core::api::DB_FILE_NAME;
+    use pige_core::auth::{
+        AccountSessionManager, AuthenticationService, CredentialSecretRepository,
+    };
+    use pige_core::platform::CredentialStore;
+    use pige_core::providers::ProviderRegistry;
+    use pige_core::providers::google::{
+        GoogleAuthentication, GoogleEndpoints, GoogleOAuthConfig, google_auth_service,
+        google_registry,
+    };
+    use pige_core::store::Store;
+
+    const ATTEMPT_TTL: Duration = Duration::from_secs(300);
+
+    #[derive(Default)]
+    struct GoogleSettings {
+        desktop_client_id: Option<String>,
+        server_client_id: Option<String>,
+        server_exchange_url: Option<String>,
+    }
+
+    fn non_empty(value: Option<String>) -> Option<String> {
+        value.filter(|value| !value.trim().is_empty())
+    }
+
+    fn env(name: &str) -> Option<String> {
+        non_empty(std::env::var(name).ok())
+    }
+
+    /// Read the optional local config, then let the environment override it per
+    /// key. The file is never created here; a missing file means "not
+    /// configured".
+    fn settings(config_dir: &Path) -> GoogleSettings {
+        let mut settings = GoogleSettings::default();
+        let path = config_dir.join("google-oauth.json");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(value) => {
+                    settings.desktop_client_id = value
+                        .get("desktop_client_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    settings.server_client_id = value
+                        .get("server_client_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    settings.server_exchange_url = value
+                        .get("server_exchange_url")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                }
+                Err(error) => log::warn!("read {}: {error}", path.display()),
+            }
+        }
+        settings.desktop_client_id = env("PIGE_GOOGLE_DESKTOP_CLIENT_ID")
+            .or_else(|| env("GOOGLE_DESKTOP_CLIENT_ID"))
+            .or(settings.desktop_client_id);
+        settings.server_client_id = env("PIGE_GOOGLE_SERVER_CLIENT_ID")
+            .or_else(|| env("GOOGLE_WEB_SERVER_CLIENT_ID"))
+            .or(settings.server_client_id);
+        settings.server_exchange_url =
+            env("PIGE_GOOGLE_SERVER_EXCHANGE_URL").or(settings.server_exchange_url);
+        settings
+    }
+
+    pub(super) struct GoogleShell {
+        pub registry: ProviderRegistry,
+        pub auth: Arc<AsyncMutex<Box<dyn AuthenticationService>>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn build(
+        data_dir: &Path,
+        config_dir: &Path,
+        credentials: Arc<dyn CredentialStore>,
+    ) -> Option<GoogleShell> {
+        use pige_core::providers::google::LoopbackRedirect;
+
+        let settings = settings(config_dir);
+        let client_id = settings.desktop_client_id?;
+        let store = open_store(data_dir)?;
+        let sessions = Arc::new(AccountSessionManager::new(store.clone()));
+        let secrets = Arc::new(CredentialSecretRepository::with_gate(
+            credentials,
+            store.clone(),
+        ));
+        let make = || {
+            GoogleAuthentication::desktop(
+                secrets.clone(),
+                sessions.clone(),
+                store.clone(),
+                GoogleOAuthConfig::production(client_id.clone()),
+                Arc::new(LoopbackRedirect::new()),
+                ATTEMPT_TTL,
+            )
+        };
+        let factory_auth = Arc::new(make());
+        let registry = google_registry(
+            sessions.clone(),
+            GoogleEndpoints::production(),
+            factory_auth,
+        )
+        .map_err(|error| log::warn!("register Google provider: {}", error.safe_message))
+        .ok()?;
+        Some(GoogleShell {
+            registry,
+            auth: google_auth_service(make()),
+        })
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn build(
+        data_dir: &Path,
+        config_dir: &Path,
+        credentials: Arc<dyn CredentialStore>,
+    ) -> Option<GoogleShell> {
+        use pige_core::providers::google::{AndroidOfflineExchange, AndroidPlatformHost};
+        let settings = settings(config_dir);
+        // Play services identifies the Android OAuth client by package and
+        // signing certificate, so no client id is required for on-demand
+        // authorization. A server client id/exchange URL is optional and only
+        // used for the deferred offline-refresh path.
+        let client_id = settings.desktop_client_id.unwrap_or_default();
+        let offline = settings
+            .server_client_id
+            .zip(settings.server_exchange_url)
+            .and_then(|(server_client_id, exchange_url)| {
+                url::Url::parse(&exchange_url)
+                    .ok()
+                    .map(|exchange_url| AndroidOfflineExchange {
+                        server_client_id,
+                        exchange_url,
+                    })
+            });
+        let store = open_store(data_dir)?;
+        let sessions = Arc::new(AccountSessionManager::new(store.clone()));
+        let secrets = Arc::new(CredentialSecretRepository::with_gate(
+            credentials,
+            store.clone(),
+        ));
+        let host: Arc<dyn pige_core::providers::google::GoogleAndroidHost> =
+            Arc::new(AndroidPlatformHost::new());
+        let oauth = GoogleOAuthConfig::production(client_id);
+        let make = || {
+            GoogleAuthentication::android(
+                secrets.clone(),
+                sessions.clone(),
+                store.clone(),
+                oauth.clone(),
+                host.clone(),
+                offline.clone(),
+                ATTEMPT_TTL,
+            )
+        };
+        let factory_auth = Arc::new(make());
+        let registry = google_registry(
+            sessions.clone(),
+            GoogleEndpoints::production(),
+            factory_auth,
+        )
+        .map_err(|error| log::warn!("register Google provider: {}", error.safe_message))
+        .ok()?;
+        Some(GoogleShell {
+            registry,
+            auth: google_auth_service(make()),
+        })
+    }
+
+    fn open_store(data_dir: &Path) -> Option<Arc<Store>> {
+        if let Err(error) = std::fs::create_dir_all(data_dir) {
+            log::warn!("create Google bootstrap data dir: {error}");
+            return None;
+        }
+        let store = match Store::open(data_dir.join(DB_FILE_NAME)) {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                log::warn!("open Google bootstrap store: {error}");
+                return None;
+            }
+        };
+        if let Err(error) = store.migrate() {
+            log::warn!("migrate Google bootstrap store: {error}");
+            return None;
+        }
+        Some(store)
+    }
+}
+
 /// The real Linux platform: XDG data/cache directories, Secret Service
 /// passwords, `xdg-open`, and the TLS IMAP transport.
 #[cfg(target_os = "linux")]
@@ -22,20 +229,33 @@ pub(crate) fn config() -> api::Config {
     let credentials: Arc<dyn CredentialStore> = Arc::new(LinuxCredentials::new());
     let transport: Arc<dyn TransportFactory> =
         Arc::new(LinuxTransportFactory::new(credentials.clone()));
-    let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(
-        pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone()),
-    );
+    let data_dir = xdg_dir("XDG_DATA_HOME", ".local/share");
+    let cache_dir = xdg_dir("XDG_CACHE_HOME", ".cache");
+    let config_dir = config_dir();
+    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
+    let mut registry =
+        pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone());
+    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
+    let mut auth = None;
+    #[cfg(feature = "provider-google")]
+    if let Some(shell) = google::build(&data_dir, &config_dir, credentials.clone()) {
+        match registry.merge(shell.registry) {
+            Ok(()) => auth = Some(shell.auth),
+            Err(error) => log::warn!("compose Google provider: {}", error.safe_message),
+        }
+    }
+    let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(registry);
     api::Config {
-        data_dir: xdg_dir("XDG_DATA_HOME", ".local/share"),
-        cache_dir: xdg_dir("XDG_CACHE_HOME", ".cache"),
-        config_dir: config_dir(),
+        data_dir,
+        cache_dir,
+        config_dir,
         credentials: credentials.clone(),
         notifier: Arc::new(LinuxNotifier::new()),
         opener: Arc::new(LinuxOpener::new()),
         providers,
         transport,
         backups: Arc::new(LinuxBackupStore::new()),
-        auth: None,
+        auth,
     }
 }
 
@@ -66,9 +286,19 @@ pub(crate) fn config() -> api::Config {
     let transport: Arc<dyn TransportFactory> = Arc::new(
         pige_core::platform::android::AndroidTransportFactory::new(credentials.clone()),
     );
-    let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(
-        pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone()),
-    );
+    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
+    let mut registry =
+        pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone());
+    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
+    let mut auth = None;
+    #[cfg(feature = "provider-google")]
+    if let Some(shell) = google::build(&paths.data_dir, &paths.config_dir, credentials.clone()) {
+        match registry.merge(shell.registry) {
+            Ok(()) => auth = Some(shell.auth),
+            Err(error) => log::warn!("compose Google provider: {}", error.safe_message),
+        }
+    }
+    let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(registry);
     api::Config {
         config_dir: paths.config_dir,
         data_dir: paths.data_dir,
@@ -79,7 +309,7 @@ pub(crate) fn config() -> api::Config {
         providers,
         transport,
         backups: Arc::new(AndroidBackupStore::new()),
-        auth: None,
+        auth,
     }
 }
 

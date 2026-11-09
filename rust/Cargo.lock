@@ -3564,7 +3564,9 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "pige_core",
+ "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

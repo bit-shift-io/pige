@@ -101,10 +101,101 @@ grant already covers People.
   provider; the shell attaches the configured authentication with
   `.with_authentication(authentication)` (or
   `.with_token_source_provider(...)`).
-- Shell wiring (G5) will read the client ids from the platform configuration and
-  register `google_auth_service(...)` as `api::Config.auth` plus
-  `google_registry(...)`. G1 adds the mechanism, not the production onboarding
-  UI.
+- Shell wiring (G5) lives in `rust/pige/src/platform.rs`. It composes the IMAP
+  registry with `register_google(...)`, and installs
+  `google_auth_service(...)` as `api::Config.auth`.
+
+### Host values (no secrets in the repository)
+
+Client ids are configuration, never credentials. The shell reads, in order of
+precedence:
+
+| Value | Environment | Local JSON key |
+| --- | --- | --- |
+| Desktop OAuth client id | `PIGE_GOOGLE_DESKTOP_CLIENT_ID` (or legacy `GOOGLE_DESKTOP_CLIENT_ID`) | `desktop_client_id` |
+| Optional Web/Android server client id | `PIGE_GOOGLE_SERVER_CLIENT_ID` (or `GOOGLE_WEB_SERVER_CLIENT_ID`) | `server_client_id` |
+| Optional server exchange URL | `PIGE_GOOGLE_SERVER_EXCHANGE_URL` | `server_exchange_url` |
+
+The local file is `<config_dir>/google-oauth.json` (Linux:
+`$XDG_CONFIG_HOME/bitshift/pige/google-oauth.json`; Android:
+`<app files>/config/google-oauth.json`). It is optional and contains only those
+public identifiers. Never put a refresh token, access token, client secret, or
+account password in it. When the desktop client id is absent the Google provider
+is not registered; any native Gmail account already in `pige.json` remains
+visible as an "unavailable provider" account instead of being quarantined or
+treated as a corrupt document.
+
+Android does **not** need the desktop id: Play services identifies the Android
+OAuth client by package name plus signing certificate. The server client id and
+exchange URL are only for the optional offline-refresh path. Without them, the
+Android app uses on-demand `authorize()`: it keeps an in-memory access token,
+stores no device refresh token, and asks the user to sign in again after expiry
+or process restart. That is the distribution choice for this build.
+
+### Onboarding, contacts, and switching (G5)
+
+- The account screen offers **Google account** separately from the manual
+  **IMAP/SMTP** form. A new Google account has a label/display-name field and an
+  optional "Sync Google contacts" choice; it never asks for a password or IMAP
+  servers.
+- An existing Gmail-over-IMAP account keeps editing its IMAP/SMTP fields. A
+  separate "Switch to native Google" action is offered for `gmail.com` /
+  `googlemail.com` addresses and calls `can_switch_backend` first. A pending,
+  accepted-but-unfinalized, or uncertain submission refuses the switch; the
+  account stays IMAP and no credential is overwritten.
+- Enabling Google contacts is a new `AuthRequest { enable_contacts: true }`, not
+  an assumption that the mail grant already covers People. On completion the two
+  R6 sources (`google.saved`, `google.other`) are registered and enabled.
+  Disabling contacts keeps cached contacts and only stops synchronization.
+- The Android path is wired through `PigeBridge.launchGoogleAuthorization`
+  (scopes JSON + optional `serverClientId`) and
+  `GoogleAuthorization.nativeResult`. The Rust host forwards the request and
+  the validated result is polled from the JNI inbox by
+  `api::poll_platform_auth`; the attempt id binds every result, so a late answer
+  after cancellation or Activity recreation cannot create an account.
+
+## Release setup: console, consent, and signing
+
+1. **Registrations.** Create one Google Cloud project. Enable the Gmail API and
+   People API. Create a Desktop OAuth client for Linux and an Android OAuth client
+   for package `bitshift.pige`. If a server-side exchange is ever added, create a
+   Web application client as well; it is not required for this on-demand build.
+2. **Minimal scopes.** Mail: `gmail.modify` plus `openid email profile`.
+   Contacts: `contacts.readonly` and `contacts.other.readonly`, requested only by
+   the contacts opt-in. Do not request broader Gmail scopes; permanent delete is
+   deliberately unavailable under `gmail.modify`.
+3. **Android identity.** The Android OAuth client must match:
+   - package: `bitshift.pige`
+   - debug and release SHA-1:
+     `7E:4B:01:BC:E7:61:75:E3:89:38:88:5D:91:A6:26:FE:D3:07:21:AD`
+     (shared key committed at `android/keystore/pige-release.jks`; selected by
+     `android/keystore.properties`). Both build types use it, so one fingerprint
+     covers local debug and release APKs.
+   - If `android/keystore.properties` is absent, the host-local debug key is used
+     instead; add that debug SHA-1 as a second Android client fingerprint only in
+     that case. Changing the signing key requires a new Android OAuth client (or
+     another registered fingerprint) or consent returns `DEVELOPER_ERROR`.
+   There is no redirect URI, App Link, loopback, OOB code, or WebView on Android.
+4. **Consent screen and verification.** While the OAuth consent screen is in
+   **Testing**:
+   - only accounts listed as test users can authorize (limit: 100 test users);
+   - refresh tokens for external/test-user grants expire after **7 days**;
+   - the user must be re-added if the project changes.
+   `gmail.modify` is a restricted Gmail scope. Distributing to users outside the
+   test list requires publishing the app and completing Google's OAuth
+   verification (and, for restricted scopes, the applicable security assessment).
+   Plan for a review lead time before a public release.
+5. **Testing-user limits.** Desktop and Android each consume the same project's
+   consent screen and test-user list. A disposable account should be a test user;
+   do not use a personal account for send testing.
+6. **Release signing.** For a public release, replace the shared test key with a
+   dedicated release keystore held outside the repository, update
+   `android/keystore.properties` (or the CI secret injection), sign with
+   `scripts/build.sh release`, and register the release SHA-1 as the Android OAuth
+   fingerprint. Keep the release keystore backed up: losing it prevents in-place
+   upgrades, and rotating it requires a new OAuth client registration. The
+   release scripts build both desktop and Android with `--features
+   provider-google`.
 
 ## Offline verification (no live network)
 
@@ -115,10 +206,33 @@ state mismatch, cancellation, Activity recreation binding, persistence across
 restart, refresh rotation/reauth, denied contacts, expired callbacks, and HTTP
 error redaction.
 
-## Still BLOCKED (needs the registrations above)
+G5 adds `cargo test -p pige_core --features provider-google --test
+provider_lifecycle`, including the native onboarding/switch/contacts cases, and
+`tests/live_google.rs`. Every live case is `#[ignore]` and requires its own
+environment. An explicitly requested live run with missing values fails with a
+clear message; it never reports a silent pass. Send additionally requires
+`PIGE_TEST_ALLOW_SEND=1`. Example:
 
-S2 §9.7/§9.11 live cases remain BLOCKED: `desktop_pkce_cancel_and_state`,
-`android_consent_return_and_recreation`, `resume_after_process_restart`,
-`contacts_later_grant`, `revoked_grant_requires_login`, the Gmail/People API
-probes, and `play_services_absent_or_disabled`. They must be recorded from a
-real device/account; no mock result is reported as live evidence.
+```text
+PIGE_TEST_GOOGLE_CLIENT_ID=... \
+PIGE_TEST_GOOGLE_REFRESH_TOKEN=... \
+PIGE_TEST_GOOGLE_ACCOUNT_EMAIL=person@example.com \
+cargo test -p pige_core --features provider-google --test live_google \
+  -- --ignored --nocapture live_gmail_read_and_sync
+```
+
+The contacts-denial case also requires `PIGE_TEST_GOOGLE_CONTACTS_DENIED=1` and
+a token without People scopes. Tokens and response bodies are never printed.
+
+## Recorded coverage still required from a live account
+
+Cold resume, sync/delta, contacts denial, offline autocomplete, send, revoke, and
+switch recovery must be recorded on Linux and Android against the disposable
+account. Fixtures and mocks prove the wiring, not Google's live behavior. The
+S2 §9.7/§9.11 cases remain BLOCKED until the console registrations above exist:
+`desktop_pkce_cancel_and_state`, `android_consent_return_and_recreation`,
+`resume_after_process_restart`, `contacts_later_grant`,
+`revoked_grant_requires_login`, the Gmail/People API probes, and
+`play_services_absent_or_disabled`. They must be recorded from a real
+device/account; no mock result is reported as live evidence.
+

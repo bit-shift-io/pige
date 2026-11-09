@@ -22,6 +22,8 @@ use tokio::sync::{Mutex, Semaphore};
 
 use pige_core::account::{ContactSourceConfig, MailBackend, Security, ServerConfig};
 use pige_core::api::{self, AccountInput, Config, DB_FILE_NAME};
+#[cfg(feature = "provider-google")]
+use pige_core::auth::AuthChallenge;
 use pige_core::auth::{
     AuthAnswer, AuthProgress, AuthRequest, AuthenticationService, CredentialSecretRepository,
     FakeAuthScript, FakeAuthService, SecretEnvelope, SecretPersistence, SecretRepository,
@@ -1885,6 +1887,597 @@ async fn startup_at_completed_finishes_without_rolling_back() {
 
 /// Live write failure after the backup is confirmed: the rollback succeeds, so
 /// no intent or backup is left and the old pair is untouched.
+/// A configuration naming a native provider this build cannot open must remain a
+/// readable account, not be treated as a corrupt document and quarantined.
+#[tokio::test]
+async fn google_provider_disabled_is_a_readable_account_state() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::imap();
+    let account = Account {
+        id: AccountId::new(),
+        label: "Work".to_string(),
+        email: "person@example.com".to_string(),
+        display_name: "Person".to_string(),
+        backend: MailBackend::gmail("google-uid-restored"),
+        contact_sources: Vec::new(),
+        sort_order: 0,
+        color: None,
+    };
+    write_accounts(&harness, vec![account.clone()]);
+    harness.restart();
+
+    let snapshot = api::snapshot();
+    let summary = snapshot
+        .accounts
+        .iter()
+        .find(|candidate| candidate.id == account.id)
+        .expect("the unavailable account is still listed");
+    assert_eq!(summary.provider, pige_core::providers::GMAIL_PROVIDER);
+    assert!(!summary.available);
+    assert!(
+        summary
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not available")),
+        "a readable reason must explain the missing provider: {:?}",
+        summary.unavailable_reason
+    );
+    assert!(
+        api::account(&account.id).is_ok(),
+        "the account remains readable"
+    );
+    let corrupt = harness.dir.path().join("config").join("pige.json.corrupt");
+    assert!(
+        !corrupt.exists(),
+        "the configuration must not be quarantined"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task G5: native Gmail onboarding, explicit switching, and contact opt-in.
+//
+// These drive the same validated Android host-result path the JNI bridge uses
+// (`deliver_native_result` -> `api::poll_platform_auth`) against a recording
+// fake host. No test reaches Google.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "provider-google")]
+mod google_onboarding {
+    use super::*;
+
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use secrecy::SecretString;
+
+    use pige_core::auth::TokenSource;
+    use pige_core::providers::google::{
+        CONTACTS_OTHER_READONLY_SCOPE, CONTACTS_READONLY_SCOPE, GMAIL_MODIFY_SCOPE,
+        GoogleAndroidHost, GoogleAndroidResult, GoogleAuthentication, GoogleEndpoints,
+        GoogleOAuthConfig, GoogleProviderFactory, GoogleTokenSourceProvider, deliver_native_result,
+    };
+    use pige_core::providers::{
+        GMAIL_PROVIDER, OperationContext, ProviderError, ProviderId, ProviderRegistry,
+    };
+
+    struct RecordingHost {
+        launches: StdMutex<Vec<pige_core::providers::google::AndroidAuthorizationRequest>>,
+        cancelled: StdMutex<Vec<AuthAttemptId>>,
+    }
+
+    impl RecordingHost {
+        fn new() -> Self {
+            Self {
+                launches: StdMutex::new(Vec::new()),
+                cancelled: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn launches(&self) -> Vec<pige_core::providers::google::AndroidAuthorizationRequest> {
+            self.launches.lock().expect("launches").clone()
+        }
+
+        fn cancelled(&self) -> Vec<AuthAttemptId> {
+            self.cancelled.lock().expect("cancelled").clone()
+        }
+    }
+
+    #[async_trait]
+    impl GoogleAndroidHost for RecordingHost {
+        async fn launch(
+            &self,
+            request: pige_core::providers::google::AndroidAuthorizationRequest,
+        ) -> Result<(), ProviderError> {
+            self.launches.lock().expect("launches").push(request);
+            Ok(())
+        }
+
+        fn cancel(&self, attempt: &AuthAttemptId) -> Result<(), ProviderError> {
+            self.cancelled
+                .lock()
+                .expect("cancelled")
+                .push(attempt.clone());
+            Ok(())
+        }
+
+        async fn acquire(
+            &self,
+            _account: &AccountId,
+            _scopes: &[String],
+        ) -> Result<GoogleAndroidResult, ProviderError> {
+            Err(ProviderError::reauthenticate(
+                "no live Android grant in this test",
+            ))
+        }
+    }
+
+    /// An API backed by the real Google authentication service in its Android
+    /// host-result shape, plus provider dispatch for Gmail and IMAP accounts.
+    fn google_harness() -> (Harness, Arc<RecordingHost>) {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("data")).expect("data dir");
+        let credentials = Arc::new(FakeCredentials::default());
+        let transport = Arc::new(FakeTransportFactory::default());
+        let store = Arc::new(
+            Store::open(dir.path().join("data").join(DB_FILE_NAME)).expect("google store"),
+        );
+        store.migrate().expect("migrate google store");
+        let secrets = Arc::new(CredentialSecretRepository::with_gate(
+            credentials.clone(),
+            store.clone(),
+        ));
+        let sessions = Arc::new(pige_core::auth::AccountSessionManager::new(store.clone()));
+        let host = Arc::new(RecordingHost::new());
+        let authentication = GoogleAuthentication::android(
+            secrets,
+            sessions,
+            store,
+            GoogleOAuthConfig::production("android-test-client"),
+            host.clone(),
+            None,
+            Duration::from_secs(300),
+        );
+
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                ProviderId::from(GMAIL_PROVIDER),
+                Arc::new(FakeProviderFactory::new()),
+            )
+            .expect("register gmail");
+        registry
+            .register(
+                ProviderId::from(IMAP_SMTP_PROVIDER),
+                Arc::new(FakeProviderFactory::new()),
+            )
+            .expect("register imap");
+        let harness = Harness {
+            dir,
+            credentials,
+            transport,
+            providers: Arc::new(registry),
+            backups: Arc::new(FakeBackupStore::new()),
+            auth: Some(Arc::new(Mutex::new(
+                Box::new(authentication) as Box<dyn AuthenticationService>
+            ))),
+        };
+        harness.init();
+        (harness, host)
+    }
+
+    async fn begin_google(account: Option<AccountId>, enable_contacts: bool) -> AuthAttemptId {
+        let progress = api::begin_auth(AuthRequest {
+            provider: ProviderId::from(GMAIL_PROVIDER),
+            account,
+            enable_contacts,
+        })
+        .await
+        .expect("begin Google sign-in");
+        let AuthProgress::Challenge { attempt, challenge } = progress else {
+            panic!("expected a Google challenge");
+        };
+        let AuthChallenge::Browser(browser) = challenge else {
+            panic!("expected a browser-shaped challenge");
+        };
+        assert!(
+            browser.url.starts_with("pige-google-android:"),
+            "the Android flow must be signalled as a platform challenge: {}",
+            browser.url
+        );
+        attempt
+    }
+
+    fn deliver_android(attempt: &AuthAttemptId, scopes: &[&str], email: &str) -> AuthAttemptId {
+        let payload = serde_json::json!({
+            "attempt": attempt.as_str(),
+            "result": {
+                "kind": "authorized",
+                "accessToken": "android-access-token",
+                "expiresAtMs": now_ms() + 3_600_000,
+                "scopes": scopes,
+                "identity": {
+                    "userId": "google-user-1",
+                    "email": email,
+                    "displayName": "Google Person"
+                }
+            }
+        })
+        .to_string();
+        deliver_native_result(&payload).expect("queue the validated Android result")
+    }
+
+    async fn poll_complete(attempt: &AuthAttemptId) -> pige_core::auth::AuthenticatedAccount {
+        for _ in 0..100 {
+            if let Ok(Some(progress)) = api::poll_platform_auth(attempt).await {
+                return match progress {
+                    AuthProgress::Complete(authenticated) => authenticated,
+                    other => panic!("expected a completed Google attempt, got {other:?}"),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the Android result never reached the Rust authentication service");
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn stored_google(harness: &Harness, account: &AccountId) -> bool {
+        matches!(
+            harness
+                .secrets()
+                .load(account)
+                .expect("load credential")
+                .map(|envelope| envelope.credentials),
+            Some(StoredCredentials::Google(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn new_google_account_has_no_password_or_server_fields() {
+        let _guard = TEST_LOCK.lock().await;
+        let (harness, host) = google_harness();
+        let attempt = begin_google(None, false).await;
+        let launch = host.launches().last().cloned().expect("host launch");
+        assert_eq!(
+            launch.server_client_id, None,
+            "on-demand authorization forwards no server client id unless offline is configured"
+        );
+        deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "person@example.com");
+        let authenticated = poll_complete(&attempt).await;
+        assert!(matches!(
+            authenticated.account.backend,
+            MailBackend::Gmail { .. }
+        ));
+        assert!(authenticated.account.imap_smtp().is_none());
+
+        let (id, snapshot) = api::finish_auth(authenticated)
+            .await
+            .expect("create account");
+        let account = api::account(&id).expect("created account");
+        assert!(matches!(account.backend, MailBackend::Gmail { .. }));
+        assert!(account.imap_smtp().is_none());
+        assert!(stored_google(&harness, &id));
+        assert_eq!(snapshot.accounts.len(), 1);
+
+        let document = std::fs::read_to_string(harness.dir.path().join("config").join("pige.json"))
+            .expect("read configuration");
+        assert!(
+            !document.contains("\"password\""),
+            "no password field: {document}"
+        );
+        assert!(
+            !document.contains("\"imap\""),
+            "no IMAP endpoints: {document}"
+        );
+        assert!(
+            !document.contains("\"smtp\""),
+            "no SMTP endpoints: {document}"
+        );
+        assert!(
+            document.contains("\"kind\": \"gmail\""),
+            "the native Gmail backend is persisted: {document}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_login_creates_no_account() {
+        let _guard = TEST_LOCK.lock().await;
+        let (harness, host) = google_harness();
+        let attempt = begin_google(None, false).await;
+        api::cancel_auth(&attempt).await.expect("cancel");
+        assert!(host.cancelled().contains(&attempt));
+
+        // A late platform result must not resurrect the abandoned attempt.
+        deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "person@example.com");
+        assert!(
+            api::poll_platform_auth(&attempt).await.is_err(),
+            "a cancelled attempt rejects its late result"
+        );
+        assert!(api::snapshot().accounts.is_empty());
+        assert!(
+            harness
+                .store()
+                .expired_pending_auth(i64::MAX)
+                .expect("pending auth rows")
+                .is_empty(),
+            "no pending authentication survives cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn contacts_optional_at_setup() {
+        let _guard = TEST_LOCK.lock().await;
+        let (harness, host) = google_harness();
+
+        // Mail-only setup requests no contacts scope and commits no sources.
+        let attempt = begin_google(None, false).await;
+        let launch = host.launches().last().cloned().expect("mail launch");
+        assert!(
+            !launch
+                .scopes
+                .iter()
+                .any(|scope| scope == CONTACTS_READONLY_SCOPE)
+        );
+        assert!(
+            !launch
+                .scopes
+                .iter()
+                .any(|scope| scope == CONTACTS_OTHER_READONLY_SCOPE)
+        );
+        deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "person@example.com");
+        let authenticated = poll_complete(&attempt).await;
+        let (id, _) = api::finish_auth_with_contacts(authenticated, false)
+            .await
+            .expect("create mail-only account");
+        assert!(
+            api::account(&id).unwrap().contact_sources.is_empty(),
+            "contacts stay off unless the user opts in"
+        );
+
+        // Enabling contacts is a new authorization that requests both read scopes
+        // and registers the R6 sources only after it completes.
+        let launches_before = host.launches().len();
+        let attempt = begin_google(Some(id.clone()), true).await;
+        assert_eq!(host.launches().len(), launches_before + 1);
+        let launch = host.launches().last().cloned().expect("contacts launch");
+        assert!(
+            launch
+                .scopes
+                .iter()
+                .any(|scope| scope == CONTACTS_READONLY_SCOPE)
+        );
+        assert!(
+            launch
+                .scopes
+                .iter()
+                .any(|scope| scope == CONTACTS_OTHER_READONLY_SCOPE)
+        );
+        deliver_android(
+            &attempt,
+            &[
+                GMAIL_MODIFY_SCOPE,
+                CONTACTS_READONLY_SCOPE,
+                CONTACTS_OTHER_READONLY_SCOPE,
+            ],
+            "person@example.com",
+        );
+        let authenticated = poll_complete(&attempt).await;
+        let (same, _) = api::finish_auth_with_contacts(authenticated, true)
+            .await
+            .expect("grant contacts");
+        assert_eq!(same, id);
+        let account = api::account(&id).unwrap();
+        let sources: Vec<&str> = account
+            .contact_sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect();
+        assert!(sources.contains(&"google.saved"), "{sources:?}");
+        assert!(sources.contains(&"google.other"), "{sources:?}");
+        assert!(account.contact_sources.iter().all(|source| source.enabled));
+        let states = harness.store().contact_source_states(&id).expect("states");
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().all(|(_, state)| state.enabled));
+    }
+
+    #[tokio::test]
+    async fn switch_refuses_sent_copy_repair_or_uncertain_send() {
+        let _guard = TEST_LOCK.lock().await;
+        for state in [SubmissionState::Accepted, SubmissionState::Uncertain] {
+            let (harness, _host) = google_harness();
+            let account = harness.add_imap("LegacyGmail").await;
+            let store = harness.store();
+            let id = queue_submission(&store, outgoing(&account, "Report"), Vec::new())
+                .expect("queue submission");
+            store
+                .set_outbox_state(&id, state, Some("pending"))
+                .expect("set state");
+
+            let blocked = api::can_switch_backend(&account).expect_err("switch is gated");
+            assert!(blocked.to_lowercase().contains("submission"), "{blocked}");
+
+            let attempt = begin_google(Some(account.clone()), false).await;
+            deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "person@example.com");
+            let authenticated = poll_complete(&attempt).await;
+            let error = api::finish_auth(authenticated)
+                .await
+                .expect_err("an unfinished submission blocks the switch");
+            assert!(error.to_lowercase().contains("submission"), "{error}");
+            assert!(
+                api::account(&account).unwrap().imap_smtp().is_some(),
+                "{state:?} must not silently convert the IMAP account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_delete_button_reflects_scope() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(Store::open(dir.path().join("pige.db")).expect("store"));
+        store.migrate().expect("migrate");
+        let sessions = Arc::new(pige_core::auth::AccountSessionManager::new(store));
+        let factory = GoogleProviderFactory::new(sessions.clone(), GoogleEndpoints::production())
+            .with_token_source_provider(Arc::new(FixedGoogleSources));
+        let id = AccountId::new();
+        let account = Account {
+            id: id.clone(),
+            label: "Gmail".to_string(),
+            email: "person@example.com".to_string(),
+            display_name: "Person".to_string(),
+            backend: MailBackend::gmail("google-user-1"),
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        };
+        let ctx = sessions
+            .context(&id, Duration::from_secs(30))
+            .expect("context");
+        let session = provider_open(&factory, &account, &ctx).await;
+        assert!(
+            !session.capabilities.mutations.permanent_delete,
+            "gmail.modify cannot permanently delete; the UI must not offer it"
+        );
+        assert!(
+            session.capabilities.mutations.trash,
+            "the native Gmail path must offer Trash instead"
+        );
+    }
+
+    async fn provider_open(
+        factory: &GoogleProviderFactory,
+        account: &Account,
+        ctx: &OperationContext,
+    ) -> pige_core::providers::ProviderSession {
+        use pige_core::providers::ProviderFactory;
+        factory
+            .open(account, ctx)
+            .await
+            .expect("open Gmail session")
+    }
+
+    struct FixedTokenSource;
+
+    #[async_trait]
+    impl TokenSource for FixedTokenSource {
+        async fn access_token(
+            &self,
+            _ctx: &OperationContext,
+        ) -> Result<SecretString, ProviderError> {
+            Ok(SecretString::from("fixed-access"))
+        }
+    }
+
+    struct FixedGoogleSources;
+
+    impl GoogleTokenSourceProvider for FixedGoogleSources {
+        fn token_source(
+            &self,
+            _account: &AccountId,
+        ) -> Result<Arc<dyn TokenSource>, ProviderError> {
+            Ok(Arc::new(FixedTokenSource))
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_google_config_requires_reauth_not_embedded_tokens() {
+        let _guard = TEST_LOCK.lock().await;
+        let (harness, host) = google_harness();
+        let account = Account {
+            id: AccountId::new(),
+            label: "Restored".to_string(),
+            email: "restored@example.com".to_string(),
+            display_name: "Restored".to_string(),
+            backend: MailBackend::gmail("google-user-restored"),
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        };
+        let backup = "pige-backup-2026-11-10-120000.json";
+        harness
+            .backups
+            .write(backup, &backup_document(vec![account.clone()]))
+            .expect("write Google backup");
+        let outcome = api::restore_config(backup.to_string())
+            .await
+            .expect("restore native Gmail configuration");
+        assert!(
+            outcome
+                .snapshot
+                .accounts
+                .iter()
+                .any(|candidate| candidate.id == account.id)
+        );
+
+        // A configuration backup never carries credentials. With no credential
+        // store entry for the restored id, the only valid next step is a new
+        // authorization; no password or token is invented.
+        assert!(
+            harness
+                .credentials
+                .get(&account.id)
+                .expect("read credential store")
+                .is_none(),
+            "restored Google config must not embed a token"
+        );
+        assert!(harness.secrets().load(&account.id).unwrap().is_none());
+        let document = std::fs::read_to_string(harness.dir.path().join("config").join("pige.json"))
+            .expect("read configuration");
+        for marker in [
+            "access_token",
+            "refresh_token",
+            "accessToken",
+            "refreshToken",
+            "client_secret",
+        ] {
+            assert!(
+                !document.contains(marker),
+                "the restored document must not carry {marker}: {document}"
+            );
+        }
+
+        // Reauthentication is a fresh interactive attempt, not a silent resume.
+        let attempt = begin_google(Some(account.id.clone()), false).await;
+        assert!(
+            host.launches()
+                .iter()
+                .any(|launch| launch.attempt == attempt)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_email_accounts_are_not_silently_merged() {
+        let _guard = TEST_LOCK.lock().await;
+        let (_harness, _host) = google_harness();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let attempt = begin_google(None, false).await;
+            deliver_android(&attempt, &[GMAIL_MODIFY_SCOPE], "same@example.com");
+            let authenticated = poll_complete(&attempt).await;
+            let (id, _) = api::finish_auth(authenticated)
+                .await
+                .expect("create account");
+            ids.push(id);
+        }
+
+        assert_ne!(
+            ids[0], ids[1],
+            "a second consent creates a distinct account"
+        );
+        let snapshot = api::snapshot();
+        assert_eq!(snapshot.accounts.len(), 2);
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .all(|account| account.email == "same@example.com")
+        );
+    }
+}
+
 #[tokio::test]
 async fn write_failure_after_backup_rolls_back_without_a_record() {
     let _guard = TEST_LOCK.lock().await;

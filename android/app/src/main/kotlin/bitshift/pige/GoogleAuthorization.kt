@@ -118,6 +118,24 @@ object GoogleAuthorization {
         currentAttempt = null
     }
 
+    /** Cancel only the attempt named by Rust; a newer attempt is untouched. */
+    fun cancel(attempt: String) {
+        if (currentAttempt == attempt) {
+            currentAttempt = null
+        }
+    }
+
+    /**
+     * Report that the platform UI could not be launched at all (for example no
+     * foreground Activity). Rust turns this into a safe retryable message.
+     */
+    fun reportFailure(attempt: String) {
+        if (currentAttempt == attempt) {
+            currentAttempt = null
+        }
+        deliverFailure(attempt, IllegalStateException("no foreground activity"))
+    }
+
     fun restoreAttempt(attempt: String?) {
         currentAttempt = attempt
     }
