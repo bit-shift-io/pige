@@ -10,6 +10,7 @@
 pub mod identity;
 pub mod mailbox;
 pub mod mutations;
+pub mod submission;
 pub mod sync;
 
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use crate::transport::{
 
 pub use mailbox::ImapMailbox;
 pub use mutations::ImapMutations;
+pub use submission::ImapSubmission;
 pub use sync::ImapSync;
 
 /// Opens IMAP mailbox sessions for IMAP/SMTP accounts.
@@ -104,7 +106,8 @@ pub fn imap_registry(
 }
 
 /// Capabilities advertised by the IMAP adapter, derived from the server's own
-/// capability set. Submission arrives with F9. The mutation booleans are honest
+/// capability set. Submission is SMTP delivery with a client-appended Sent copy.
+/// The mutation booleans are honest
 /// about what the adapter actually implements:
 ///
 /// - `labels` means "label operations that are implemented". On Gmail a label
@@ -131,7 +134,7 @@ pub fn imap_capabilities(server: Capabilities) -> ProviderCapabilities {
             trash: true,
             permanent_delete: !server.gmail,
         },
-        submission: false,
+        submission: true,
         contacts: crate::providers::types::ContactCapabilities::default(),
         server_search: false,
     }
@@ -179,6 +182,10 @@ impl ProviderFactory for ImapProviderFactory {
         session.mutations = Some(Box::new(ImapMutations::new(
             Box::new(SharedTransport::new(shared)),
             server,
+        )));
+        session.submission = Some(Box::new(ImapSubmission::new(
+            self.transports.clone(),
+            account.clone(),
         )));
         Ok(session)
     }

@@ -2227,40 +2227,63 @@ fn message_text(store: &Store, message: &crate::mail::StoredMessage) -> String {
 /// failure (for example a rejected recipient) keeps the compose form open by
 /// returning the outbox error.
 pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> {
-    let (config, account, id, sender) = {
+    let (config, sessions, account, id, sender) = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
         let account = find_account(&state.store, &message.account_id)?;
-        let id = state
-            .store
-            .insert_outbox(&message, send::OutboxState::Queued)
+        // The compose UI has no attachment picker yet, so it passes no parts.
+        // The submission layer still persists the empty vector and the stable
+        // operation id before any network work.
+        let id = send::queue_submission(&state.store, message, Vec::new())
             .map_err(|error| format!("queue message: {error}"))?;
-        (state.config.clone(), account, id, state.events.clone())
+        (
+            state.config.clone(),
+            state.sessions.clone(),
+            account,
+            id,
+            state.events.clone(),
+        )
     };
     let _ = sender.send(CoreEvent::SnapshotChanged);
 
     let store = Store::open(database_path(&config.data_dir))
         .map_err(|error| format!("open outbox store: {error}"))?;
-    // SMTP delivery is the important half. IMAP is only needed for the
-    // best-effort Sent APPEND, so an unreachable IMAP connection must not keep
-    // a message queued when SMTP is available.
-    if let Ok(mut smtp) = config.transport.smtp(&account).await {
-        let result = match config.transport.imap(&account).await {
-            Ok(mut imap) => {
-                send::flush_outbox(&store, &account, smtp.as_mut(), imap.as_mut()).await
-            }
+
+    // Submission is a provider capability from F9 onwards. Opening a session
+    // may fail when the account is offline; the row stays queued and a later
+    // sync retries it.
+    if let Ok(ctx) = sessions.context(&account.id, INTERACTIVE_TIMEOUT) {
+        match config.providers.open(&account, &ctx).await {
+            Ok(mut session) => match session.submission_service() {
+                Ok(service) => {
+                    if let Err(error) = send::flush_provider_outbox(
+                        &store,
+                        &account,
+                        service.as_mut(),
+                        &ctx,
+                    )
+                    .await
+                    {
+                        log::warn!("flush outbox for {}: {error}", account.label);
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "no submission service for {}: {}",
+                        account.label,
+                        error.safe_message
+                    );
+                }
+            },
             Err(error) => {
-                log::warn!(
-                    "IMAP unavailable for {} while sending; appending to Sent later: {error}",
-                    account.label
+                log::debug!(
+                    "outbox for {} is waiting: {}",
+                    account.label,
+                    error.safe_message
                 );
-                send::flush_outbox_smtp_only(&store, &account, smtp.as_mut()).await
             }
-        };
-        if let Err(error) = result {
-            log::warn!("flush outbox for {}: {error}", account.label);
         }
     }
 
@@ -2270,13 +2293,19 @@ pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> 
     let queued = entry.as_ref().is_some_and(|entry| {
         matches!(
             entry.state,
-            send::OutboxState::Queued | send::OutboxState::Sending
+            send::SubmissionState::Queued
+                | send::SubmissionState::Preparing
+                | send::SubmissionState::Submitting
         )
     });
-    let failure = entry
-        .as_ref()
-        .filter(|entry| entry.state == send::OutboxState::Failed)
-        .and_then(|entry| entry.error.clone());
+    let failure = entry.as_ref().and_then(|entry| match entry.state {
+        send::SubmissionState::Rejected | send::SubmissionState::Uncertain => {
+            entry.error.clone().or_else(|| {
+                Some("the message may already have been sent; check Sent before retrying".to_string())
+            })
+        }
+        _ => None,
+    });
 
     let snapshot = snapshot();
     let _ = sender.send(CoreEvent::SnapshotChanged);
@@ -2939,11 +2968,31 @@ async fn sync_one(
             let report = provider_sync_account(store, &mut session, &sync_ctx, budget)
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>((report, capabilities))
+
+            // Deliver queued mail through the same provider session. A
+            // cancelled/expired context or an unreachable provider leaves the
+            // rows durable for the next pass; accepted rows only retry the Sent
+            // copy, never delivery.
+            let mut outbox_errors = Vec::new();
+            let has_pending = store
+                .outbox_pending(&target.id)
+                .is_ok_and(|pending| !pending.is_empty());
+            if has_pending
+                && let Some(service) = session.submission.as_mut()
+            {
+                match send::flush_provider_outbox(store, &target, service.as_mut(), &sync_ctx).await
+                {
+                    Ok(outbox) => outbox_errors.extend(outbox.errors),
+                    Err(error) => outbox_errors.push(error.to_string()),
+                }
+            }
+
+            Ok::<_, String>((report, capabilities, outbox_errors))
         })
         .await
         .map_err(scheduler_message)?;
-    let (report, capabilities) = inner.map_err(|error| format!("{}: {error}", account.label))?;
+    let (report, capabilities, outbox_errors) =
+        inner.map_err(|error| format!("{}: {error}", account.label))?;
 
     // The provider page reports each collection's server total but not its
     // unread rollup, so recompute `unread` locally from the cached flags. This
@@ -2954,37 +3003,6 @@ async fn sync_one(
             if let Err(error) = store.recompute_folder_unread(&folder.id) {
                 log::warn!("recompute unread for {}: {error}", folder.id);
             }
-        }
-    }
-
-    // Outbox delivery is still protocol-side (SMTP + a best-effort Sent APPEND)
-    // until provider submission lands; a missing SMTP connection is expected
-    // offline, so the rows stay queued for the next sync.
-    let mut outbox_errors = Vec::new();
-    let has_pending = store
-        .outbox_pending(&account.id)
-        .is_ok_and(|pending| !pending.is_empty());
-    if has_pending {
-        match config.transport.smtp(account).await {
-            Ok(mut smtp) => match config.transport.imap(account).await {
-                Ok(mut imap) => {
-                    match send::flush_outbox(store, account, smtp.as_mut(), imap.as_mut()).await {
-                        Ok(outbox) => outbox_errors.extend(outbox.errors),
-                        Err(error) => outbox_errors.push(error.to_string()),
-                    }
-                }
-                Err(error) => {
-                    log::warn!(
-                        "IMAP unavailable for {} while appending Sent; sending without the copy: {error}",
-                        account.label
-                    );
-                    match send::flush_outbox_smtp_only(store, account, smtp.as_mut()).await {
-                        Ok(outbox) => outbox_errors.extend(outbox.errors),
-                        Err(error) => outbox_errors.push(error.to_string()),
-                    }
-                }
-            },
-            Err(error) => log::debug!("outbox for {} is waiting: {error}", account.label),
         }
     }
 

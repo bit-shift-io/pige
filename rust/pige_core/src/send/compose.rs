@@ -7,11 +7,12 @@
 use std::str::FromStr;
 
 use lettre::Message;
-use lettre::message::Mailbox;
-use lettre::message::header::{ContentType, MIME_VERSION_1_0};
+use lettre::message::header::{ContentDisposition, ContentId, ContentType, MIME_VERSION_1_0};
+use lettre::message::{Mailbox, MultiPart, SinglePart};
 
 use crate::account::Account;
-use crate::mail::{Address, MessageHeader, sender_display};
+use crate::mail::{Address, AttachmentDisposition, MessageHeader, sender_display};
+use crate::providers::SubmissionAttachment;
 
 use super::OutgoingMessage;
 
@@ -179,6 +180,20 @@ pub fn forward_message(account: &Account, header: &MessageHeader, body: &str) ->
 /// formatted headers: the same bytes go to every recipient, so a Bcc header
 /// would disclose the blind recipients to To/Cc.
 pub fn build_mime(from: &Address, message: &OutgoingMessage) -> Result<Vec<u8>, ComposeError> {
+    build_mime_with_parts(from, message, &[])
+}
+
+/// Render a compose form with optional structured MIME parts.
+///
+/// The existing plain-text compose UI passes an empty slice, which produces
+/// byte-for-byte the same shape as [`build_mime`]. Provider submissions that
+/// carry structured parts get a `multipart/mixed` body while keeping the Bcc
+/// envelope rule: recipients go into the envelope, never a header.
+pub fn build_mime_with_parts(
+    from: &Address,
+    message: &OutgoingMessage,
+    attachments: &[SubmissionAttachment],
+) -> Result<Vec<u8>, ComposeError> {
     let recipient_count = message.to.len() + message.cc.len() + message.bcc.len();
     if recipient_count == 0 {
         return Err(ComposeError::NoRecipients);
@@ -197,7 +212,6 @@ pub fn build_mime(from: &Address, message: &OutgoingMessage) -> Result<Vec<u8>, 
         .date_now()
         .message_id(Some(format!("<{}@{domain}>", uuid::Uuid::new_v4())))
         .header(MIME_VERSION_1_0)
-        .header(ContentType::TEXT_PLAIN)
         .subject(message.subject.clone());
 
     for address in &message.to {
@@ -217,10 +231,58 @@ pub fn build_mime(from: &Address, message: &OutgoingMessage) -> Result<Vec<u8>, 
         builder = builder.references(message.references.join(" "));
     }
 
-    let formatted = builder
-        .body(message.body.clone())
-        .map_err(|error| ComposeError::Build(error.to_string()))?;
+    let formatted = if attachments.is_empty() {
+        builder
+            .header(ContentType::TEXT_PLAIN)
+            .body(message.body.clone())
+    } else {
+        let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone()));
+        for attachment in attachments {
+            let content_type = ContentType::parse(&attachment.content_type)
+                .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
+            let disposition = match attachment.disposition {
+                AttachmentDisposition::Inline => {
+                    ContentDisposition::inline_with_name(&attachment.filename)
+                }
+                AttachmentDisposition::Attachment => {
+                    ContentDisposition::attachment(&attachment.filename)
+                }
+            };
+            let mut part = SinglePart::builder()
+                .header(content_type)
+                .header(disposition);
+            if let Some(content_id) = &attachment.content_id {
+                part = part.header(ContentId::from(content_id.clone()));
+            }
+            multipart = multipart.singlepart(part.body(attachment.bytes.clone()));
+        }
+        builder.multipart(multipart)
+    }
+    .map_err(|error| ComposeError::Build(error.to_string()))?;
     Ok(formatted.formatted())
+}
+
+/// Extract the RFC 5322 `Message-ID` from prepared bytes, if present.
+///
+/// Used by adapters to prove a Sent APPEND already happened before retrying an
+/// ambiguous copy operation.
+pub fn raw_message_id(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("message-id") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn mailbox(address: &Address) -> Result<Mailbox, ComposeError> {

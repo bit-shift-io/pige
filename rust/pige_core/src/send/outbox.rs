@@ -14,13 +14,16 @@
 //! resent. The tiny window between SMTP acceptance and the `SentLocal` write can
 //! therefore cause a missing Sent copy, never a duplicate delivery.
 
-use std::str::FromStr;
-
 use async_trait::async_trait;
 use rusqlite::{Row, params};
 
 use crate::account::{Account, AccountId};
-use crate::mail::{Address, Flags, Uid};
+use crate::mail::{Address, AttachmentDisposition, Flags, Uid};
+use crate::providers::{
+    ErrorKind, OperationContext, OperationId, PreparedSubmission, ProviderError, ProviderId,
+    SubmissionAttachment, SubmissionOutcome, SubmissionReceipt, SubmissionRequest,
+    SubmissionService, SentCopyPolicy,
+};
 use crate::store::{Store, StoreError};
 use crate::transport::{
     Capabilities, FlagOp, FolderState, MailTransport, RemoteFolder, RemoteMessage, SendError,
@@ -29,6 +32,11 @@ use crate::transport::{
 
 use super::OutgoingMessage;
 use super::compose::build_mime;
+use super::submission::SubmissionState;
+
+/// Compatibility name for the durable submission lifecycle. New code should
+/// use [`SubmissionState`]; the alias keeps older callers and the UI compiling.
+pub type OutboxState = SubmissionState;
 
 /// Stable identifier for one outbox row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -52,51 +60,23 @@ impl std::fmt::Display for OutboxId {
     }
 }
 
-/// Persisted lifecycle of an outgoing message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxState {
-    Draft,
-    Queued,
-    Sending,
-    SentLocal,
-    Sent,
-    Failed,
-}
-
-impl OutboxState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Draft => "draft",
-            Self::Queued => "queued",
-            Self::Sending => "sending",
-            Self::SentLocal => "sent_local",
-            Self::Sent => "sent",
-            Self::Failed => "failed",
-        }
-    }
-
-    pub fn from_db(value: &str) -> Option<Self> {
-        match value {
-            "draft" => Some(Self::Draft),
-            "queued" => Some(Self::Queued),
-            "sending" => Some(Self::Sending),
-            "sent_local" => Some(Self::SentLocal),
-            "sent" => Some(Self::Sent),
-            "failed" => Some(Self::Failed),
-            _ => None,
-        }
-    }
-}
-
 /// One outbox row, including the compose fields and the exact raw bytes once
-/// they have been generated.
+/// they have been generated. Provider-neutral submission metadata is kept in
+/// separate fields so a receipt, a prepared artifact, and retry diagnostics can
+/// never overwrite one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxEntry {
     pub id: OutboxId,
     pub message: OutgoingMessage,
-    pub state: OutboxState,
+    pub state: SubmissionState,
     pub error: Option<String>,
     pub raw: Option<Vec<u8>>,
+    pub operation_id: OperationId,
+    pub backend: Option<ProviderId>,
+    pub prepared: Option<PreparedSubmission>,
+    pub receipt: Option<SubmissionReceipt>,
+    pub retry_count: u32,
+    pub retry_after: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -105,18 +85,24 @@ pub struct OutboxEntry {
 /// aborting the whole sync; only an unrecoverable store failure returns `Err`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutboxReport {
-    /// Fully delivered and, when possible, appended to Sent.
+    /// Fully delivered and, when possible, the Sent copy is complete.
     pub sent: u32,
-    /// Accepted by SMTP, but the Sent APPEND still has to be retried.
+    /// Accepted, but the Sent copy still has to be retried.
     pub sent_local: u32,
+    /// Permanently rejected this pass.
     pub failed: u32,
-    /// Still queued for a later attempt.
+    /// Still queued or interrupted and waiting for a later attempt.
     pub queued: u32,
+    /// Rows whose outcome cannot be proven; never retried automatically.
+    pub uncertain: u32,
     pub errors: Vec<String>,
 }
 
 const COLUMNS: &str = "id, account_id, to_json, cc_json, bcc_json, subject, body, \
-     in_reply_to, references_json, raw, state, error, created_at, updated_at";
+     in_reply_to, references_json, raw, state, error, created_at, updated_at, \
+     operation_id, backend, prepared_version, prepared_backend, prepared_raw, \
+     prepared_reference, receipt_operation, receipt_remote_message, \
+     receipt_remote_thread, retry_count, retry_after";
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -142,13 +128,40 @@ impl Store {
         message: &OutgoingMessage,
         state: OutboxState,
     ) -> Result<OutboxId, StoreError> {
+        self.insert_outbox_with_parts(message, state, &[])
+    }
+
+    /// Insert a row and its structured parts in one transaction.
+    ///
+    /// Validation runs before the transaction so an oversized submission never
+    /// creates an outbox row. Parts keep the caller's stable ids and are deleted
+    /// with the row by the foreign-key cascade.
+    pub(crate) fn insert_outbox_with_parts(
+        &self,
+        message: &OutgoingMessage,
+        state: OutboxState,
+        attachments: &[SubmissionAttachment],
+    ) -> Result<OutboxId, StoreError> {
+        super::submission::validate_attachments(attachments)?;
+
         let id = OutboxId::new();
+        let operation = OperationId::new(uuid::Uuid::new_v4().to_string());
+        let backend = self
+            .accounts()?
+            .into_iter()
+            .find(|account| account.id == message.account_id)
+            .map(|account| account.provider_id());
         let now = now_unix();
-        self.connection().execute(
+
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO outbox (
                  id, account_id, to_json, cc_json, bcc_json, subject, body,
-                 in_reply_to, references_json, raw, state, error, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?11)",
+                 in_reply_to, references_json, raw, state, error, created_at,
+                 updated_at, operation_id, backend
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11,
+                       ?11, ?12, ?13)",
             params![
                 id.0,
                 message.account_id.0,
@@ -161,8 +174,29 @@ impl Store {
                 encode_json(&message.references)?,
                 state.as_str(),
                 now,
+                operation.0,
+                backend.as_ref().map(|backend| backend.0.clone()),
             ],
         )?;
+        for (position, attachment) in attachments.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO outbox_parts (
+                     outbox_id, part_id, position, filename, content_type,
+                     content_id, disposition, bytes
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id.0,
+                    &attachment.id,
+                    position as i64,
+                    &attachment.filename,
+                    &attachment.content_type,
+                    attachment.content_id.as_deref(),
+                    attachment.disposition.as_str(),
+                    &attachment.bytes,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(id)
     }
 
@@ -208,11 +242,15 @@ impl Store {
             .collect())
     }
 
-    /// Rows a flush should inspect: queued, already accepted, and interrupted.
+    /// Rows a flush should inspect: queued, accepted with a Sent copy pending,
+    /// and interrupted preparations/submissions. Terminal and uncertain rows are
+    /// deliberately excluded so they are never retried automatically.
     pub fn outbox_pending(&self, account: &AccountId) -> Result<Vec<OutboxEntry>, StoreError> {
         let sql = format!(
             "SELECT {COLUMNS} FROM outbox
-             WHERE account_id = ?1 AND state IN ('queued', 'sent_local', 'sending')
+             WHERE account_id = ?1 AND state IN
+                 ('queued', 'preparing', 'submitting', 'accepted',
+                  'sent_local', 'sending')
              ORDER BY created_at, id"
         );
         let conn = self.connection();
@@ -244,6 +282,169 @@ impl Store {
             params![raw, now_unix(), id.0],
         )?;
         Ok(())
+    }
+
+    /// Atomically claim a queued row for preparation, persisting the stable
+    /// operation id and backend before any network work. Only one flush can win
+    /// the transition out of `queued`.
+    pub fn claim_outbox_for_prepare(
+        &self,
+        id: &OutboxId,
+        operation: &OperationId,
+        backend: &ProviderId,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection().execute(
+            "UPDATE outbox
+             SET state = 'preparing',
+                 operation_id = COALESCE(operation_id, ?1),
+                 backend = COALESCE(backend, ?2),
+                 error = NULL,
+                 updated_at = ?3
+             WHERE id = ?4 AND state = 'queued'",
+            params![operation.0, backend.0, now_unix(), id.0],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Persist the prepared artifact and move to `submitting` in one write. The
+    /// prepared bytes are also mirrored into `raw` for the legacy Sent-append
+    /// path and diagnostics.
+    pub fn set_outbox_prepared_submitting(
+        &self,
+        id: &OutboxId,
+        prepared: &PreparedSubmission,
+        raw: Option<&[u8]>,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection().execute(
+            "UPDATE outbox
+             SET state = 'submitting',
+                 prepared_version = ?1,
+                 prepared_backend = ?2,
+                 prepared_raw = ?3,
+                 prepared_reference = ?4,
+                 raw = COALESCE(?3, raw),
+                 error = NULL,
+                 updated_at = ?5
+             WHERE id = ?6 AND state = 'preparing'",
+            params![
+                prepared.version,
+                prepared.backend.0,
+                raw,
+                prepared.reference,
+                now_unix(),
+                id.0,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Record acceptance, the provider receipt, and the once-only learning
+    /// marker in one transaction. Returns true only for the transition that
+    /// actually recorded the acceptance, so a future learning hook cannot train
+    /// the same submission twice.
+    pub fn record_outbox_acceptance(
+        &self,
+        id: &OutboxId,
+        receipt: &SubmissionReceipt,
+    ) -> Result<bool, StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE outbox
+             SET state = 'accepted',
+                 receipt_operation = ?1,
+                 receipt_remote_message = ?2,
+                 receipt_remote_thread = ?3,
+                 acceptance_recorded = 1,
+                 retry_after = NULL,
+                 error = NULL,
+                 updated_at = ?4
+             WHERE id = ?5
+               AND acceptance_recorded = 0
+               AND state IN ('preparing', 'submitting', 'queued')",
+            params![
+                receipt.operation.0,
+                receipt.remote_message.as_ref().map(|id| id.0.clone()),
+                receipt.remote_thread.as_ref().map(|id| id.0.clone()),
+                now_unix(),
+                id.0,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn mark_outbox_complete(&self, id: &OutboxId) -> Result<bool, StoreError> {
+        let changed = self.connection().execute(
+            "UPDATE outbox SET state = 'complete', error = NULL, updated_at = ?1
+             WHERE id = ?2 AND state = 'accepted'",
+            params![now_unix(), id.0],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn mark_outbox_rejected(&self, id: &OutboxId, error: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE outbox
+             SET state = 'rejected', error = ?1, retry_count = retry_count + 1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![error, now_unix(), id.0],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_outbox_uncertain(&self, id: &OutboxId, error: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE outbox
+             SET state = 'uncertain', error = ?1, retry_count = retry_count + 1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![error, now_unix(), id.0],
+        )?;
+        Ok(())
+    }
+
+    /// Return a row to `queued` with retry metadata. Safe only when the caller
+    /// has evidence that no delivery was accepted.
+    pub fn requeue_outbox(
+        &self,
+        id: &OutboxId,
+        error: Option<&str>,
+        retry_after: Option<i64>,
+    ) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE outbox
+             SET state = 'queued', error = ?1, retry_count = retry_count + 1,
+                 retry_after = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![error, retry_after, now_unix(), id.0],
+        )?;
+        Ok(())
+    }
+
+    /// Structured parts in their original order. Bytes are stored in the row so
+    /// they survive a process restart without relying on a cache file.
+    pub fn outbox_parts(&self, id: &OutboxId) -> Result<Vec<SubmissionAttachment>, StoreError> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT part_id, filename, content_type, bytes, content_id, disposition
+             FROM outbox_parts WHERE outbox_id = ?1 ORDER BY position, part_id",
+        )?;
+        let mut rows = stmt.query([&id.0])?;
+        let mut parts = Vec::new();
+        while let Some(row) = rows.next()? {
+            let disposition: String = row.get(5)?;
+            parts.push(SubmissionAttachment {
+                id: row.get(0)?,
+                filename: row.get(1)?,
+                content_type: row.get(2)?,
+                bytes: row.get(3)?,
+                content_id: row.get(4)?,
+                disposition: AttachmentDisposition::from_db(&disposition),
+            });
+        }
+        Ok(parts)
     }
 
     /// Persist the generated bytes and claim the row atomically. A row can only
@@ -287,13 +488,39 @@ impl Store {
 }
 
 fn entry_from_row(row: &Row<'_>) -> Result<OutboxEntry, StoreError> {
+    let id: String = row.get(0)?;
     let to_json: String = row.get(2)?;
     let cc_json: String = row.get(3)?;
     let bcc_json: String = row.get(4)?;
     let references_json: String = row.get(8)?;
     let state: String = row.get(10)?;
+    let operation_id: Option<String> = row.get(14)?;
+    let backend: Option<String> = row.get(15)?;
+    let prepared_version: Option<u32> = row.get(16)?;
+    let prepared_backend: Option<String> = row.get(17)?;
+    let prepared_raw: Option<Vec<u8>> = row.get(18)?;
+    let prepared_reference: Option<String> = row.get(19)?;
+    let receipt_operation: Option<String> = row.get(20)?;
+    let receipt_remote_message: Option<String> = row.get(21)?;
+    let receipt_remote_thread: Option<String> = row.get(22)?;
+
+    let prepared = match (prepared_version, prepared_backend) {
+        (Some(version), Some(backend)) => Some(PreparedSubmission {
+            version,
+            backend: ProviderId::from(backend),
+            raw: prepared_raw,
+            reference: prepared_reference,
+        }),
+        _ => None,
+    };
+    let receipt = receipt_operation.map(|operation| SubmissionReceipt {
+        operation: OperationId::new(operation),
+        remote_message: receipt_remote_message.map(crate::providers::RemoteMessageId::new),
+        remote_thread: receipt_remote_thread.map(crate::providers::RemoteThreadId::new),
+    });
+
     Ok(OutboxEntry {
-        id: OutboxId(row.get(0)?),
+        id: OutboxId(id.clone()),
         message: OutgoingMessage {
             account_id: AccountId(row.get(1)?),
             to: decode_json(&to_json, "outbox.to_json")?,
@@ -304,10 +531,18 @@ fn entry_from_row(row: &Row<'_>) -> Result<OutboxEntry, StoreError> {
             in_reply_to: row.get(7)?,
             references: decode_json(&references_json, "outbox.references_json")?,
         },
-        state: OutboxState::from_db(&state)
+        state: SubmissionState::from_db(&state)
             .ok_or_else(|| StoreError::corrupt("outbox.state", state))?,
         error: row.get(11)?,
         raw: row.get(9)?,
+        operation_id: operation_id
+            .map(OperationId::new)
+            .unwrap_or_else(|| super::submission::legacy_operation_id(&id)),
+        backend: backend.map(ProviderId::from),
+        prepared,
+        receipt,
+        retry_count: row.get(23)?,
+        retry_after: row.get(24)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
     })
@@ -368,215 +603,171 @@ pub fn outbox_entry(store: &Store, id: &OutboxId) -> Result<Option<OutboxEntry>,
     store.outbox_entry(id)
 }
 
-/// Persist a message as `Queued` before any network work. Callers then invoke
-/// [`flush_outbox`]; if the network is unavailable the row simply stays queued.
+/// Persist a message as `Queued` before any network work. The existing compose
+/// UI has no attachment picker, so it always passes an empty parts vector.
 pub async fn queue_send(store: &Store, message: OutgoingMessage) -> Result<OutboxId, StoreError> {
-    store.insert_outbox(&message, OutboxState::Queued)
+    super::submission::queue_submission(store, message, Vec::new())
 }
 
-/// Deliver every pending row for one account.
+/// Deliver every pending row for one account through the provider-neutral state
+/// machine, using the legacy SMTP + IMAP transports behind a local
+/// `SubmissionService`. Kept for callers and tests that still drive the protocol
+/// transports directly; the API uses [`super::submission::flush_provider_outbox`]
+/// with a provider session instead.
 pub async fn flush_outbox(
     store: &Store,
     account: &Account,
     smtp: &mut dyn SmtpSender,
     imap: &mut dyn MailTransport,
 ) -> Result<OutboxReport, SendError> {
-    flush_outbox_inner(store, account, smtp, imap).await
+    let mut service = ProtocolSubmission {
+        store,
+        account,
+        smtp,
+        imap,
+    };
+    let ctx = OperationContext::with_timeout(
+        account.id.clone(),
+        0,
+        std::time::Duration::from_secs(30),
+    );
+    super::submission::flush_provider_outbox(store, account, &mut service, &ctx)
+        .await
+        .map_err(store_error)
 }
 
 /// Deliver every pending row with SMTP only. The Sent APPEND is best-effort, so
 /// an unreachable IMAP server must not block delivery; accepted rows remain
-/// `SentLocal` until a later flush can append them.
+/// `Accepted` until a later flush can append them.
 pub async fn flush_outbox_smtp_only(
     store: &Store,
     account: &Account,
     smtp: &mut dyn SmtpSender,
 ) -> Result<OutboxReport, SendError> {
     let mut imap = UnavailableImap;
-    flush_outbox_inner(store, account, smtp, &mut imap).await
+    flush_outbox(store, account, smtp, &mut imap).await
 }
 
-async fn flush_outbox_inner(
-    store: &Store,
-    account: &Account,
-    smtp: &mut dyn SmtpSender,
-    imap: &mut dyn MailTransport,
-) -> Result<OutboxReport, SendError> {
-    let from = Address::new(
-        Some(account.display_name.clone()).filter(|name| !name.trim().is_empty()),
-        account.email.clone(),
-    );
-    let pending = store.outbox_pending(&account.id).map_err(store_error)?;
-    let mut report = OutboxReport::default();
+/// The original SMTP + IMAP transports expressed through the submission
+/// contract. This keeps the old direct-transport entry points working while the
+/// durable state machine, crash recovery, and Sent-copy retry logic stay shared
+/// with provider adapters.
+struct ProtocolSubmission<'a> {
+    store: &'a Store,
+    account: &'a Account,
+    smtp: &'a mut dyn SmtpSender,
+    imap: &'a mut dyn MailTransport,
+}
 
-    for entry in pending {
-        match entry.state {
-            OutboxState::Queued => {
-                match flush_queued(store, account, &from, smtp, &mut *imap, &entry).await {
-                    Ok(Outcome::Sent) => report.sent += 1,
-                    Ok(Outcome::SentLocal(error)) => {
-                        report.sent_local += 1;
-                        report.errors.push(error);
-                    }
-                    Ok(Outcome::Failed(error)) => {
-                        report.failed += 1;
-                        report.errors.push(error);
-                    }
-                    Ok(Outcome::Skipped) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            OutboxState::SentLocal => match entry.raw.as_deref() {
-                Some(raw) => match append_sent(store, account, &mut *imap, &entry.id, raw).await {
-                    Ok(()) => report.sent += 1,
-                    Err(message) => {
-                        report.sent_local += 1;
-                        report.errors.push(message);
-                    }
-                },
-                None => {
-                    let message = "sent message has no raw bytes to append".to_string();
-                    store
-                        .set_outbox_error(&entry.id, &message)
-                        .map_err(store_error)?;
-                    report.sent_local += 1;
-                    report.errors.push(message);
-                }
-            },
-            OutboxState::Sending => {
-                // The process may have died after SMTP accepted this message.
-                // Resending would risk a duplicate delivery, so fail it loudly
-                // and leave the row for the user to inspect.
-                let message = "send was interrupted; not retried to avoid a duplicate".to_string();
-                store
-                    .set_outbox_state(&entry.id, OutboxState::Failed, Some(&message))
-                    .map_err(store_error)?;
-                report.failed += 1;
-                report.errors.push(message);
-            }
-            OutboxState::Draft | OutboxState::Sent | OutboxState::Failed => {}
+#[async_trait]
+impl SubmissionService for ProtocolSubmission<'_> {
+    fn sent_copy_policy(&self) -> SentCopyPolicy {
+        SentCopyPolicy::ClientAppend
+    }
+
+    async fn prepare(
+        &mut self,
+        request: &SubmissionRequest,
+        _ctx: &OperationContext,
+    ) -> Result<PreparedSubmission, ProviderError> {
+        if let Some(prepared) = &request.prepared
+            && prepared.raw.is_some()
+        {
+            return Ok(prepared.clone());
+        }
+        let from = Address::new(
+            Some(self.account.display_name.clone())
+                .filter(|name| !name.trim().is_empty()),
+            self.account.email.clone(),
+        );
+        let raw = build_mime(&from, &request.message)
+            .map_err(|error| ProviderError::new(ErrorKind::Forbidden, error.to_string()))?;
+        Ok(PreparedSubmission {
+            version: 1,
+            backend: self.account.provider_id(),
+            raw: Some(raw),
+            reference: None,
+        })
+    }
+
+    async fn submit(
+        &mut self,
+        request: &SubmissionRequest,
+        _ctx: &OperationContext,
+    ) -> Result<SubmissionOutcome, ProviderError> {
+        let raw = request
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.raw.clone())
+            .ok_or_else(|| ProviderError::new(ErrorKind::Forbidden, "no prepared message"))?;
+        let from = Address::new(
+            Some(self.account.display_name.clone())
+                .filter(|name| !name.trim().is_empty()),
+            self.account.email.clone(),
+        );
+        let recipients = request.message.recipients();
+        if recipients.is_empty() {
+            return Ok(SubmissionOutcome::Rejected(ProviderError::new(
+                ErrorKind::Forbidden,
+                "message has no recipients",
+            )));
+        }
+        match self.smtp.send_raw(&from, &recipients, &raw).await {
+            Ok(()) => Ok(SubmissionOutcome::Accepted(SubmissionReceipt {
+                operation: request.operation.clone(),
+                remote_message: None,
+                remote_thread: None,
+            })),
+            // A protocol send that failed after connecting is ambiguous: the
+            // server may have accepted DATA before the connection dropped.
+            Err(error) => Err(
+                ProviderError::unknown_write_outcome("SMTP delivery did not complete")
+                    .with_source_detail(error.to_string()),
+            ),
         }
     }
 
-    report.queued = store
-        .count_outbox_state(&account.id, OutboxState::Queued)
-        .map_err(store_error)?;
-    Ok(report)
-}
-
-enum Outcome {
-    Sent,
-    SentLocal(String),
-    Failed(String),
-    Skipped,
-}
-
-async fn flush_queued(
-    store: &Store,
-    account: &Account,
-    from: &Address,
-    smtp: &mut dyn SmtpSender,
-    imap: &mut dyn MailTransport,
-    entry: &OutboxEntry,
-) -> Result<Outcome, SendError> {
-    let raw = match &entry.raw {
-        Some(raw) => raw.clone(),
-        None => match build_mime(from, &entry.message) {
-            Ok(raw) => raw,
-            Err(error) => {
-                // Invalid addresses and missing recipients are permanent: mark
-                // the row failed instead of retrying forever and telling the
-                // user it is merely waiting for a connection.
-                let message = error.to_string();
-                store
-                    .set_outbox_state(&entry.id, OutboxState::Failed, Some(&message))
-                    .map_err(store_error)?;
-                return Ok(Outcome::Failed(message));
-            }
-        },
-    };
-
-    let recipients = entry
-        .message
-        .to
-        .iter()
-        .chain(entry.message.cc.iter())
-        .chain(entry.message.bcc.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-    if recipients.is_empty() {
-        let message = "message has no recipients".to_string();
-        store
-            .set_outbox_state(&entry.id, OutboxState::Failed, Some(&message))
-            .map_err(store_error)?;
-        return Ok(Outcome::Failed(message));
+    async fn reconcile(
+        &mut self,
+        _request: &SubmissionRequest,
+        _ctx: &OperationContext,
+    ) -> Result<crate::providers::ReconcileOutcome, ProviderError> {
+        // The legacy transports expose no delivery evidence. Treat a reopened
+        // write as unknown rather than guessing.
+        Ok(crate::providers::ReconcileOutcome::Unknown)
     }
 
-    if !store.claim_outbox(&entry.id, &raw).map_err(store_error)? {
-        // Another flush claimed it first; leave it alone.
-        return Ok(Outcome::Skipped);
-    }
-
-    if let Err(error) = smtp.send_raw(from, &recipients, &raw).await {
-        let message = error.to_string();
-        store
-            .set_outbox_state(&entry.id, OutboxState::Failed, Some(&message))
-            .map_err(store_error)?;
-        return Ok(Outcome::Failed(message));
-    }
-
-    // SMTP accepted. Record that before touching the Sent folder; from here on
-    // a failure can only retry the APPEND, never the send.
-    store
-        .set_outbox_state(&entry.id, OutboxState::SentLocal, None)
-        .map_err(store_error)?;
-
-    match append_sent(store, account, imap, &entry.id, &raw).await {
-        Ok(()) => Ok(Outcome::Sent),
-        Err(message) => Ok(Outcome::SentLocal(message)),
-    }
-}
-
-/// Best-effort APPEND to the account's Sent folder. No Sent folder means there
-/// is nothing to retry, so the row is considered sent. A failure, including an
-/// unavailable IMAP connection, leaves the row in `SentLocal` and stores the
-/// error for the next flush.
-async fn append_sent(
-    store: &Store,
-    account: &Account,
-    imap: &mut dyn MailTransport,
-    id: &OutboxId,
-    raw: &[u8],
-) -> Result<(), String> {
-    let folders = store.folders(&account.id).map_err(|e| e.to_string())?;
-    let Some(folder) = folders
-        .iter()
-        .find(|folder| folder.kind == crate::mail::FolderKind::Sent)
-    else {
-        store
-            .set_outbox_state(id, OutboxState::Sent, None)
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    };
-
-    let flags = Flags {
-        seen: true,
-        ..Flags::default()
-    };
-    match imap.append(&folder.name, raw, flags).await {
-        Ok(()) => {
-            store
-                .set_outbox_state(id, OutboxState::Sent, None)
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        Err(error) => {
-            let message = format!("append to {}: {error}", folder.name);
-            store
-                .set_outbox_error(id, &message)
-                .map_err(|e| e.to_string())?;
-            Err(message)
-        }
+    async fn finalize_sent(
+        &mut self,
+        request: &SubmissionRequest,
+        _receipt: &SubmissionReceipt,
+        _ctx: &OperationContext,
+    ) -> Result<(), ProviderError> {
+        let raw = request
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.raw.as_deref())
+            .ok_or_else(|| ProviderError::transient("the sent message has no raw bytes"))?;
+        let folders = self
+            .store
+            .folders(&self.account.id)
+            .map_err(|error| ProviderError::transient(error.to_string()))?;
+        let Some(folder) = folders
+            .iter()
+            .find(|folder| folder.kind == crate::mail::FolderKind::Sent)
+        else {
+            return Ok(());
+        };
+        let flags = Flags {
+            seen: true,
+            ..Flags::default()
+        };
+        self.imap
+            .append(&folder.name, raw, flags)
+            .await
+            .map_err(|error| {
+                ProviderError::transient(format!("append to {}: {error}", folder.name))
+            })
     }
 }
 
@@ -672,14 +863,6 @@ impl MailTransport for UnavailableImap {
 
 fn store_error(error: StoreError) -> SendError {
     SendError(format!("outbox store: {error}"))
-}
-
-impl FromStr for OutboxState {
-    type Err = ();
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::from_db(value).ok_or(())
-    }
 }
 
 #[cfg(test)]

@@ -112,6 +112,17 @@ pub enum StoreError {
     /// A change referenced a provider message that has not been cached yet.
     #[error("unknown remote message {0}")]
     UnknownRemoteMessage(RemoteMessageId),
+    /// One outgoing attachment exceeds the per-part cap.
+    #[error("attachment is too large: {size} bytes exceeds the {limit} byte limit")]
+    AttachmentTooLarge { size: u64, limit: u64 },
+    /// The sum of outgoing attachment bytes exceeds the per-submission cap.
+    #[error(
+        "attachment total is too large: {size} bytes exceeds the {limit} byte submission limit"
+    )]
+    AttachmentsTooLarge { size: u64, limit: u64 },
+    /// A structured outgoing part has invalid identity or metadata.
+    #[error("invalid submission attachment: {reason}")]
+    InvalidAttachment { reason: String },
 }
 
 impl StoreError {

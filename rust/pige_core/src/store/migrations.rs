@@ -9,6 +9,7 @@ mod v5;
 mod v6;
 mod v7;
 mod v8;
+mod v9;
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -57,7 +58,9 @@ impl Store {
     /// generations, cross-process leases, pending-auth references, and
     /// generation-fenced checkpoints; v7 separates remote message identity from
     /// collection membership; v8 records the provider signature status and the
-    /// remote attachment id on the cached message and attachment.
+    /// remote attachment id on the cached message and attachment; v9 generalizes
+    /// the outbox into a provider-neutral durable submission with structured
+    /// parts, operation identity, prepared artifacts, and receipts.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -135,6 +138,10 @@ impl Store {
         if version < 8 && target >= 8 {
             v8::apply(&tx)?;
             version = 8;
+        }
+        if version < 9 && target >= 9 {
+            v9::apply(&tx)?;
+            version = 9;
         }
 
         // The rebuild must not leave a dangling reference behind; check before

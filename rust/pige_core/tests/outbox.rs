@@ -296,11 +296,12 @@ async fn an_interrupted_sending_row_is_never_resent() {
         .await
         .unwrap();
 
-    assert_eq!(report.failed, 1);
+    assert_eq!(report.uncertain, 1);
+    assert_eq!(report.failed, 0);
     assert!(smtp.calls.is_empty());
     let entry = outbox_entry(&store, &id).unwrap().unwrap();
-    assert_eq!(entry.state, OutboxState::Failed);
-    assert!(entry.error.unwrap().contains("not retried"));
+    assert_eq!(entry.state, OutboxState::Uncertain);
+    assert!(entry.error.unwrap().contains("unknown"));
 }
 
 #[test]

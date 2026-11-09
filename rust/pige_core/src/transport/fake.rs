@@ -27,6 +27,10 @@ pub struct FakeTransport {
     pub texts: HashMap<String, HashMap<Uid, String>>,
     /// Folder name -> UID -> raw body bytes returned by `fetch_body`.
     pub bodies: HashMap<String, HashMap<Uid, Vec<u8>>>,
+    /// UIDs returned by every `search` call, for Sent-copy evidence tests.
+    pub search_results: Vec<Uid>,
+    /// When true, `search` fails, modelling an unverifiable APPEND.
+    pub fail_search: bool,
     pub capabilities: Capabilities,
     /// Folder names whose `select` returns an error.
     pub fail_select: HashSet<String>,
@@ -42,6 +46,7 @@ pub struct FakeTransport {
     pub fetch_flags_calls: Vec<(String, Vec<Uid>)>,
     pub fetch_texts_calls: Vec<(String, Vec<Uid>, usize)>,
     pub fetch_body_calls: Vec<(String, Uid)>,
+    pub search_calls: Vec<(String, String)>,
     pub append_calls: Vec<(String, Vec<u8>, Flags)>,
     /// Mutation call recordings: (selected folder, uids, ...).
     pub store_flags_calls: Vec<(String, Vec<Uid>, FlagOp)>,
@@ -81,6 +86,7 @@ impl FakeTransport {
         self.fetch_flags_calls.clear();
         self.fetch_texts_calls.clear();
         self.fetch_body_calls.clear();
+        self.search_calls.clear();
         self.append_calls.clear();
         self.store_flags_calls.clear();
         self.move_calls.clear();
@@ -240,8 +246,13 @@ impl MailTransport for FakeTransport {
             .collect())
     }
 
-    async fn search(&mut self, _query: &str) -> Result<Vec<Uid>, TransportError> {
-        Ok(Vec::new())
+    async fn search(&mut self, query: &str) -> Result<Vec<Uid>, TransportError> {
+        let folder = self.current.clone().unwrap_or_default();
+        self.search_calls.push((folder, query.to_string()));
+        if self.fail_search {
+            return Err(TransportError("search failed".to_string()));
+        }
+        Ok(self.search_results.clone())
     }
 
     async fn store_flags(&mut self, uids: &[Uid], flags: FlagOp) -> Result<(), TransportError> {

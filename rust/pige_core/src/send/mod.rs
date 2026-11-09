@@ -3,18 +3,23 @@
 
 pub mod compose;
 pub mod outbox;
+pub mod submission;
 
 use crate::account::AccountId;
 use crate::mail::Address;
 use crate::transport::{SendError, SmtpSender};
 
 pub use compose::{
-    ComposeError, build_mime, forward_message, forward_subject, quote_body, reply_message,
-    reply_subject,
+    ComposeError, build_mime, build_mime_with_parts, forward_message, forward_subject, quote_body,
+    raw_message_id, reply_message, reply_subject,
 };
 pub use outbox::{
     OutboxEntry, OutboxId, OutboxReport, OutboxState, discard_draft, drafts, flush_outbox,
-    flush_outbox_smtp_only, list_outbox, queue_send, save_draft, update_draft,
+    flush_outbox_smtp_only, list_outbox, outbox_entry, queue_send, save_draft, update_draft,
+};
+pub use submission::{
+    MAX_SUBMISSION_ATTACHMENT_BYTES, SubmissionObserver, SubmissionState, flush_provider_outbox,
+    flush_provider_outbox_with_observer, queue_submission, validate_attachments,
 };
 
 /// A plain-text message ready to be sent. Attachments are intentionally absent
