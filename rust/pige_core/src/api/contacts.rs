@@ -10,7 +10,8 @@ use std::time::Duration;
 use crate::account::{Account, AccountId, ContactSourceConfig};
 use crate::contacts::normalize::{normalize_address, normalize_email};
 use crate::contacts::rank::{
-    bound_query_text, bounded_limit, folded_query, query_tokens, rank_candidates,
+    OTHER_CONTACT_KIND, SAVED_CONTACT_KIND, bound_query_text, bounded_limit, folded_query,
+    query_tokens, rank_candidates,
 };
 use crate::contacts::types::{AddressKey, RecipientQuery, RecipientSuggestion};
 use crate::mail::Address;
@@ -170,19 +171,29 @@ pub fn set_contact_sync(
         .ok_or_else(|| format!("unknown account {account}"))?;
 
     let mut updated = current.clone();
-    match updated
+    let kind = match updated
         .contact_sources
         .iter_mut()
         .find(|configured| &configured.id == source)
     {
-        Some(existing) => existing.enabled = enabled,
-        None => updated.contact_sources.push(ContactSourceConfig {
-            id: source.clone(),
-            provider: current.provider_id(),
-            kind: "saved".to_string(),
-            enabled,
-        }),
-    }
+        Some(existing) => {
+            existing.enabled = enabled;
+            existing.kind.clone()
+        }
+        None => {
+            // Google's auto-populated Other contacts rank below saved contacts.
+            // The legacy upsert defaults to `saved`, so the source kind has to
+            // be explicit here as well as in the durable store.
+            let kind = contact_source_kind(source).to_string();
+            updated.contact_sources.push(ContactSourceConfig {
+                id: source.clone(),
+                provider: current.provider_id(),
+                kind: kind.clone(),
+                enabled,
+            });
+            kind
+        }
+    };
     let mut accounts = state.config_doc.accounts.clone();
     if let Some(slot) = accounts
         .iter_mut()
@@ -194,7 +205,15 @@ pub fn set_contact_sync(
 
     // The configuration document is authoritative for user intent. The store's
     // state is the durable execution fence; a failure is reported rather than
-    // silently leaving a source believing it is still enabled.
+    // silently leaving a source believing it is still enabled. Registering the
+    // kind before enabling prevents `set_contact_source_enabled` from creating
+    // an Other-contacts source with the default saved ranking.
+    if enabled {
+        state
+            .store
+            .upsert_contact_source_with_kind(account, source, None, &kind)
+            .map_err(|error| format!("update contact source kind: {error}"))?;
+    }
     state
         .store
         .set_contact_source_enabled(account, source, enabled)
@@ -203,6 +222,16 @@ pub fn set_contact_sync(
     drop(guard);
     let _ = sender.send(super::CoreEvent::SnapshotChanged);
     Ok(())
+}
+
+/// Default ranking kind for a built-in contact source id. Unknown sources keep
+/// the saved-address-book behavior established before source kinds existed.
+fn contact_source_kind(source: &ContactSourceId) -> &'static str {
+    if source.as_str() == "google.other" {
+        OTHER_CONTACT_KIND
+    } else {
+        SAVED_CONTACT_KIND
+    }
 }
 
 fn ensure_configured_account(state: &super::AppState, account: &AccountId) -> Result<(), String> {

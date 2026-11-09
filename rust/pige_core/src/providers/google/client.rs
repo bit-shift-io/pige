@@ -248,7 +248,7 @@ impl GmailApi {
     }
 }
 
-fn with_query(mut url: Url, query: &[(&str, String)]) -> Url {
+pub(crate) fn with_query(mut url: Url, query: &[(&str, String)]) -> Url {
     {
         let mut pairs = url.query_pairs_mut();
         for (name, value) in query {
@@ -259,7 +259,7 @@ fn with_query(mut url: Url, query: &[(&str, String)]) -> Url {
 }
 
 impl GoogleClient {
-    async fn get_json<T: DeserializeOwned>(
+    pub(crate) async fn get_json<T: DeserializeOwned>(
         &self,
         ctx: &OperationContext,
         url: Url,
@@ -422,6 +422,17 @@ fn map_status(
                 .map(str::to_string)
         })
         .unwrap_or_default();
+
+    // Google's People sync APIs return HTTP 410 (or an ErrorInfo reason) when a
+    // seven-day sync token has expired. Clients must restart from a full sync;
+    // this is a cursor problem, not an authentication or transport failure.
+    if status == reqwest::StatusCode::GONE
+        || reason == "EXPIRED_SYNC_TOKEN"
+        || detail.contains("EXPIRED_SYNC_TOKEN")
+    {
+        return ProviderError::cursor_invalid("the Google sync cursor expired")
+            .with_source_detail(detail);
+    }
 
     let error = match status {
         reqwest::StatusCode::UNAUTHORIZED => {

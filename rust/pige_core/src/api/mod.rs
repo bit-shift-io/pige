@@ -1113,7 +1113,7 @@ async fn run_maintenance_inner(
     // Resolve the enabled contact sources first. If any exist, reserve half of
     // the remaining pass for them: history resumes from a durable cursor, so a
     // starving history crawl must not consume the only budget contacts get.
-    let contact_targets: Vec<(&Account, &crate::providers::ContactSourceId)> = accounts
+    let contact_targets: Vec<(&Account, &crate::providers::ContactSourceId, &str)> = accounts
         .iter()
         .flat_map(|account| {
             account
@@ -1125,7 +1125,7 @@ async fn run_maintenance_inner(
                         .contact_source_state(&account.id, &configured.id)
                         .is_ok_and(|state| state.enabled)
                 })
-                .map(move |configured| (account, &configured.id))
+                .map(move |configured| (account, &configured.id, configured.kind.as_str()))
         })
         .collect();
 
@@ -1179,9 +1179,32 @@ async fn run_maintenance_inner(
         }
     }
 
-    for (account, source) in contact_targets {
+    for (account, source, kind) in contact_targets {
         if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
             return Ok(());
+        }
+        // The configuration document carries the ranking kind (saved vs
+        // Other). Make it durable before the first sync so a fresh source is
+        // never created by the legacy saved default.
+        let kind_changed = match store.contact_source_kind(&account.id, source) {
+            Ok(current) => current.as_deref() != Some(kind),
+            Err(error) => {
+                log::warn!(
+                    "maintenance contacts for {} / {source}: read kind: {error}",
+                    account.label
+                );
+                true
+            }
+        };
+        if kind_changed
+            && let Err(error) =
+                store.upsert_contact_source_with_kind(&account.id, source, None, kind)
+        {
+            log::warn!(
+                "maintenance contacts for {} / {source}: register kind: {error}",
+                account.label
+            );
+            continue;
         }
         // Re-read under the pass: a disable or a permission failure may have
         // landed while history was running.

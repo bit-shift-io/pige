@@ -136,6 +136,24 @@ impl Store {
         Ok(())
     }
 
+    /// The durable ranking kind (`saved`/`other`) of one contact source, or
+    /// `None` when the source has never been registered.
+    pub fn contact_source_kind(
+        &self,
+        account: &AccountId,
+        source: &ContactSourceId,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT kind FROM contact_sources
+                 WHERE account_id = ?1 AND source_id = ?2",
+                params![account.0, source.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Add one address to a source contact. Invalid addresses are rejected as a
     /// `Corrupt` value rather than silently stored under a bogus key.
     pub fn upsert_contact_email(

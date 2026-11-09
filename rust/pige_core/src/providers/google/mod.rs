@@ -12,6 +12,7 @@ pub mod desktop;
 mod mailbox;
 mod mutations;
 mod normalize;
+mod people;
 mod sync;
 
 use std::collections::HashMap;
@@ -23,12 +24,14 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::account::{Account, AccountId, MailBackend};
 use crate::auth::{AccountSessionManager, AuthenticationService, TokenSource};
 use crate::providers::{
-    GMAIL_PROVIDER, MutationCapabilities, OperationContext, ProviderCapabilities, ProviderError,
-    ProviderFactory, ProviderId, ProviderRegistry, ProviderSession,
+    ContactCapabilities, GMAIL_PROVIDER, MutationCapabilities, OperationContext,
+    ProviderCapabilities, ProviderError, ProviderFactory, ProviderId, ProviderRegistry,
+    ProviderSession,
 };
 
 pub use mailbox::GmailMailbox;
 pub use mutations::GmailMutations;
+pub use people::{GOOGLE_OTHER_CONTACTS_SOURCE, GOOGLE_SAVED_CONTACTS_SOURCE, GoogleAddressBook};
 pub use sync::{GmailSync, cursor_stage, request_collection};
 
 pub use android::{
@@ -182,15 +185,23 @@ impl ProviderFactory for GoogleProviderFactory {
                 // v1 holds gmail.modify, which cannot permanently delete.
                 permanent_delete: false,
             },
-            // Submission is G4; contacts are G3.
+            // Submission is G4. Contacts are read-only in v1: People lists are
+            // full snapshots with deletion metadata, and compose remains local.
             submission: false,
-            contacts: Default::default(),
+            contacts: ContactCapabilities {
+                read: true,
+                incremental_sync: true,
+                remote_search: false,
+                write: false,
+                groups: false,
+            },
             server_search: false,
         })
         .with_provider(ProviderId::from(GMAIL_PROVIDER));
 
         session.mailbox = Some(Box::new(GmailMailbox::new(client.clone(), user)));
         session.sync = Some(Box::new(GmailSync::new(client.clone(), user)));
+        session.address_book = Some(Box::new(GoogleAddressBook::new(client.clone(), user)));
         session.mutations = Some(Box::new(GmailMutations::new(client, user)));
         Ok(session)
     }

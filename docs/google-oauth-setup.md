@@ -24,6 +24,31 @@ Scopes requested:
   `https://www.googleapis.com/auth/contacts.other.readonly`.
   Denying contacts does not affect mail or local history learning.
 
+## People contacts (G3)
+
+Two independent contact sources are enabled only when the user turns them on:
+
+| Source id | Endpoint | Scope | Read mask |
+| --- | --- | --- | --- |
+| `google.saved` | `GET /v1/people/me/connections` | `contacts.readonly` | `names,emailAddresses,metadata` |
+| `google.other` | `GET /v1/otherContacts` | `contacts.other.readonly` | `names,emailAddresses,metadata` |
+
+Both requests set `sources=READ_SOURCE_TYPE_CONTACT` and
+`requestSyncToken=true`. The masks intentionally omit `organizations`: Other
+contacts do not support it, and saved contacts do not need it for autocomplete.
+Compose never queries People; recipient suggestions come from the local R2
+projection. `google.other` is stored with kind `other` so it ranks below a
+saved contact while the same address still merges into one suggestion.
+
+People sync tokens expire seven days after the full sync. An HTTP 410 /
+`EXPIRED_SYNC_TOKEN` response restarts that source from a fresh full snapshot;
+it never uses Gmail's `historyId`. A full snapshot removes locally absent
+contacts only after its final page. A 403/permission denial disables only the
+affected contact source, leaving mail, local history, cached contacts and the
+other contact source intact. Granting contacts later is a new authorization
+operation (`AuthRequest.enable_contacts = true`), not an assumption that an
+existing Gmail grant already covers People.
+
 ## What the user must create in Google Cloud Console
 
 1. Create/select a project; enable the **Gmail API** and **People API**.
