@@ -1,18 +1,25 @@
 //! The durable outbox and its state machine.
 //!
-//! States:
+//! The authoritative lifecycle is [`SubmissionState`]:
 //! - `Draft`: saved locally, never sent.
 //! - `Queued`: ready to send, persisted before any network call.
-//! - `Sending`: claimed by a flush; SMTP may or may not have accepted.
-//! - `SentLocal`: SMTP accepted. Only the Sent APPEND remains.
-//! - `Sent`: SMTP accepted and, when a Sent folder exists, the APPEND succeeded.
-//! - `Failed`: permanent failure or an interrupted send that must not be retried
-//!   blindly, because it may already have reached the server.
+//! - `Preparing`: claimed by a flush while provider-side artifacts are built.
+//! - `Submitting`: the prepared artifact is durable; delivery may be in flight.
+//! - `Accepted`: the provider accepted delivery. Only a client-appended Sent
+//!   copy remains.
+//! - `Complete`: delivery and the Sent-copy policy are both finished.
+//! - `Rejected`: an evidenced, permanent refusal.
+//! - `Uncertain`: the write may or may not have reached the provider. Such rows
+//!   are never retried automatically; the user must decide.
 //!
-//! Flush is deliberately conservative: a row is moved to `Sending` *before*
-//! SMTP, and any `Sending` row found on a later flush is failed instead of
-//! resent. The tiny window between SMTP acceptance and the `SentLocal` write can
-//! therefore cause a missing Sent copy, never a duplicate delivery.
+//! Flush is deliberately conservative: a row is claimed atomically *before* any
+//! network work, an interrupted `Submitting` row is reconciled rather than
+//! resent, and acceptance is recorded separately from the Sent copy. The small
+//! window between delivery and the Sent copy can therefore cause a missing
+//! copy, never a duplicate delivery.
+//!
+//! The legacy names `Sending`, `SentLocal`, `Sent`, and `Failed` remain as
+//! compatibility aliases for the pre-provider vocabulary.
 
 use async_trait::async_trait;
 use rusqlite::{Row, params};
@@ -394,15 +401,18 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_outbox_uncertain(&self, id: &OutboxId, error: &str) -> Result<(), StoreError> {
-        self.connection().execute(
+    /// Mark an unresolved write as terminal. The compare-and-swap only applies
+    /// to states that were still in flight or waiting, so a late recovery
+    /// result can never overwrite an acceptance that already won.
+    pub fn mark_outbox_uncertain(&self, id: &OutboxId, error: &str) -> Result<bool, StoreError> {
+        let changed = self.connection().execute(
             "UPDATE outbox
              SET state = 'uncertain', error = ?1, retry_count = retry_count + 1,
                  updated_at = ?2
-             WHERE id = ?3",
+             WHERE id = ?3 AND state IN ('queued', 'preparing', 'submitting')",
             params![error, now_unix(), id.0],
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     /// Return a row to `queued` with retry metadata. Safe only when the caller

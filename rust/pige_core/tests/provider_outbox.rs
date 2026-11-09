@@ -100,6 +100,7 @@ struct RecordingSubmission {
     submit_error: Option<ProviderError>,
     outcome: Option<SubmissionOutcome>,
     reconcile: Option<ReconcileOutcome>,
+    reconcile_error: Option<ProviderError>,
     fail_finalize: usize,
     prepare_calls: usize,
     submit_calls: usize,
@@ -122,6 +123,11 @@ impl RecordingSubmission {
 
     fn reconcile(mut self, outcome: ReconcileOutcome) -> Self {
         self.reconcile = Some(outcome);
+        self
+    }
+
+    fn reconcile_error(mut self, error: ProviderError) -> Self {
+        self.reconcile_error = Some(error);
         self
     }
 
@@ -186,6 +192,9 @@ impl SubmissionService for RecordingSubmission {
     ) -> Result<ReconcileOutcome, ProviderError> {
         self.reconcile_calls += 1;
         self.requests.push(request.clone());
+        if let Some(error) = &self.reconcile_error {
+            return Err(error.clone());
+        }
         Ok(self.reconcile.clone().unwrap_or(ReconcileOutcome::NotAccepted))
     }
 
@@ -292,6 +301,77 @@ async fn killed_submitting_becomes_uncertain() {
     assert_eq!(
         outbox_entry(&store, &id).unwrap().unwrap().state,
         SubmissionState::Uncertain
+    );
+}
+
+#[tokio::test]
+async fn transient_reconcile_keeps_submitting_retryable() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let id = queue_submission(&store, message("Transient reconcile"), Vec::new()).unwrap();
+    store
+        .set_outbox_state(&id, SubmissionState::Submitting, None)
+        .unwrap();
+    let mut service = RecordingSubmission::default()
+        .reconcile_error(ProviderError::transient("the provider is busy"));
+
+    let report = send::flush_provider_outbox(&store, &account(), &mut service, &context())
+        .await
+        .unwrap();
+
+    assert_eq!(report.uncertain, 0, "a temporary failure is not ambiguous");
+    assert_eq!(report.queued, 1);
+    assert_eq!(service.reconcile_calls, 1);
+    assert_eq!(service.submit_calls, 0);
+    assert_eq!(
+        outbox_entry(&store, &id).unwrap().unwrap().state,
+        SubmissionState::Submitting,
+        "the next pass must be able to reconcile again"
+    );
+
+    // Once the provider is reachable, the same row still reconciles and
+    // completes; it was never stranded as `Uncertain`.
+    service.reconcile_error = None;
+    let report = send::flush_provider_outbox(&store, &account(), &mut service, &context())
+        .await
+        .unwrap();
+    assert_eq!(report.sent, 1);
+    assert_eq!(
+        outbox_entry(&store, &id).unwrap().unwrap().state,
+        SubmissionState::Complete
+    );
+}
+
+#[tokio::test]
+async fn offline_reconcile_keeps_preparing_retryable() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let id = queue_submission(&store, message("Offline reconcile"), Vec::new()).unwrap();
+    store
+        .set_outbox_state(&id, SubmissionState::Preparing, None)
+        .unwrap();
+    let mut service = RecordingSubmission::default()
+        .reconcile_error(ProviderError::offline("the server is unreachable"));
+
+    let report = send::flush_provider_outbox(&store, &account(), &mut service, &context())
+        .await
+        .unwrap();
+
+    assert_eq!(report.uncertain, 0);
+    assert_eq!(report.queued, 1);
+    assert_eq!(
+        outbox_entry(&store, &id).unwrap().unwrap().state,
+        SubmissionState::Preparing
+    );
+
+    service.reconcile_error = None;
+    let report = send::flush_provider_outbox(&store, &account(), &mut service, &context())
+        .await
+        .unwrap();
+    assert_eq!(report.sent, 1);
+    assert_eq!(
+        outbox_entry(&store, &id).unwrap().unwrap().state,
+        SubmissionState::Complete
     );
 }
 

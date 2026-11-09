@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
+use tokio::sync::Semaphore;
 
 use crate::account::{Account, AccountId};
 use crate::mail::Address;
@@ -233,6 +234,10 @@ impl Opener for FakeOpener {
 #[derive(Debug, Clone, Default)]
 pub struct FakeSmtp {
     sent: std::sync::Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Receives a permit when a send begins, for deterministic ordering tests.
+    started: Option<Arc<Semaphore>>,
+    /// When set, the send waits for a permit before returning.
+    pause: Option<Arc<Semaphore>>,
 }
 
 impl FakeSmtp {
@@ -249,6 +254,12 @@ impl SmtpSender for FakeSmtp {
         _recipients: &[Address],
         raw: &[u8],
     ) -> std::result::Result<(), SendError> {
+        if let Some(started) = &self.started {
+            started.add_permits(1);
+        }
+        if let Some(pause) = &self.pause {
+            let _permit = pause.acquire().await;
+        }
         self.sent.lock().unwrap().push(raw.to_vec());
         Ok(())
     }
@@ -374,6 +385,8 @@ pub struct FakeTransportFactory {
     imap_failures: Mutex<HashSet<AccountId>>,
     smtp_failures: Mutex<HashSet<AccountId>>,
     smtp_sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    smtp_send_started: Mutex<Option<Arc<Semaphore>>>,
+    smtp_send_pause: Mutex<Option<Arc<Semaphore>>>,
     /// How many IMAP connections have been handed out per account. A provider
     /// session must not open more than it needs, so tests assert a ceiling here
     /// rather than counting the (shared) handle.
@@ -394,6 +407,19 @@ impl FakeTransportFactory {
 
     pub fn fail_imap(&self, id: AccountId) {
         self.imap_failures.lock().unwrap().insert(id);
+    }
+
+    /// Remove a previously scripted IMAP connection failure.
+    pub fn succeed_imap(&self, id: &AccountId) {
+        self.imap_failures.lock().unwrap().remove(id);
+    }
+
+    /// Pause every SMTP send after it starts. `started` receives a permit when
+    /// the send begins; the send then waits for a permit on `pause`. This lets
+    /// ordering tests hold a submission in flight without sleeping.
+    pub fn pause_smtp_send(&self, started: Arc<Semaphore>, pause: Arc<Semaphore>) {
+        *self.smtp_send_started.lock().unwrap() = Some(started);
+        *self.smtp_send_pause.lock().unwrap() = Some(pause);
     }
 
     pub fn fail_smtp(&self, id: AccountId) {
@@ -533,6 +559,8 @@ impl TransportFactory for FakeTransportFactory {
             }
             Ok(Box::new(FakeSmtp {
                 sent: self.smtp_sent.clone(),
+                started: self.smtp_send_started.lock().unwrap().clone(),
+                pause: self.smtp_send_pause.lock().unwrap().clone(),
             }) as Box<dyn SmtpSender>)
         })
     }

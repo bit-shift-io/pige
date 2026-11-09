@@ -35,6 +35,7 @@ use crate::mail::{
 use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
 use crate::providers::{
     OperationContext, ProviderCapabilities, ProviderFactory, RemoteAttachmentId,
+    imap::ImapSubmission,
 };
 use crate::search::{SearchHit, SearchScope};
 use crate::send::{
@@ -2227,7 +2228,7 @@ fn message_text(store: &Store, message: &crate::mail::StoredMessage) -> String {
 /// failure (for example a rejected recipient) keeps the compose form open by
 /// returning the outbox error.
 pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> {
-    let (config, sessions, account, id, sender) = {
+    let (config, sessions, scheduler, account, id, sender) = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
@@ -2241,6 +2242,7 @@ pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> 
         (
             state.config.clone(),
             state.sessions.clone(),
+            state.scheduler.clone(),
             account,
             id,
             state.events.clone(),
@@ -2251,39 +2253,60 @@ pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> 
     let store = Store::open(database_path(&config.data_dir))
         .map_err(|error| format!("open outbox store: {error}"))?;
 
-    // Submission is a provider capability from F9 onwards. Opening a session
-    // may fail when the account is offline; the row stays queued and a later
-    // sync retries it.
+    // Submission is a provider capability from F9 onwards. The flush runs
+    // under the same per-account gate as sync and mutations, so a sync pass can
+    // never read and reconcile the `submitting` row while SMTP delivery is in
+    // flight.
     if let Ok(ctx) = sessions.context(&account.id, INTERACTIVE_TIMEOUT) {
-        match config.providers.open(&account, &ctx).await {
-            Ok(mut session) => match session.submission_service() {
-                Ok(service) => {
-                    if let Err(error) = send::flush_provider_outbox(
-                        &store,
-                        &account,
-                        service.as_mut(),
-                        &ctx,
-                    )
-                    .await
-                    {
-                        log::warn!("flush outbox for {}: {error}", account.label);
+        let providers = config.providers.clone();
+        let transports = config.transport.clone();
+        let target = account.clone();
+        let delivery = async {
+            match providers.open(&target, &ctx).await {
+                Ok(mut session) => match session.submission_service() {
+                    Ok(service) => {
+                        if let Err(error) =
+                            send::flush_provider_outbox(&store, &target, service.as_mut(), &ctx)
+                                .await
+                        {
+                            log::warn!("flush outbox for {}: {error}", target.label);
+                        }
                     }
-                }
+                    Err(error) => {
+                        log::warn!(
+                            "no submission service for {}: {}",
+                            target.label,
+                            error.safe_message
+                        );
+                    }
+                },
                 Err(error) => {
-                    log::warn!(
-                        "no submission service for {}: {}",
-                        account.label,
+                    log::debug!(
+                        "outbox provider for {} is unreachable: {}",
+                        target.label,
                         error.safe_message
                     );
+                    // IMAP is only needed for the Sent copy and mailbox reads;
+                    // SMTP can still deliver. Keep the durable state machine
+                    // but build the submission service directly from the
+                    // protocol transports, so the message is not stranded just
+                    // because the mailbox connection failed.
+                    if ctx.ensure_active().is_ok() && target.imap_smtp().is_some() {
+                        let mut fallback = ImapSubmission::new(transports, target.clone());
+                        if let Err(error) =
+                            send::flush_provider_outbox(&store, &target, &mut fallback, &ctx).await
+                        {
+                            log::warn!("SMTP-only flush outbox for {}: {error}", target.label);
+                        }
+                    }
                 }
-            },
-            Err(error) => {
-                log::debug!(
-                    "outbox for {} is waiting: {}",
-                    account.label,
-                    error.safe_message
-                );
             }
+        };
+        if let Err(error) = scheduler.run_interactive(&ctx, delivery).await {
+            log::debug!(
+                "outbox for {} is waiting for the account gate: {error}",
+                account.label
+            );
         }
     }
 

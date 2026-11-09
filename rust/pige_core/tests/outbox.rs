@@ -17,8 +17,9 @@ use pige_core::{
     transport::{FakeTransport, RemoteFolder, SendError, SmtpSender},
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 fn account() -> Account {
     Account {
@@ -522,6 +523,103 @@ async fn api_reports_a_permanent_mime_failure_instead_of_queueing() {
     let entry = harness.store().outbox_items(Some(&id)).unwrap().remove(0);
     assert_eq!(entry.state, OutboxState::Failed);
     assert!(entry.error.unwrap().contains("invalid address"));
+}
+
+#[tokio::test]
+async fn sync_flush_cannot_uncertain_an_in_flight_smtp_send() {
+    let _guard = API_LOCK.lock().await;
+    let harness = ApiHarness::new();
+    let id = harness.add_account().await;
+    harness.add_transport(&id);
+
+    // Hold the SMTP send in flight after it starts. The send owns the account
+    // gate while it is delivering.
+    let started = Arc::new(Semaphore::new(0));
+    let pause = Arc::new(Semaphore::new(0));
+    harness
+        .factory
+        .pause_smtp_send(started.clone(), pause.clone());
+
+    let send_id = id.clone();
+    let sending = tokio::spawn(async move { api::send_mail(api_message(send_id)).await });
+    let permit = started.acquire().await.unwrap();
+    drop(permit);
+
+    // A sync must wait for the gate, so it cannot reach the outbox flush (and
+    // reconcile the in-flight `submitting` row) while SMTP is mid-send.
+    let syncing = tokio::spawn(async { api::sync_all().await });
+    let finished_while_send_in_flight = tokio::time::timeout(Duration::from_millis(250), async {
+        while !syncing.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        !finished_while_send_in_flight,
+        "a sync flush must not run while send_mail holds the account gate"
+    );
+
+    pause.add_permits(1);
+    let outcome = sending.await.unwrap().expect("the send completes");
+    assert!(!outcome.queued);
+    let entry = harness.store().outbox_items(Some(&id)).unwrap().remove(0);
+    assert_eq!(
+        entry.state,
+        OutboxState::Sent,
+        "the acceptance wins and the row is complete: {:?}",
+        entry.error
+    );
+    assert_eq!(harness.factory.sent_raw().len(), 1);
+
+    syncing.await.unwrap().unwrap();
+    // The sync that followed must not resend or mark the delivered row
+    // uncertain.
+    assert_eq!(harness.factory.sent_raw().len(), 1);
+    assert_eq!(
+        harness.store().outbox_items(Some(&id)).unwrap()[0].state,
+        OutboxState::Sent
+    );
+}
+
+#[tokio::test]
+async fn imap_unreachable_still_delivers_and_leaves_only_the_sent_copy_pending() {
+    let _guard = API_LOCK.lock().await;
+    let harness = ApiHarness::new();
+    let id = harness.add_account().await;
+    harness.add_transport(&id);
+    // Learn the local folder layout (including Sent) while IMAP is healthy.
+    api::sync_account(&id).await.unwrap();
+
+    harness.factory.fail_imap(id.clone());
+    let outcome = api::send_mail(api_message(id.clone())).await.unwrap();
+    assert!(!outcome.queued);
+    assert_eq!(harness.factory.sent_raw().len(), 1);
+    let entry = harness.store().outbox_items(Some(&id)).unwrap().remove(0);
+    assert_eq!(entry.state, OutboxState::SentLocal);
+    assert!(
+        entry
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Sent copy")),
+        "the Sent copy is the only pending work: {:?}",
+        entry.error
+    );
+
+    // When IMAP returns, the retry appends only the Sent copy.
+    harness.factory.succeed_imap(&id);
+    api::sync_all().await.unwrap();
+    assert_eq!(
+        harness.factory.sent_raw().len(),
+        1,
+        "delivery is not repeated"
+    );
+    let transport = harness.factory.transport(&id).await.unwrap();
+    assert_eq!(transport.append_calls.len(), 1);
+    assert_eq!(
+        harness.store().outbox_items(Some(&id)).unwrap()[0].state,
+        OutboxState::Sent
+    );
 }
 
 #[tokio::test]

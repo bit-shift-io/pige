@@ -364,7 +364,10 @@ async fn recover_preparing(
     observer: &mut dyn SubmissionObserver,
     report: &mut OutboxReport,
 ) -> Result<(), StoreError> {
-    let request = request_from_entry(store, entry)?;
+    // `Preparing` has no prepared artifact yet, so a stale `raw` column must
+    // not be mistaken for evidence that bytes reached the provider. Without
+    // that evidence the adapter can safely prove a repeat is needed.
+    let request = request_from_entry(store, entry, false)?;
     match service.reconcile(&request, ctx).await {
         Ok(ReconcileOutcome::Accepted(receipt)) => {
             finish_accepted(store, entry, service, ctx, &request, receipt, observer, report).await?;
@@ -378,7 +381,7 @@ async fn recover_preparing(
                     .await?;
             }
         }
-        Ok(ReconcileOutcome::Unknown) | Err(_) => {
+        Ok(ReconcileOutcome::Unknown) => {
             mark_uncertain(
                 store,
                 entry,
@@ -386,6 +389,7 @@ async fn recover_preparing(
                 report,
             )?;
         }
+        Err(error) => handle_reconcile_error(store, entry, &error, report)?,
     }
     Ok(())
 }
@@ -401,7 +405,7 @@ async fn recover_submitting(
     observer: &mut dyn SubmissionObserver,
     report: &mut OutboxReport,
 ) -> Result<(), StoreError> {
-    let request = request_from_entry(store, entry)?;
+    let request = request_from_entry(store, entry, true)?;
     match service.reconcile(&request, ctx).await {
         Ok(ReconcileOutcome::Accepted(receipt)) => {
             finish_accepted(store, entry, service, ctx, &request, receipt, observer, report).await?;
@@ -415,7 +419,7 @@ async fn recover_submitting(
                     .await?;
             }
         }
-        Ok(ReconcileOutcome::Unknown) | Err(_) => {
+        Ok(ReconcileOutcome::Unknown) => {
             mark_uncertain(
                 store,
                 entry,
@@ -423,6 +427,7 @@ async fn recover_submitting(
                 report,
             )?;
         }
+        Err(error) => handle_reconcile_error(store, entry, &error, report)?,
     }
     Ok(())
 }
@@ -455,7 +460,7 @@ async fn finalize_accepted(
         return Ok(());
     }
 
-    let request = match request_from_entry(store, entry) {
+    let request = match request_from_entry(store, entry, true) {
         Ok(request) => request,
         Err(error) => {
             let message = error.to_string();
@@ -534,9 +539,13 @@ async fn finish_accepted(
 fn request_from_entry(
     store: &Store,
     entry: &OutboxEntry,
+    include_legacy_raw: bool,
 ) -> Result<SubmissionRequest, StoreError> {
     let attachments = store.outbox_parts(&entry.id)?;
     let prepared = entry.prepared.clone().or_else(|| {
+        if !include_legacy_raw {
+            return None;
+        }
         entry.raw.as_ref().map(|raw| PreparedSubmission {
             version: 0,
             backend: entry
@@ -588,6 +597,31 @@ fn handle_prepare_error(
                 Some(&error.safe_message),
                 error.retry_after.map(|after| after.as_secs() as i64),
             )?;
+            report.errors.push(error.safe_message.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Reconciliation has no delivery side effect, so an unreachable or busy
+/// provider is not evidence that the write outcome is ambiguous. Keep the row
+/// in its recovery state so a later pass can reconcile again; only an explicit
+/// unknown-write result makes it terminal.
+fn handle_reconcile_error(
+    store: &Store,
+    entry: &OutboxEntry,
+    error: &ProviderError,
+    report: &mut OutboxReport,
+) -> Result<(), StoreError> {
+    match error.kind {
+        ErrorKind::UnknownWriteOutcome => {
+            mark_uncertain(store, entry, &error.safe_message, report)?;
+        }
+        // Offline, transient, rate-limited, cancelled, and even permanent
+        // capability errors leave the durable outcome unresolved. Preserve the
+        // recovery state rather than calling an unproven write `Uncertain`.
+        _ => {
+            store.set_outbox_error(&entry.id, &error.safe_message)?;
             report.errors.push(error.safe_message.clone());
         }
     }
@@ -648,8 +682,11 @@ fn mark_uncertain(
     message: &str,
     report: &mut OutboxReport,
 ) -> Result<(), StoreError> {
-    store.mark_outbox_uncertain(&entry.id, message)?;
-    report.errors.push(message.to_string());
+    // Never downgrade a row that a concurrent acceptance already moved to
+    // `Accepted`/`Complete`; the CAS in the store makes the acceptance win.
+    if store.mark_outbox_uncertain(&entry.id, message)? {
+        report.errors.push(message.to_string());
+    }
     Ok(())
 }
 
