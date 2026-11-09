@@ -175,6 +175,13 @@ impl App {
                     self.delete_confirm_open = false;
                 } else if self.move_picker_open {
                     self.move_picker_open = false;
+                } else if let Some(key) = self
+                    .compose
+                    .as_ref()
+                    .and_then(ComposeState::active_suggestion_key)
+                    .cloned()
+                {
+                    return Task::done(Message::RecipientSuggestionDismissed(key));
                 } else if self.compose.is_some() {
                     return self.close_compose();
                 } else if self.accounts_open {
@@ -556,6 +563,91 @@ impl App {
             Message::ComposeField(field, value) => {
                 if let Some(compose) = self.compose.as_mut() {
                     compose.apply_field(field, value);
+                }
+            }
+            Message::ComposeCaret(field, caret) => {
+                let Some(compose) = self.compose.as_mut() else {
+                    return Task::none();
+                };
+                compose.set_recipient_caret(field, caret);
+                // One debounce timer per caret/text change. The key makes every
+                // earlier timer harmless when it wakes up.
+                if let Some(key) = compose.begin_recipient_query() {
+                    return Task::perform(
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            key
+                        },
+                        Message::RecipientQueryReady,
+                    );
+                }
+            }
+            Message::RecipientQueryReady(key) => {
+                let Some(compose) = self.compose.as_ref() else {
+                    return Task::none();
+                };
+                if !compose.is_current_recipient_request(&key) {
+                    return Task::none();
+                }
+                // Strictly local: this never opens a provider session or
+                // consults the network. Eight rows is the compose default.
+                let query = api::RecipientQuery {
+                    sending_account: key.account_id.clone(),
+                    text: key.query.clone(),
+                    limit: 8,
+                };
+                return Task::perform(
+                    async move {
+                        let result = api::suggest_recipients(query);
+                        Message::RecipientSuggestionsLoaded { key, result }
+                    },
+                    |message| message,
+                );
+            }
+            Message::RecipientSuggestionsLoaded { key, result } => {
+                let Some(compose) = self.compose.as_mut() else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(suggestions) => {
+                        compose.apply_suggestions(key, suggestions);
+                    }
+                    Err(error) => {
+                        if compose.is_current_recipient_request(&key) {
+                            compose.notice = Some(error);
+                        }
+                    }
+                }
+            }
+            Message::RecipientSuggestionMoved { key, index } => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.highlight_suggestion(&key, index);
+                }
+            }
+            Message::RecipientSuggestionDismissed(key) => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.dismiss_suggestions(&key);
+                }
+            }
+            Message::RecipientSuggestionChosen { key, index } => {
+                let Some(compose) = self.compose.as_mut() else {
+                    return Task::none();
+                };
+                match compose.accept_suggestion(&key, index) {
+                    Ok(_) => {
+                        // Only this explicit choice records evidence. Typing
+                        // and merely viewing results never do.
+                        if let Some(address) = compose.take_pending_selection() {
+                            let account = key.account_id.clone();
+                            return Task::perform(
+                                async move {
+                                    let _ = api::record_recipient_selection(&account, &address);
+                                },
+                                |_| Message::Noop,
+                            );
+                        }
+                    }
+                    Err(error) => compose.notice = Some(error),
                 }
             }
             Message::ComposeBody(action) => {

@@ -6,7 +6,7 @@
 use iced::Size;
 use pige_core::account::presets::ProviderPreset;
 use pige_core::account::{Account, AccountId, Security};
-use pige_core::api::{ConfigOutcome, ModelSnapshot};
+use pige_core::api::{ConfigOutcome, ModelSnapshot, RecipientSuggestion};
 use pige_core::mail::{FolderId, MessageId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
@@ -14,7 +14,7 @@ use pige_core::settings::{Settings, ThemeMode};
 
 use crate::screens::accounts::AccountField;
 use crate::screens::advanced::Row as AdvancedRow;
-use crate::screens::compose::{ComposeField, ComposeSeed};
+use crate::screens::compose::{ComposeField, ComposeSeed, RecipientRequestKey};
 
 /// The successful result of saving an account. `warning` carries the
 /// session-only credential notice; it is shown in the
@@ -145,6 +145,27 @@ pub enum Message {
     /// A draft row was chosen from the Drafts folder.
     OpenDraft(OutboxId),
     ComposeField(ComposeField, String),
+    /// The caret moved inside a recipient field, as a UTF-8 byte offset.
+    ComposeCaret(ComposeField, usize),
+    /// A debounced recipient lookup may run now.
+    RecipientQueryReady(RecipientRequestKey),
+    /// Local results arrived; the key rejects responses for an old request.
+    RecipientSuggestionsLoaded {
+        key: RecipientRequestKey,
+        result: Result<Vec<RecipientSuggestion>, String>,
+    },
+    /// The user explicitly accepted one row (keyboard or touch).
+    RecipientSuggestionChosen {
+        key: RecipientRequestKey,
+        index: usize,
+    },
+    /// Arrow keys moved the highlighted row.
+    RecipientSuggestionMoved {
+        key: RecipientRequestKey,
+        index: usize,
+    },
+    /// Escape/Back hid the list without inserting anything.
+    RecipientSuggestionDismissed(RecipientRequestKey),
     ComposeBody(iced::widget::text_editor::Action),
     ComposeSend,
     ComposeSent(Result<pige_core::api::SendOutcome, String>),

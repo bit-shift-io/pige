@@ -34,6 +34,7 @@ pub mod fields;
 pub mod label;
 pub mod menu;
 pub mod pull_refresh;
+pub mod recipient_suggestions;
 pub mod rows;
 pub mod scroll_fade;
 pub mod spinner;
@@ -46,6 +47,7 @@ pub use chrome::{app_bar, app_bar_actions, empty_state, toast};
 pub use dialog::{dialog, dialog_sized};
 pub use fields::{password_field, search_field, text_area, text_field};
 pub use menu::{MenuAnchor, MenuItem, menu, menu_overlay};
+pub use recipient_suggestions::{SuggestionNavigation, recipient_field, suggestion_panel};
 pub use rows::{FolderKind, FolderView, ListRow, folder_row, list_row, section_header};
 
 /// A collapsible account header: the label, unread roll-up and the account's
