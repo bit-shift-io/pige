@@ -30,6 +30,10 @@ pub struct FakeCredentials {
     session_only: Mutex<HashSet<AccountId>>,
     deleted: Mutex<Vec<AccountId>>,
     fail_next_set: AtomicBool,
+    /// Accounts whose next (and every subsequent) persistent `set` call fails.
+    /// Used by lifecycle recovery tests to fail both a new active write and the
+    /// rollback that would otherwise follow it.
+    fail_set: Mutex<HashSet<AccountId>>,
     fail_delete: AtomicBool,
     unavailable: AtomicBool,
 }
@@ -70,6 +74,18 @@ impl FakeCredentials {
     /// Make the next `set` call fail.
     pub fn fail_next_set(&self) {
         self.fail_next_set.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every persistent `set` call for `id` fail until
+    /// [`Self::allow_set_for`] is called. A lifecycle recovery test uses this so
+    /// the new active write and the rollback restore both fail.
+    pub fn fail_set_for(&self, id: &AccountId) {
+        self.fail_set.lock().unwrap().insert(id.clone());
+    }
+
+    /// Stop failing persistent `set` calls for `id`.
+    pub fn allow_set_for(&self, id: &AccountId) {
+        self.fail_set.lock().unwrap().remove(id);
     }
 
     /// Make every persistent `set`/`get` call report no storage access, as if
@@ -116,6 +132,9 @@ impl CredentialStore for FakeCredentials {
         }
         if self.fail_next_set.swap(false, Ordering::SeqCst) {
             return Err("fake credential set failed".to_string());
+        }
+        if self.fail_set.lock().unwrap().contains(id) {
+            return Err("fake credential set failed for this account".to_string());
         }
         self.secrets
             .lock()

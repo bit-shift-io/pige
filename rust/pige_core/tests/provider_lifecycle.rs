@@ -195,9 +195,17 @@ impl Harness {
         target: Account,
         reference: StagedSecretRef,
     ) -> pige_core::auth::AuthenticatedAccount {
+        Self::authenticated_with(target, reference, SecretPersistence::Persistent)
+    }
+
+    fn authenticated_with(
+        target: Account,
+        reference: StagedSecretRef,
+        persistence: SecretPersistence,
+    ) -> pige_core::auth::AuthenticatedAccount {
         pige_core::auth::AuthenticatedAccount {
             account: target,
-            persistence: SecretPersistence::Persistent,
+            persistence,
             credential_ref: reference,
         }
     }
@@ -470,6 +478,7 @@ async fn draft_survives_switch() {
     let existing = api::account(&account).expect("account");
     let target = Harness::gmail_target(&existing);
     let staged = harness.stage("switched-secret");
+    let committed_candidate = staged.clone();
     let snapshot = api::switch_backend(&account, Harness::authenticated(target, staged))
         .await
         .expect("switch backend");
@@ -504,10 +513,14 @@ async fn draft_survives_switch() {
     );
 
     // The staged candidate was committed, not left behind.
-    let staged =
-        StagedSecretRef::for_attempt(&AuthAttemptId::new("00000000-0000-0000-0000-000000000001"))
-            .unwrap();
-    let _ = staged; // the actual attempt id is internal to the harness
+    assert!(
+        harness
+            .secrets()
+            .load_staged(&committed_candidate)
+            .unwrap()
+            .is_none(),
+        "the staged authentication candidate is discarded after commit"
+    );
 }
 
 #[tokio::test]
@@ -984,5 +997,305 @@ async fn finish_auth_commits_new_account_and_cancel_cleans_up() {
         harness.stored_password(&id).as_deref(),
         Some("auth-password"),
         "the staged credential is committed to the new account"
+    );
+}
+
+/// A failed rollback must never discard the only record that can repair the
+/// old config/credential pair at startup.
+#[tokio::test]
+async fn rollback_failure_keeps_the_switch_recoverable() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::provider_neutral();
+    let account = harness.add_imap("Personal").await;
+    let target = Harness::gmail_target(&api::account(&account).unwrap());
+    let staged = harness.stage("new-backend-secret");
+
+    // Fail both the new active write and the rollback restore. The old secret
+    // therefore stays active, but the intent and its backup must survive.
+    harness.credentials.fail_set_for(&account);
+    let error = api::switch_backend(&account, Harness::authenticated(target, staged))
+        .await
+        .expect_err("the credential write fails");
+    assert!(
+        error.contains("restore"),
+        "the rollback failure is surfaced: {error}"
+    );
+
+    let store = harness.store();
+    assert!(
+        store.has_switch_intent(&account).unwrap(),
+        "the intent must survive a failed rollback"
+    );
+    let backup = StagedSecretRef::from_stored_key(&format!("switch_backup_{}", account.0))
+        .expect("backup reference");
+    assert!(
+        harness.secrets().load_staged(&backup).unwrap().is_some(),
+        "the rollback credential must survive a failed rollback"
+    );
+    assert!(
+        api::account(&account).unwrap().imap_smtp().is_some(),
+        "the old configuration is still live"
+    );
+    drop(store);
+
+    // Repair the store and restart: startup restores the old credential and
+    // clears the intent.
+    harness.credentials.allow_set_for(&account);
+    harness.restart();
+    assert_eq!(
+        harness.stored_password(&account).as_deref(),
+        Some("secret-Personal")
+    );
+    assert!(api::account(&account).unwrap().imap_smtp().is_some());
+    assert!(!harness.store().has_switch_intent(&account).unwrap());
+}
+
+/// Restoring a pre-switch backup while a published switch intent is pending must
+/// restore that backup's credential too, not leave the old backend paired with
+/// the new backend's secret.
+#[tokio::test]
+async fn restore_reconciles_a_pending_published_switch() {
+    let _guard = TEST_LOCK.lock().await;
+    const BACKUP: &str = "pige-backup-2026-10-21-140530.json";
+    let harness = Harness::provider_neutral();
+    let account = harness.add_imap("Personal").await;
+    let original = api::account(&account).unwrap();
+    harness
+        .backups
+        .write(BACKUP, &backup_document(vec![original]))
+        .unwrap();
+
+    let target = Harness::gmail_target(&api::account(&account).unwrap());
+    let staged = harness.stage("gmail-secret");
+    api::inject_switch_crash_after_config();
+    let error = api::switch_backend(&account, Harness::authenticated(target, staged))
+        .await
+        .expect_err("the injected crash surfaces");
+    assert!(error.contains("simulated"), "{error}");
+    api::clear_switch_crash();
+
+    // The crash left a phase-2 intent: new config and new secret are live.
+    assert!(harness.store().has_switch_intent(&account).unwrap());
+    assert_eq!(
+        api::account(&account).unwrap().provider_id(),
+        ProviderId::from("gmail")
+    );
+    assert_eq!(
+        harness.stored_password(&account).as_deref(),
+        Some("gmail-secret")
+    );
+
+    let outcome = api::restore_config(BACKUP.to_string())
+        .await
+        .expect("restore");
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert!(
+        api::account(&account).unwrap().imap_smtp().is_some(),
+        "the backup's backend is restored"
+    );
+    assert_eq!(
+        harness.stored_password(&account).as_deref(),
+        Some("secret-Personal"),
+        "the backup's credential is restored with its backend"
+    );
+    assert!(
+        !harness.store().has_switch_intent(&account).unwrap(),
+        "the reconciled intent is cleared"
+    );
+}
+
+/// A session-only commit over a persistent credential must delete the old OS
+/// entry, because `get` prefers the persistent half.
+#[tokio::test]
+async fn session_only_switch_removes_the_previous_persistent_secret() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::provider_neutral();
+    let account = harness.add_imap("Personal").await;
+    assert_eq!(
+        harness.credentials.persistent_secret(&account).as_deref(),
+        Some("secret-Personal")
+    );
+
+    let target = Harness::gmail_target(&api::account(&account).unwrap());
+    let staged = harness.stage("session-only-secret");
+    api::switch_backend(
+        &account,
+        Harness::authenticated_with(target, staged, SecretPersistence::SessionOnly),
+    )
+    .await
+    .expect("session-only switch");
+
+    assert_eq!(
+        harness.stored_password(&account).as_deref(),
+        Some("session-only-secret"),
+        "the new session credential is the active one"
+    );
+    assert_eq!(
+        harness.credentials.persistent_secret(&account),
+        None,
+        "the previous OS secret is deleted"
+    );
+    assert!(
+        harness
+            .credentials
+            .get(&account)
+            .unwrap()
+            .is_some_and(|stored| !stored.contains("secret-Personal")),
+        "get must resolve the new credential, not the old OS entry"
+    );
+
+    // A real restart drops the session half; the old persistent secret must not
+    // reappear under the new backend.
+    harness.credentials.delete_session(&account).unwrap();
+    assert_eq!(harness.stored_password(&account), None);
+}
+
+/// A crash after publishing a session-only switch rolls back to the previous
+/// backend and its persistent credential, because the session secret cannot
+/// survive a restart.
+#[tokio::test]
+async fn session_only_switch_crash_rolls_back_to_the_old_credential() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::provider_neutral();
+    let account = harness.add_imap("Personal").await;
+    let target = Harness::gmail_target(&api::account(&account).unwrap());
+    let staged = harness.stage("session-only-secret");
+    api::inject_switch_crash_after_config();
+    let error = api::switch_backend(
+        &account,
+        Harness::authenticated_with(target, staged, SecretPersistence::SessionOnly),
+    )
+    .await
+    .expect_err("the injected crash surfaces");
+    assert!(error.contains("simulated"), "{error}");
+    api::clear_switch_crash();
+
+    // A real process death drops the session credential but keeps the persistent
+    // rollback backup.
+    harness.credentials.delete_session(&account).unwrap();
+    harness.restart();
+
+    assert!(
+        api::account(&account).unwrap().imap_smtp().is_some(),
+        "the old backend is restored"
+    );
+    assert_eq!(
+        harness.stored_password(&account).as_deref(),
+        Some("secret-Personal"),
+        "the old persistent credential is restored"
+    );
+    assert!(!harness.store().has_switch_intent(&account).unwrap());
+}
+
+/// A rollback backup whose intent row is gone must be swept at startup, so a
+/// factory reset or crash cannot leave an unreachable credential.
+#[tokio::test]
+async fn startup_sweeps_an_orphaned_switch_backup() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::provider_neutral();
+    let account = harness.add_imap("Personal").await;
+    let backup = AccountId(format!("switch_backup_{}", account.0));
+    harness
+        .credentials
+        .set(&backup, "orphan-rollback")
+        .expect("seed orphan backup");
+    assert_eq!(
+        harness.credentials.get(&backup).unwrap().as_deref(),
+        Some("orphan-rollback")
+    );
+
+    harness.restart();
+
+    assert_eq!(
+        harness.credentials.get(&backup).unwrap(),
+        None,
+        "an orphaned rollback credential is removed at startup"
+    );
+    assert_eq!(
+        harness.stored_password(&account).as_deref(),
+        Some("secret-Personal"),
+        "the active account credential is untouched"
+    );
+}
+
+/// Forward recovery of a same-backend contact-source switch must clear the
+/// replaced source checkpoint just like the live commit path.
+#[tokio::test]
+async fn same_backend_recovery_clears_the_replaced_contact_source() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::provider_neutral();
+    let account = harness.add_imap("Personal").await;
+
+    let source_a = ContactSourceConfig {
+        id: ContactSourceId::from(CONTACTS_SOURCE_A),
+        provider: ProviderId::from(IMAP_SMTP_PROVIDER),
+        kind: "personal".to_string(),
+        enabled: true,
+    };
+    let mut target = api::account(&account).unwrap();
+    target.contact_sources = vec![source_a];
+    let staged = harness.stage("contact-a-secret");
+    api::switch_backend(&account, Harness::authenticated(target, staged))
+        .await
+        .expect("enable source A");
+
+    let store = harness.store();
+    let generation = store.generation(&account).unwrap();
+    let contacts_a = JobKey {
+        account: account.clone(),
+        kind: JobKind::Contacts,
+        source: CONTACTS_SOURCE_A.to_string(),
+    };
+    store
+        .set_checkpoint(
+            &contacts_a,
+            generation,
+            &ProviderCursor::new(1, "contacts-a"),
+        )
+        .unwrap();
+    store
+        .set_checkpoint(
+            &account_job(&account),
+            generation,
+            &ProviderCursor::new(1, "mail"),
+        )
+        .unwrap();
+    drop(store);
+
+    let source_b = ContactSourceConfig {
+        id: ContactSourceId::from(CONTACTS_SOURCE_B),
+        provider: ProviderId::from(IMAP_SMTP_PROVIDER),
+        kind: "personal".to_string(),
+        enabled: true,
+    };
+    let mut target = api::account(&account).unwrap();
+    target.contact_sources = vec![source_b.clone()];
+    let staged = harness.stage("contact-b-secret");
+    api::inject_switch_crash_after_config();
+    let error = api::switch_backend(&account, Harness::authenticated(target, staged))
+        .await
+        .expect_err("the injected crash surfaces");
+    assert!(error.contains("simulated"), "{error}");
+    api::clear_switch_crash();
+
+    // The crash left the target config published but never cleared the replaced
+    // source. Startup's forward path must do it.
+    harness.restart();
+
+    let store = harness.store();
+    assert!(
+        store.job_checkpoint(&contacts_a).unwrap().is_none(),
+        "recovery clears the replaced contact source cache"
+    );
+    assert!(
+        store
+            .job_checkpoint(&account_job(&account))
+            .unwrap()
+            .is_some(),
+        "recovery keeps the mail sync checkpoint"
+    );
+    assert_eq!(
+        api::account(&account).unwrap().contact_sources,
+        vec![source_b]
     );
 }

@@ -101,12 +101,20 @@ A successful switch:
 4. marks the intent durable, activates the new credential, and publishes the new
    account backend in `pige.json`;
 5. clears only provider-derived cache and checkpoints; and
-6. removes the intent and the rollback copy.
+6. removes the intent and the rollback copy, but only after the configuration
+   and active credential are confirmed to be a pair. If restoring the old
+   credential fails, the intent and backup are kept so startup can repair it.
+
+A session-only switch deletes the previous persistent OS entry before storing the
+new session credential: `get` prefers the persistent entry, so leaving it would
+make the new backend read the old secret. The rollback copy is written first, so
+the old credential is never lost.
 
 The account id, drafts, outbox rows, and learned data in other tables survive.
 The provider remote mappings (`remote_messages`, `remote_collections`), cached
 folders, messages, threads, bodies, attachments, FTS rows derived from that mail,
-and sync/contact checkpoints are rebuilt from the new backend.
+and sync/contact checkpoints are rebuilt from the new backend. A thread row that
+a surviving draft still references is retained rather than left dangling.
 
 A same-backend re-authentication keeps the endpoints and contact sources and
 does not clear the mail cache. Replacing one contact source clears only that
@@ -123,7 +131,8 @@ activated, and its phase is advanced durably:
   restores the previous credential from the secure-store rollback reference and
   keeps the old backend;
 - **after config publication** — startup completes forward for a persistent
-  credential and clears the previous provider cache;
+  credential and clears the previous provider cache, or only the replaced
+  contact-source checkpoint for a same-backend switch;
 - **after config publication with a session-only credential** — the session
   secret cannot survive a restart, so startup restores the previous backend and
   credential rather than leaving a new backend with no or stale credentials.
@@ -135,19 +144,28 @@ than guessed at. Startup reports a warning for any incomplete recovery.
 
 ## Restore, removal, and factory reset
 
-- **Restore** discards interrupted switch intents, cancels the current
-  generation of every existing account, and then rebuilds the account mirror.
-  Accounts dropped by the backup lose their credentials, jobs, and cache.
+- **Restore** cancels the current generation of every existing account before
+  rebuilding the account mirror, then reconciles any interrupted switch against
+  the restored account shapes: a restored pre-switch backend gets the old
+  credential back, a restored target backend keeps the new one, and an unrelated
+  backend has its active credential removed and must sign in again. Remaining
+  intents are cleared only after that pairing is confirmed. Accounts dropped by
+  the backup lose their credentials, jobs, cache, and rollback backups.
   Surviving accounts keep their cache but any work that started before the
   restore is fenced out.
 - **Removal** discards a pending switch, advances the generation, fences
-  credential writers, deletes the secret, removes the account row (cascading its
-  cache), and clears its jobs and pending-auth references. The generation
-  tombstone remains so a number is never reused and a late writer cannot win.
+  credential writers, deletes the secret and any rollback backup, removes the
+  account row (cascading its cache), and clears its jobs and pending-auth
+  references. The generation tombstone remains so a number is never reused and a
+  late writer cannot win.
 - **Factory reset** discards switch intents, cancels every generation, deletes
-  accounts, secrets, jobs, leases, pending-auth references, and the cache
-  directory. It leaves no credential or job record behind for the previous
-  configuration.
+  accounts, secrets, rollback backups, jobs, leases, pending-auth references, and
+  the cache directory. It leaves no credential or job record behind for the
+  previous configuration.
+
+At startup, a rollback backup whose intent no longer exists is swept for every
+account the configuration or SQLite mirror still names, so a crash between
+cache clearing and reference cleanup cannot leave an unreachable secret.
 
 Account edits advance the generation too: a sync, refresh, prefetch, or crawl
 that started before the edit cannot persist its result, and a credential write

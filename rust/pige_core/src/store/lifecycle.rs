@@ -200,9 +200,11 @@ impl Store {
 
     /// Clear every provider-derived cache row for `account`: remote identity
     /// mappings, collection folders, messages (with bodies, attachments, FTS,
-    /// and memberships), threads, job checkpoints, and the switch intent. Drafts,
-    /// outbox rows, learned data in other tables, the account row, and its
-    /// generation/lease tombstones are deliberately preserved.
+    /// and memberships), threads, and job checkpoints. Drafts, outbox rows,
+    /// learned data in other tables, the account row, its generation/lease
+    /// tombstones, and any switch intent are deliberately preserved. Keeping the
+    /// intent is what lets a crash between this clear and the reference cleanup
+    /// be retried at the next start instead of orphaning a rollback credential.
     ///
     /// Returns cache files that are no longer referenced so the caller can
     /// remove them best-effort.
@@ -248,9 +250,15 @@ impl Store {
         )?;
         tx.execute("DELETE FROM folders WHERE account_id = ?1", [&account.0])?;
         tx.execute("DELETE FROM messages WHERE account_id = ?1", [&account.0])?;
-        tx.execute("DELETE FROM threads WHERE account_id = ?1", [&account.0])?;
+        // A draft's thread link has no foreign key, so preserve any thread row a
+        // surviving outbox entry still points at rather than leaving it dangling.
         tx.execute(
-            "DELETE FROM switch_intents WHERE account_id = ?1",
+            "DELETE FROM threads
+             WHERE account_id = ?1
+               AND id NOT IN (
+                   SELECT thread_id FROM outbox
+                   WHERE account_id = ?1 AND thread_id IS NOT NULL
+               )",
             [&account.0],
         )?;
 

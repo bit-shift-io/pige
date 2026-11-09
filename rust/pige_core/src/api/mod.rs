@@ -608,6 +608,12 @@ pub fn init(config: Config) -> Result<(), String> {
         log::warn!("an interrupted backend switch is pending but configuration writes are blocked");
     }
 
+    // A rollback backup without a surviving intent can only be an orphan (for
+    // example a crash between the intent delete and the reference discard, or a
+    // historical bug). Remove it for every account we can name so no protected
+    // secret outlives its switch.
+    accounts::sweep_orphaned_switch_references(&store, &config.credentials, &config_doc.accounts);
+
     let sender = events::sender().clone();
     let mut state = AppState {
         config,
@@ -869,10 +875,10 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
     }
 
     // A restore supersedes any interrupted switch, and every current account
-    // generation is stale once the document is replaced. Cancel live work and
-    // discard switch remnants *before* rebuilding the mirror so a late worker
-    // cannot write into the restored configuration.
-    accounts::discard_pending_switches(&state.store, &state.config.credentials)?;
+    // generation is stale once the document is replaced. Cancel live work
+    // *before* rebuilding the mirror so a late worker cannot write into the
+    // restored configuration. Bumping generations is deliberately fail-safe:
+    // even if the save below fails, in-flight work simply has to restart.
     for account in &previous.accounts {
         if let Err(error) = state.sessions.invalidate(&account.id) {
             log::warn!(
@@ -907,11 +913,21 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         return Err(format!("update account cache: {error}"));
     }
 
+    // The restored document is durable. Reconcile any switch that was
+    // interrupted before this restore against the restored shapes, so the
+    // restored backend is never paired with the other backend's credential.
+    // A failure keeps the intent and removes the unmatched active credential;
+    // the next start retries the recovery.
+    let mut warnings = accounts::reconcile_restored_switches(
+        &state.store,
+        &state.config.credentials,
+        &state.config_doc.accounts,
+    );
+
     // The document is durable; now the dropped accounts' secrets must not
     // linger, or a later restore of the same id would silently re-attach one.
     // A failure is reported rather than hidden: the app cannot both claim a
     // clean restore and keep the old password.
-    let mut warnings = Vec::new();
     for id in &dropped {
         // The generation was already advanced before the mirror rebuild. Clean
         // the dropped account's durable jobs and cached provider state now.
@@ -927,6 +943,7 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password for restored-away account {id}: {error}");
         }
+        accounts::discard_switch_backup(&state.config.credentials, id);
     }
 
     state.selected_folder = None;
@@ -996,6 +1013,8 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password during factory reset for {id}: {error}");
         }
+        // Remove a rollback backup even if its intent row was already lost.
+        accounts::discard_switch_backup(&state.config.credentials, id);
     }
 
     // No job, lease, pending-auth reference, or switch intent survives a reset.
@@ -1462,6 +1481,9 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session credential after invalidating removed account {id}: {error}");
         }
+        // A rollback backup must not outlive the account even if its intent row
+        // was already gone.
+        accounts::discard_switch_backup(&state.config.credentials, id);
 
         // Clear any selection that pointed at the removed account, then pick
         // the unified inbox again when other accounts remain.
