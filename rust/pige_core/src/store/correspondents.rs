@@ -334,8 +334,10 @@ impl Store {
             [&account.0],
         )?;
         // Rebuild the derived projection so the account's synced contacts remain
-        // suggestible even though every learned signal for it is gone.
-        rebuild_recipient_index_in(&tx)?;
+        // suggestible even though every learned signal for it is gone. Only this
+        // account's projection rows are touched; another account's learned
+        // suggestions are completely independent of this clear.
+        rebuild_recipient_index_for_account_in(&tx, account)?;
 
         let disabled = if enable_automatic_learning { 0 } else { 1 };
         tx.execute(
@@ -458,14 +460,38 @@ impl Store {
     /// Progress is monotonic: `scanned` never decreases, and once a crawl is
     /// complete a late tail write cannot transiently mark it incomplete again.
     /// A history retry delay is independent of this write and is preserved.
+    ///
+    /// This convenience form stamps the write with the *current* learning epoch.
+    /// A crawl that captured its epoch before fetching a page must call
+    /// [`Self::record_history_progress_at_epoch`] instead, otherwise a page from
+    /// before a clear/rebuild could still mark the new epoch complete.
     pub fn record_history_progress(
         &self,
         ctx: &OperationContext,
         progress: HistoryProgress,
     ) -> Result<(), StoreError> {
+        let epoch = self.learning_epoch(&ctx.account)?;
+        self.record_history_progress_at_epoch(ctx, epoch, progress)
+    }
+
+    /// Epoch-fenced form of [`Self::record_history_progress`]. Progress produced
+    /// under an older learning epoch is rejected with
+    /// [`StoreError::StaleLearningEpoch`] instead of completing or rewinding the
+    /// new epoch that clear/rebuild/pause just started.
+    pub fn record_history_progress_at_epoch(
+        &self,
+        ctx: &OperationContext,
+        expected_epoch: u64,
+        progress: HistoryProgress,
+    ) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        let state = learning_state_in(&tx, &ctx.account)?;
+        check_learning_write_in(&state, expected_epoch)?;
+        if state.history_disabled {
+            return Err(StoreError::LearningDisabled);
+        }
         tx.execute(
             "INSERT INTO contact_learning_state
                  (account_id, existing_cache_cursor, updated_at, history_scanned,
@@ -504,14 +530,36 @@ impl Store {
     }
 
     /// Persist a rate-limit delay so a restart does not immediately retry.
+    ///
+    /// This convenience form stamps the write with the *current* learning epoch;
+    /// a crawl must use [`Self::record_history_retry_after_at_epoch`] with the
+    /// epoch it captured before the request.
     pub fn record_history_retry_after(
         &self,
         ctx: &OperationContext,
         until_ms: i64,
     ) -> Result<(), StoreError> {
+        let epoch = self.learning_epoch(&ctx.account)?;
+        self.record_history_retry_after_at_epoch(ctx, epoch, until_ms)
+    }
+
+    /// Epoch-fenced form of [`Self::record_history_retry_after`]. A delay
+    /// produced under an older epoch must not delay the crawl that a rebuild
+    /// just restarted.
+    pub fn record_history_retry_after_at_epoch(
+        &self,
+        ctx: &OperationContext,
+        expected_epoch: u64,
+        until_ms: i64,
+    ) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        let state = learning_state_in(&tx, &ctx.account)?;
+        check_learning_write_in(&state, expected_epoch)?;
+        if state.history_disabled {
+            return Err(StoreError::LearningDisabled);
+        }
         tx.execute(
             "INSERT INTO contact_learning_state
                  (account_id, existing_cache_cursor, updated_at, history_retry_after)
@@ -1019,59 +1067,77 @@ fn delete_recipient_index_in(
     Ok(())
 }
 
+/// Rebuild the derived recipient tables for every account. Used after a
+/// migration or by repair tooling; ordinary writes refresh only the affected
+/// address key.
 pub(crate) fn rebuild_recipient_index_in(conn: &rusqlite::Connection) -> Result<(), StoreError> {
-    conn.execute("DELETE FROM recipient_tokens", [])?;
-    conn.execute("DELETE FROM recipient_index", [])?;
+    for account in store_account_ids(conn)? {
+        rebuild_recipient_index_for_account_in(conn, &AccountId(account))?;
+    }
+    Ok(())
+}
 
-    let mut entries: BTreeMap<
-        (String, String),
-        (Option<LearnedAddress>, ContactSignals, EvidenceSignals),
-    > = BTreeMap::new();
+/// Rebuild one account's derived recipient tables from its durable contact and
+/// evidence rows. Clearing learning for one account must not churn another
+/// account's independent projection.
+pub(crate) fn rebuild_recipient_index_for_account_in(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM recipient_tokens WHERE account_id = ?1",
+        [&account.0],
+    )?;
+    conn.execute(
+        "DELETE FROM recipient_index WHERE account_id = ?1",
+        [&account.0],
+    )?;
+
+    let mut entries: BTreeMap<String, (Option<LearnedAddress>, ContactSignals, EvidenceSignals)> =
+        BTreeMap::new();
 
     {
         let mut statement = conn.prepare(
-            "SELECT account_id, address_key, email, display_name, trust, outgoing,
-                    last_seen, evidence_count
-             FROM contact_addresses",
+            "SELECT address_key, email, display_name, trust, outgoing, last_seen, evidence_count
+             FROM contact_addresses
+             WHERE account_id = ?1",
         )?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query([&account.0])?;
         while let Some(row) = rows.next()? {
-            let account: String = row.get(0)?;
-            let address_key: String = row.get(1)?;
-            let display_name: Option<String> = row.get(3)?;
-            let trust: String = row.get(4)?;
-            let outgoing: i64 = row.get(5)?;
-            let last_seen: i64 = row.get(6)?;
-            let evidence_count: i64 = row.get(7)?;
+            let address_key: String = row.get(0)?;
+            let display_name: Option<String> = row.get(2)?;
+            let trust: String = row.get(3)?;
+            let outgoing: i64 = row.get(4)?;
+            let last_seen: i64 = row.get(5)?;
+            let evidence_count: i64 = row.get(6)?;
             let learned = LearnedAddress {
                 key: AddressKey(address_key.clone()),
-                address: Address::new(display_name, row.get::<_, String>(2)?),
+                address: Address::new(display_name, row.get::<_, String>(1)?),
                 evidence_count: evidence_count.max(0) as u32,
                 outgoing: outgoing != 0,
                 trust: ObservationTrust::from_db(&trust).unwrap_or(ObservationTrust::Ordinary),
                 last_seen,
             };
-            entries.entry((account, address_key)).or_default().0 = Some(learned);
+            entries.entry(address_key).or_default().0 = Some(learned);
         }
     }
 
     {
         let mut statement = conn.prepare(
-            "SELECT ce.account_id, ce.address_key, ce.email, ce.display_name,
-                    COALESCE(cs.kind, 'saved')
+            "SELECT ce.address_key, ce.email, ce.display_name, COALESCE(cs.kind, 'saved')
              FROM contact_emails ce
              LEFT JOIN contact_sources cs
                ON cs.account_id = ce.account_id AND cs.source_id = ce.source_id
-             ORDER BY ce.account_id, ce.address_key, ce.source_id, ce.remote_contact_id",
+             WHERE ce.account_id = ?1
+             ORDER BY ce.address_key, ce.source_id, ce.remote_contact_id",
         )?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query([&account.0])?;
         while let Some(row) = rows.next()? {
-            let account: String = row.get(0)?;
-            let address_key: String = row.get(1)?;
-            let email: String = row.get(2)?;
-            let name: Option<String> = row.get(3)?;
-            let kind: String = row.get(4)?;
-            let signals = &mut entries.entry((account, address_key)).or_default().1;
+            let address_key: String = row.get(0)?;
+            let email: String = row.get(1)?;
+            let name: Option<String> = row.get(2)?;
+            let kind: String = row.get(3)?;
+            let signals = &mut entries.entry(address_key).or_default().1;
             if kind.eq_ignore_ascii_case(OTHER_CONTACT_KIND) {
                 signals.other = true;
                 if signals.other_email.is_none() {
@@ -1098,7 +1164,7 @@ pub(crate) fn rebuild_recipient_index_in(conn: &rusqlite::Connection) -> Result<
 
     {
         let mut statement = conn.prepare(
-            "SELECT ea.account_id, ea.address_key,
+            "SELECT ea.address_key,
                     MAX(CASE WHEN ce.origin = 'selection' THEN 1 ELSE 0 END),
                     MAX(CASE WHEN ce.origin = 'accepted_send' THEN 1 ELSE 0 END),
                     MAX(CASE WHEN ce.origin IN ('existing_cache', 'history', 'live_arrival')
@@ -1106,23 +1172,23 @@ pub(crate) fn rebuild_recipient_index_in(conn: &rusqlite::Connection) -> Result<
              FROM evidence_addresses ea
              JOIN correspondence_evidence ce
                ON ce.account_id = ea.account_id AND ce.evidence_id = ea.evidence_id
-             GROUP BY ea.account_id, ea.address_key",
+             WHERE ea.account_id = ?1
+             GROUP BY ea.address_key",
         )?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query([&account.0])?;
         while let Some(row) = rows.next()? {
-            let account: String = row.get(0)?;
-            let address_key: String = row.get(1)?;
-            let signals = &mut entries.entry((account, address_key)).or_default().2;
-            signals.selected = row.get::<_, i64>(2)? != 0;
-            signals.outgoing = row.get::<_, i64>(3)? != 0;
-            signals.incoming = row.get::<_, i64>(4)? != 0;
+            let address_key: String = row.get(0)?;
+            let signals = &mut entries.entry(address_key).or_default().2;
+            signals.selected = row.get::<_, i64>(1)? != 0;
+            signals.outgoing = row.get::<_, i64>(2)? != 0;
+            signals.incoming = row.get::<_, i64>(3)? != 0;
         }
     }
 
-    for ((account, key), (learned, contact, evidence)) in entries {
+    for (key, (learned, contact, evidence)) in entries {
         write_recipient_index_in(
             conn,
-            &AccountId(account),
+            account,
             &AddressKey(key),
             learned.as_ref(),
             &contact,

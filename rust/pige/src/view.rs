@@ -61,9 +61,18 @@ impl App {
             root = stack![root, crate::screens::advanced::reset_confirm_modal()].into();
         }
         if let Some(confirm) = &self.learning_confirm {
+            let paused = match confirm {
+                crate::app::LearningConfirm::Clear(id)
+                | crate::app::LearningConfirm::Rebuild(id) => self
+                    .snapshot
+                    .accounts
+                    .iter()
+                    .find(|account| &account.id == id)
+                    .is_some_and(|account| account.learning_paused),
+            };
             root = stack![
                 root,
-                crate::screens::settings::learning_confirm_modal(confirm)
+                crate::screens::settings::learning_confirm_modal(confirm, paused)
             ]
             .into();
         }

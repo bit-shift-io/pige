@@ -142,6 +142,14 @@ pub async fn learn_account_slice(
     budget: WorkBudget,
     scheduler: &AccountScheduler,
 ) -> Result<LearningProgress, ProviderError> {
+    // Pause and clear-disabled are checked before opening a provider session:
+    // a paused account must not authenticate, connect, or fetch even though the
+    // caller still asks for a slice. `learn` repeats this check under its epoch
+    // snapshot for callers that already hold a mailbox.
+    let learning = store.learning_state(&ctx.account).map_err(store_error)?;
+    if learning.paused || learning.history_disabled {
+        return learning_progress(store, &ctx.account);
+    }
     let Some(_slot) = try_background_slot() else {
         return learning_progress(store, &ctx.account);
     };
@@ -214,19 +222,25 @@ async fn learn(
     }
 
     // Mark the crawl active so a concurrent `learning_progress` read can tell
-    // an in-flight slice from one that stopped with work remaining. The store
-    // never lets this write undo a concurrent completion.
-    store
-        .record_history_progress(
-            ctx,
-            HistoryProgress {
-                scanned: state.progress.scanned,
-                total_hint: state.progress.total_hint,
-                complete: false,
-                paused: false,
-            },
-        )
-        .map_err(store_error)?;
+    // an in-flight slice from one that stopped with work remaining. The write is
+    // fenced by the epoch captured above, so a clear/rebuild/pause that lands
+    // first wins instead of being overwritten by this stale slice.
+    match store.record_history_progress_at_epoch(
+        ctx,
+        epoch,
+        HistoryProgress {
+            scanned: state.progress.scanned,
+            total_hint: state.progress.total_hint,
+            complete: false,
+            paused: false,
+        },
+    ) {
+        Ok(()) => {}
+        Err(error) if is_stale_learning(&error) => {
+            return learning_progress(store, &ctx.account);
+        }
+        Err(error) => return Err(store_error(error)),
+    }
 
     let deadline = budget.deadline.min(ctx.deadline);
     let page_size = budget.page_size.max(1);
@@ -301,18 +315,29 @@ async fn learn(
                 ErrorKind::RateLimited => {
                     let delay = error.retry_after.unwrap_or(HISTORY_DEFAULT_RETRY);
                     let until = now_ms().saturating_add(duration_ms(delay));
-                    store
-                        .record_history_retry_after(ctx, until)
-                        .map_err(store_error)?;
-                    let _ = store.record_history_progress(
+                    match store.record_history_retry_after_at_epoch(ctx, epoch, until) {
+                        Ok(()) => {}
+                        Err(error) if is_stale_learning(&error) => {
+                            return learning_progress(store, &ctx.account);
+                        }
+                        Err(error) => return Err(store_error(error)),
+                    }
+                    match store.record_history_progress_at_epoch(
                         ctx,
+                        epoch,
                         HistoryProgress {
                             scanned,
                             total_hint,
                             complete: false,
                             paused: true,
                         },
-                    );
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if is_stale_learning(&error) => {
+                            return learning_progress(store, &ctx.account);
+                        }
+                        Err(error) => return Err(store_error(error)),
+                    }
                     // The checkpoint was never advanced for the failed page.
                     return Err(error);
                 }
@@ -326,15 +351,22 @@ async fn learn(
                     // Any other failure also leaves the cursor at the last
                     // complete page. Record that more work remains so the UI
                     // does not imply a finished crawl.
-                    let _ = store.record_history_progress(
+                    match store.record_history_progress_at_epoch(
                         ctx,
+                        epoch,
                         HistoryProgress {
                             scanned,
                             total_hint,
                             complete: false,
                             paused: true,
                         },
-                    );
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if is_stale_learning(&error) => {
+                            return learning_progress(store, &ctx.account);
+                        }
+                        Err(error) => return Err(store_error(error)),
+                    }
                     return Err(error);
                 }
             },
@@ -344,17 +376,16 @@ async fn learn(
             Ok(()) => {}
             // Another writer advanced the history checkpoint while this page
             // was in flight, or the learning epoch moved (clear/rebuild/pause).
-            // Discard the page; the next slice reconciles from whatever is
-            // durable now.
-            Err(StoreError::StalePage | StoreError::StaleLearningEpoch { .. }) => {
+            // Return the durable progress without writing anything: a tail
+            // progress write here could mark a freshly rebuilt epoch complete.
+            Err(
+                StoreError::StalePage
+                | StoreError::StaleLearningEpoch { .. }
+                | StoreError::LearningPaused
+                | StoreError::LearningDisabled,
+            ) => {
                 drop(gate);
-                break;
-            }
-            // Clear or pause landed while the page was being fetched. The page
-            // must not be recorded at all.
-            Err(StoreError::LearningPaused | StoreError::LearningDisabled) => {
-                drop(gate);
-                break;
+                return learning_progress(store, &ctx.account);
             }
             Err(error) => return Err(store_error(error)),
         }
@@ -381,17 +412,25 @@ async fn learn(
             complete,
             paused: !complete,
         };
-        store
-            .record_history_progress(
-                ctx,
-                HistoryProgress {
-                    scanned,
-                    total_hint,
-                    complete,
-                    paused: !complete,
-                },
-            )
-            .map_err(store_error)?;
+        match store.record_history_progress_at_epoch(
+            ctx,
+            epoch,
+            HistoryProgress {
+                scanned,
+                total_hint,
+                complete,
+                paused: !complete,
+            },
+        ) {
+            Ok(()) => {}
+            // The page committed under the captured epoch, but the user rebuilt
+            // or paused before this progress write. Never complete the new epoch
+            // from a stale slice.
+            Err(error) if is_stale_learning(&error) => {
+                return learning_progress(store, &ctx.account);
+            }
+            Err(error) => return Err(store_error(error)),
+        }
 
         // Release the page's gate before doing anything else so an interactive
         // operation can run between pages.
@@ -404,25 +443,39 @@ async fn learn(
 
     // Budget exhausted, the account gate was busy, or the deadline cancelled a
     // pending page. Persist the "more remains" state so the UI can report it
-    // without opening a provider.
+    // without opening a provider. The epoch fence ensures a clear/rebuild that
+    // raced this exit is not overwritten with stale progress.
     let progress = LearningProgress {
         scanned,
         total_hint,
         complete: false,
         paused: true,
     };
-    store
-        .record_history_progress(
-            ctx,
-            HistoryProgress {
-                scanned,
-                total_hint,
-                complete: false,
-                paused: true,
-            },
-        )
-        .map_err(store_error)?;
-    Ok(progress)
+    match store.record_history_progress_at_epoch(
+        ctx,
+        epoch,
+        HistoryProgress {
+            scanned,
+            total_hint,
+            complete: false,
+            paused: true,
+        },
+    ) {
+        Ok(()) => Ok(progress),
+        Err(error) if is_stale_learning(&error) => learning_progress(store, &ctx.account),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+/// True when a learning write lost to clear/rebuild/pause. The caller must stop
+/// and report durable progress rather than propagate the fence as an error.
+fn is_stale_learning(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::StaleLearningEpoch { .. }
+            | StoreError::LearningPaused
+            | StoreError::LearningDisabled
+    )
 }
 
 fn store_error(error: StoreError) -> ProviderError {

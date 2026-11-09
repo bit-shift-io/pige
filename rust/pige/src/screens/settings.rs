@@ -293,8 +293,12 @@ fn recipient_suggestions_section<'a>(app: &'a App) -> Element<'a, Message> {
 }
 
 /// Confirmation for the two destructive learning actions. Pause/resume is
-/// reversible and needs no dialog.
-pub(crate) fn learning_confirm_modal(confirm: &LearningConfirm) -> Element<'static, Message> {
+/// reversible and needs no dialog. `paused` reflects the account's persistent
+/// switch so the rebuild copy never promises a crawl that is not running.
+pub(crate) fn learning_confirm_modal(
+    confirm: &LearningConfirm,
+    paused: bool,
+) -> Element<'static, Message> {
     match confirm {
         LearningConfirm::Clear(_) => components::confirm(
             "Clear learned suggestions",
@@ -306,7 +310,11 @@ pub(crate) fn learning_confirm_modal(confirm: &LearningConfirm) -> Element<'stat
         ),
         LearningConfirm::Rebuild(_) => components::confirm(
             "Rebuild learned suggestions",
-            "This discards the account's learned recipients and starts a new full-history learning epoch. Synced contacts are kept; learning continues in the background.",
+            if paused {
+                "This discards the account's learned recipients and starts a new full-history learning epoch. Synced contacts are kept. Learning is paused, so resume it before the new crawl runs."
+            } else {
+                "This discards the account's learned recipients and starts a new full-history learning epoch. Synced contacts are kept; learning continues in the background."
+            },
             "Rebuild",
             true,
             Message::LearningRebuildConfirmed,

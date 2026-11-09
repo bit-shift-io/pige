@@ -24,11 +24,14 @@ use pige_core::platform::fake::{
     FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
 };
 use pige_core::platform::BackupStore;
+use pige_core::providers::fake::FakeProviderFactory;
 use pige_core::providers::{
     ChangePage, HistoryCoverage, HistoryPage, JobKey, JobKind, MailChange, MessageRecord,
-    OperationContext, OperationId, ProviderCursor, RemoteMessageId,
+    OperationContext, OperationId, ProviderCursor, ProviderFactory, RemoteMessageId,
 };
-use pige_core::store::history_job;
+use pige_core::store::{HistoryProgress, history_job};
+use pige_core::sync::history::{background_budget, learn_account_slice};
+use pige_core::sync::scheduler::AccountScheduler;
 use pige_core::Store;
 use pige_core::StoreError;
 use tempfile::TempDir;
@@ -275,6 +278,69 @@ fn stale_crawl_after_clear_cannot_commit() {
 }
 
 #[test]
+fn stale_slice_cannot_complete_progress_after_rebuild() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+    let old_epoch = store.learning_epoch(&account.id).unwrap();
+    let old = "stale-final@example.com";
+
+    // The slice fetched and committed its final page under `old_epoch`.
+    store
+        .apply_history_page_at_epoch(&context, old_epoch, None, &page(1, old, "cp-final"))
+        .unwrap();
+
+    // The user rebuilds before that slice persists its progress/complete flag.
+    store.rebuild_learned_recipients(&account.id).unwrap();
+    assert!(
+        store.learning_epoch(&account.id).unwrap() > old_epoch,
+        "rebuild starts a new learning epoch"
+    );
+
+    let stale = store.record_history_progress_at_epoch(
+        &context,
+        old_epoch,
+        HistoryProgress {
+            scanned: 1,
+            total_hint: Some(1),
+            complete: true,
+            paused: false,
+        },
+    );
+    assert!(
+        matches!(stale, Err(StoreError::StaleLearningEpoch { .. })),
+        "a stale slice must not write progress under the new epoch, got {stale:?}"
+    );
+    let state = store.history_state(&account.id).unwrap();
+    assert!(
+        !state.progress.complete,
+        "a stale slice must not complete the rebuilt epoch"
+    );
+    assert_eq!(state.progress.scanned, 0);
+
+    // The rebuilt epoch still crawls and completes under its own epoch.
+    let fresh = "fresh-final@example.com";
+    store
+        .apply_history_page(&context, None, &page(2, fresh, "cp-new"))
+        .unwrap();
+    let new_epoch = store.learning_epoch(&account.id).unwrap();
+    store
+        .record_history_progress_at_epoch(
+            &context,
+            new_epoch,
+            HistoryProgress {
+                scanned: 1,
+                total_hint: Some(1),
+                complete: true,
+                paused: false,
+            },
+        )
+        .unwrap();
+    assert!(store.history_state(&account.id).unwrap().progress.complete);
+    assert!(learned(&store, &account.id, fresh));
+}
+
+#[test]
 fn pause_preserves_existing_suggestions() {
     let (_dir, store) = open_store();
     let account = account();
@@ -291,7 +357,6 @@ fn pause_preserves_existing_suggestions() {
         learned(&store, &account.id, kept),
         "pausing must not delete existing suggestions"
     );
-    assert!(learned(&store, &account.id, kept));
 
     // Every ingestion path is stopped while paused, including deliberate ones.
     let result = store.apply_history_page(&context, None, &page(2, blocked, "cp-2"));
@@ -422,6 +487,99 @@ fn remove_one_account_preserves_other_evidence() {
 
     assert!(!learned(&store, &first.id, "first-learned@example.com"));
     assert!(learned(&store, &second.id, "second-learned@example.com"));
+}
+
+#[test]
+fn clear_one_account_preserves_other_learned_evidence() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path().join("pige.db")).unwrap();
+    store.migrate().unwrap();
+    let first = account_named("account-r4-clear-first", "first-clear@example.com");
+    let second = account_named("account-r4-clear-second", "second-clear@example.com");
+    store.upsert_account(&first).unwrap();
+    store.upsert_account(&second).unwrap();
+
+    store
+        .apply_history_page(
+            &ctx(&first.id),
+            None,
+            &page(1, "first-only@example.com", "cp-first"),
+        )
+        .unwrap();
+    store
+        .apply_history_page(
+            &ctx(&second.id),
+            None,
+            &page(2, "second-only@example.com", "cp-second"),
+        )
+        .unwrap();
+
+    store.clear_learned_recipients(&first.id).unwrap();
+
+    assert!(!learned(&store, &first.id, "first-only@example.com"));
+    assert!(
+        learned(&store, &second.id, "second-only@example.com"),
+        "clearing one account must not touch another account's evidence"
+    );
+    assert!(
+        contact_candidate(&store, &second.id, "second-only@example.com"),
+        "the other account's learned projection must survive"
+    );
+    assert!(!contact_candidate(
+        &store,
+        &first.id,
+        "first-only@example.com"
+    ));
+}
+
+#[tokio::test]
+async fn paused_or_cleared_account_skips_provider_open() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+    let fake = Arc::new(FakeProviderFactory::new());
+    let factory: Arc<dyn ProviderFactory> = fake.clone();
+    let scheduler = AccountScheduler::new();
+
+    store.pause_learning(&account.id, true).unwrap();
+    let progress = learn_account_slice(
+        &store,
+        &factory,
+        &account,
+        &context,
+        background_budget(),
+        &scheduler,
+    )
+    .await
+    .unwrap();
+    assert!(progress.paused);
+    assert_eq!(
+        fake.recorder().open_attempts(),
+        0,
+        "a paused account must not open a provider session"
+    );
+    assert!(fake.recorder().history_requests().is_empty());
+
+    store.pause_learning(&account.id, false).unwrap();
+    store.clear_learned_recipients(&account.id).unwrap();
+    fake.recorder().clear();
+    let progress = learn_account_slice(
+        &store,
+        &factory,
+        &account,
+        &context,
+        background_budget(),
+        &scheduler,
+    )
+    .await
+    .unwrap();
+    assert!(progress.paused);
+    assert_eq!(
+        fake.recorder().open_attempts(),
+        0,
+        "a cleared account must not open a provider session until rebuild"
+    );
+    assert!(fake.recorder().history_requests().is_empty());
 }
 
 // ---------------------------------------------------------------------------
