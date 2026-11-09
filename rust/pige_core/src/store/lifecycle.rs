@@ -34,9 +34,12 @@ pub struct SwitchIntent {
     pub previous_present: bool,
     /// Whether the previous active credential was persisted in the OS store.
     pub previous_persistent: bool,
-    /// Durable progress: `0` before the new secret is activated, `1` once the
-    /// rollback backup exists and the new active secret may have been written,
-    /// `2` once the target configuration is published.
+    /// Durable, *confirmed* progress. Each value is written only after the step
+    /// it names returned success, so recovery never treats an attempted write as
+    /// a completed one. See the phase constants in `api::accounts`:
+    /// `0` intent written, `1` rollback backup confirmed, `2` new active
+    /// credential write confirmed, `3` target configuration save confirmed,
+    /// `4` provider cache cleared/completed.
     pub phase: u8,
     pub created_at_ms: i64,
 }

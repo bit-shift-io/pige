@@ -943,7 +943,14 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password for restored-away account {id}: {error}");
         }
-        accounts::discard_switch_backup(&state.config.credentials, id);
+        if let Err(error) =
+            accounts::discard_switch_backup_reporting(&state.config.credentials, id)
+        {
+            log::warn!("discard rollback backup for restored-away account {id}: {error}");
+            warnings.push(format!(
+                "A rollback credential for a removed account could not be cleared: {error}"
+            ));
+        }
     }
 
     state.selected_folder = None;
@@ -986,7 +993,7 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
     // credential or cache row after the reset. Provider-session revocation is
     // best effort and never delays the local cleanup.
     accounts::revoke_sessions_best_effort(state.config.auth.clone(), ids.clone());
-    accounts::discard_pending_switches(&state.store, &state.config.credentials)?;
+    let mut warnings = accounts::discard_pending_switches(&state.store, &state.config.credentials)?;
     for id in &ids {
         if let Err(error) = state.sessions.invalidate(id) {
             log::warn!("invalidate session during factory reset for {id}: {error}");
@@ -1004,7 +1011,6 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
         return Err(format!("update account cache: {error}"));
     }
 
-    let mut warnings = Vec::new();
     for id in &ids {
         if let Err(error) = state.config.credentials.delete(id) {
             log::warn!("delete password during factory reset for {id}: {error}");
@@ -1014,7 +1020,14 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
             log::warn!("clear session password during factory reset for {id}: {error}");
         }
         // Remove a rollback backup even if its intent row was already lost.
-        accounts::discard_switch_backup(&state.config.credentials, id);
+        if let Err(error) =
+            accounts::discard_switch_backup_reporting(&state.config.credentials, id)
+        {
+            log::warn!("discard rollback backup during factory reset for {id}: {error}");
+            warnings.push(format!(
+                "A rollback credential could not be cleared during the reset: {error}"
+            ));
+        }
     }
 
     // No job, lease, pending-auth reference, or switch intent survives a reset.

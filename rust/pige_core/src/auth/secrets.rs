@@ -556,16 +556,21 @@ impl SecretRepository for CredentialSecretRepository {
     fn discard_reference(&self, reference: &StagedSecretRef) -> Result<(), ProviderError> {
         let key = AccountId(reference.as_str().to_string());
         // A backup written while the OS store was unavailable may only exist as
-        // a session entry; a persistent backup may exist beside it. Both are
-        // removed, and an unavailable store must not prevent the session cleanup.
-        let persistent_error = self.credentials.delete(&key).err();
-        self.credentials
+        // a session entry; a persistent backup may exist beside it. The platform
+        // `delete` already distinguishes a known session-only entry (success
+        // while the store is unreachable) from a persistent entry that may still
+        // exist, so its error must not be swallowed: a reference is only removed
+        // when the delete returned success or the entry was verified absent.
+        let persistent = self.credentials.delete(&key).map_err(credential_error);
+        // Always clear the in-memory half, even when the persistent delete
+        // failed, so a session backup cannot outlive its record.
+        let session = self
+            .credentials
             .delete_session(&key)
-            .map_err(credential_error)?;
-        match persistent_error {
-            Some(error) if !credentials_unavailable(&error) => Err(credential_error(error)),
-            _ => Ok(()),
-        }
+            .map_err(credential_error);
+        persistent?;
+        session?;
+        Ok(())
     }
 
     fn discard_staged(&self, reference: &StagedSecretRef) -> Result<(), ProviderError> {

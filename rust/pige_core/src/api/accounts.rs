@@ -7,16 +7,18 @@
 //! switch writes a **non-secret** [`SwitchIntent`] first, then:
 //!
 //! 1. copies the previous active credential to a lifecycle reference,
-//! 2. marks the intent phase as "secret may have changed",
-//! 3. writes the new active credential,
-//! 4. publishes the new configuration,
-//! 5. clears only provider-derived cache/checkpoints, and
-//! 6. removes the intent and its temporary references.
+//! 2. records that the backup is confirmed (`BackedUp`),
+//! 3. writes the new active credential and only then records `CredentialWritten`,
+//! 4. publishes the new configuration and only then records `ConfigWritten`,
+//! 5. clears only provider-derived cache/checkpoints (`Completed`), and
+//! 6. removes the intent before discarding its temporary references.
 //!
-//! A crash before step 4 is rolled back at startup; a crash after it completes
-//! forward, except for session-only credentials (which cannot survive a
-//! restart) where the old backend and credential are restored. The invariant is
-//! that a new backend is never left paired with an old credential.
+//! A crash before the target configuration is confirmed is rolled back at
+//! startup; a crash after it completes forward, except for session-only
+//! credentials (which cannot survive a restart) where the old backend and
+//! credential are restored. The phase is a record of what was *confirmed*, never
+//! of what was about to be attempted, so a phase at or above `CredentialWritten`
+//! is the only evidence that the new credential is active.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +43,19 @@ use super::{CoreEvent, ModelSnapshot, lock_state, not_initialized_message};
 /// How long a lifecycle reference (rollback backup) is retained. It is removed
 /// as soon as the switch completes; the constant only bounds a crashed writer.
 const LIFECYCLE_REFERENCE_TTL: Duration = Duration::from_secs(30);
+
+/// Confirmed switch progression. Every value is written only *after* the step it
+/// names returned success. Recovery branches on these confirmations, never on
+/// "the write was about to be attempted".
+pub(crate) const PHASE_INTENT: u8 = 0;
+/// The previous credential (when present) is copied to the rollback reference.
+pub(crate) const PHASE_BACKED_UP: u8 = 1;
+/// The new active credential write returned success.
+pub(crate) const PHASE_CREDENTIAL_WRITTEN: u8 = 2;
+/// The target account configuration was saved and mirrored.
+pub(crate) const PHASE_CONFIG_WRITTEN: u8 = 3;
+/// The provider cache/checkpoints were cleared; only reference cleanup remains.
+pub(crate) const PHASE_COMPLETED: u8 = 4;
 
 /// Test-only crash points. `1` simulates a process death immediately after the
 /// new secret was activated; `2` immediately after the configuration was
@@ -452,7 +467,7 @@ fn commit_switch(
             session_only,
             previous_present,
             previous_persistent,
-            phase: 0,
+            phase: PHASE_INTENT,
             created_at_ms: now_ms(),
         })
         .map_err(map_store)?;
@@ -481,11 +496,12 @@ fn commit_switch(
         }
     }
 
-    // From here on the active credential may change. Marking phase 1 *before*
-    // the write makes a crash at any point recoverable from the backup.
+    // The backup stage is confirmed. The active credential has not been touched
+    // yet; this state only says a reachable rollback copy exists (or that the
+    // account had no credential to copy).
     state
         .store
-        .set_switch_intent_phase(account, 1)
+        .set_switch_intent_phase(account, PHASE_BACKED_UP)
         .map_err(map_store)?;
 
     let write = if session_only {
@@ -517,6 +533,27 @@ fn commit_switch(
         ));
     }
 
+    // The new active credential write returned success. Only now may recovery
+    // treat the new credential as active. If the confirmation cannot be
+    // recorded, roll back instead of continuing with an unconfirmed write.
+    if let Err(error) = state
+        .store
+        .set_switch_intent_phase(account, PHASE_CREDENTIAL_WRITTEN)
+    {
+        return Err(rollback_switch(
+            &state.store,
+            &secrets,
+            account,
+            ctx,
+            previous_envelope.as_ref(),
+            previous_persistent,
+            &backup_ref,
+            previous_present,
+            credential_ref,
+            map_store(error),
+        ));
+    }
+
     // Test-only process death between secret activation and config publication.
     simulated_crash(1)?;
 
@@ -542,7 +579,7 @@ fn commit_switch(
     }
     state
         .store
-        .set_switch_intent_phase(account, 2)
+        .set_switch_intent_phase(account, PHASE_CONFIG_WRITTEN)
         .map_err(map_store)?;
 
     // Test-only process death after the config was published.
@@ -574,12 +611,24 @@ fn commit_switch(
         }
     }
 
-    cleanup_switch_references(&secrets, &backup_ref, previous_present, credential_ref)
-        .map_err(map_secret)?;
-    state
+    // Cache clearing is idempotent; a failure keeps the intent so startup
+    // retries it. Record `Completed` only once it returned success.
+    if let Err(error) = state
         .store
-        .remove_switch_intent(account)
-        .map_err(map_store)?;
+        .set_switch_intent_phase(account, PHASE_COMPLETED)
+    {
+        return Err(map_store(error));
+    }
+
+    complete_switch_intent(
+        &state.store,
+        &secrets,
+        account,
+        &backup_ref,
+        previous_present,
+        credential_ref,
+    )
+    .map_err(map_store)?;
 
     state.capabilities.remove(account);
     state.selected_folder = None;
@@ -616,16 +665,48 @@ fn rollback_switch(
             error.safe_message
         );
     }
-    match cleanup_switch_references(secrets, backup_ref, backup_present, credential_ref) {
-        Ok(()) => match store.remove_switch_intent(account) {
-            Ok(()) => original,
-            Err(error) => format!("{original}; could not clear the switch intent: {error}"),
-        },
-        Err(error) => format!(
-            "{original}; switch recovery data could not be discarded ({}); it will be retried at startup",
-            error.safe_message
-        ),
+    // The previous credential is active again. Remove the recovery record
+    // *before* discarding the backup: a crash in between can then only orphan a
+    // temporary reference for the startup sweep, never leave an intent whose
+    // rollback data is already gone.
+    match store.remove_switch_intent(account) {
+        Ok(()) => {
+            if let Err(error) =
+                cleanup_switch_references(secrets, backup_ref, backup_present, credential_ref)
+            {
+                log::warn!(
+                    "discard switch references for {account}: {}; the startup sweep will retry",
+                    error.safe_message
+                );
+            }
+            original
+        }
+        Err(error) => format!("{original}; could not clear the switch intent: {error}"),
     }
+}
+
+/// Retire a switch whose config/credential pair is already consistent. The
+/// intent is removed first; reference cleanup is best effort and retried by the
+/// startup orphan sweep, so a crash can never leave an intent without the
+/// rollback data a later recovery might need.
+fn complete_switch_intent(
+    store: &Store,
+    secrets: &dyn SecretRepository,
+    account: &AccountId,
+    backup_ref: &StagedSecretRef,
+    backup_present: bool,
+    credential_ref: &StagedSecretRef,
+) -> Result<(), StoreError> {
+    store.remove_switch_intent(account)?;
+    if let Err(error) =
+        cleanup_switch_references(secrets, backup_ref, backup_present, credential_ref)
+    {
+        log::warn!(
+            "discard switch references for {account}: {}; the startup sweep will retry",
+            error.safe_message
+        );
+    }
+    Ok(())
 }
 
 fn restore_secret(
@@ -727,6 +808,204 @@ fn intent_target_applied(current: &Account, intent: &SwitchIntent) -> bool {
         && current.contact_sources == intent.target.contact_sources
 }
 
+fn intent_previous_applied(current: &Account, intent: &SwitchIntent) -> bool {
+    current.label == intent.previous.label
+        && current.email == intent.previous.email
+        && current.display_name == intent.previous.display_name
+        && current.backend == intent.previous.backend
+        && current.contact_sources == intent.previous.contact_sources
+}
+
+/// Clear the same provider-derived state as the live commit. A backend change
+/// clears the whole provider cache; a same-backend change clears only the
+/// contact sources that disappeared.
+fn clear_switch_cache(store: &Store, intent: &SwitchIntent) -> Result<(), String> {
+    if intent.previous.backend != intent.target.backend {
+        match store.clear_provider_cache(&intent.account) {
+            Ok(files) => {
+                for path in files {
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        log::warn!("remove switched cache file {}: {error}", path.display());
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "Could not finish clearing the previous provider cache: {error}"
+            )),
+        }
+    } else {
+        for source in replaced_contact_sources(&intent.previous, &intent.target) {
+            store
+                .clear_contact_source_cache(&intent.account, &source)
+                .map_err(|error| {
+                    format!("Could not finish clearing a replaced contact source cache: {error}")
+                })?;
+        }
+        Ok(())
+    }
+}
+
+enum Activation {
+    Activated,
+    Missing,
+}
+
+/// Write the staged authentication candidate to the active entry. `Missing`
+/// means the process (or its restart) has already discarded the candidate and it
+/// can never be activated again; a store failure is returned so the caller
+/// retries instead of guessing.
+fn activate_staged_credential(
+    secrets: &dyn SecretRepository,
+    store: &Store,
+    intent: &SwitchIntent,
+) -> Result<Activation, ProviderError> {
+    let Ok(reference) = StagedSecretRef::from_stored_key(&intent.credential_ref) else {
+        return Ok(Activation::Missing);
+    };
+    let Some(staged) = secrets.load_staged(&reference)? else {
+        return Ok(Activation::Missing);
+    };
+    let ctx = recovery_context(store, &intent.account);
+    if intent.session_only {
+        secrets.save_session(&ctx, &staged)?;
+    } else {
+        secrets.save(&ctx, &staged)?;
+    }
+    Ok(Activation::Activated)
+}
+
+enum RestoredCredential {
+    Restored,
+    BackupMissing,
+}
+
+fn restore_intent_credential(
+    secrets: &dyn SecretRepository,
+    store: &Store,
+    intent: &SwitchIntent,
+) -> Result<RestoredCredential, ProviderError> {
+    if !intent.previous_present {
+        secrets.delete(&intent.account)?;
+        return Ok(RestoredCredential::Restored);
+    }
+    let Some(raw) = intent.backup_ref.as_deref() else {
+        return Ok(RestoredCredential::BackupMissing);
+    };
+    let Ok(reference) = StagedSecretRef::from_stored_key(raw) else {
+        return Ok(RestoredCredential::BackupMissing);
+    };
+    let Some(envelope) = secrets.load_staged(&reference)? else {
+        return Ok(RestoredCredential::BackupMissing);
+    };
+    let ctx = recovery_context(store, &intent.account);
+    restore_secret(
+        secrets,
+        &ctx,
+        &intent.account,
+        Some(&envelope),
+        intent.previous_persistent,
+    )?;
+    Ok(RestoredCredential::Restored)
+}
+
+/// Confirm that the target backend has its new credential active. Only a
+/// recorded `CredentialWritten` transition (or a successful activation of a
+/// still-available staged candidate) counts as confirmation.
+fn confirm_target_credential(
+    secrets: &dyn SecretRepository,
+    store: &Store,
+    intent: &SwitchIntent,
+) -> Result<bool, ProviderError> {
+    if intent.phase >= PHASE_CREDENTIAL_WRITTEN && secrets.load(&intent.account)?.is_some() {
+        return Ok(true);
+    }
+    match activate_staged_credential(secrets, store, intent)? {
+        Activation::Activated => {
+            store
+                .set_switch_intent_phase(&intent.account, PHASE_CREDENTIAL_WRITTEN)
+                .map_err(crate::auth::store_error_to_provider)?;
+            Ok(true)
+        }
+        Activation::Missing => Ok(false),
+    }
+}
+
+/// Put the previous credential back for a config that is known to be the
+/// previous shape. A failed restore or delete keeps the intent and (when it
+/// exists) the backup so the next start can retry; nothing is silently dropped.
+fn settle_previous_credential(
+    secrets: &dyn SecretRepository,
+    store: &Store,
+    intent: &SwitchIntent,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if intent.phase < PHASE_BACKED_UP {
+        // No credential write or backup attempt ever started: the active
+        // credential is already the previous one.
+        return true;
+    }
+    match restore_intent_credential(secrets, store, intent) {
+        Ok(RestoredCredential::Restored) => true,
+        Ok(RestoredCredential::BackupMissing) => {
+            // No usable backup: remove whatever may be active. Only a successful
+            // delete (or a verified absence) proves the old backend is not left
+            // paired with a newer credential.
+            match secrets.delete(&intent.account) {
+                Ok(()) => {
+                    warnings.push(
+                        "A previous credential backup was no longer available after an interrupted backend switch; sign in again."
+                            .to_string(),
+                    );
+                    true
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "The credential of an interrupted backend switch could not be cleared ({}); it will be retried at the next start.",
+                        error.safe_message
+                    ));
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "The previous credential could not be restored ({}); the switch will be retried at the next start.",
+                error.safe_message
+            ));
+            false
+        }
+    }
+}
+
+/// Replace the account shape with the pre-switch one, but only when that write
+/// succeeds. `false` keeps the intent so the next start retries.
+fn rollback_config_to_previous(
+    store: &Store,
+    config_path: &Path,
+    doc: &mut ConfigDocument,
+    index: usize,
+    intent: &SwitchIntent,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let mut candidate = doc.clone();
+    candidate.accounts[index] = intent.previous.clone();
+    if let Err(error) = config::save(config_path, &candidate) {
+        warnings.push(format!(
+            "Could not restore the previous account setup: {error}"
+        ));
+        return false;
+    }
+    *doc = candidate;
+    if let Err(error) = store.sync_accounts(&doc.accounts) {
+        warnings.push(format!(
+            "Could not restore the previous account cache: {error}"
+        ));
+        return false;
+    }
+    true
+}
+
 /// Complete or roll back every interrupted backend switch. Called by
 /// [`super::init`] after the configuration document is loaded and before the
 /// process-wide state is installed.
@@ -749,138 +1028,161 @@ pub(crate) fn recover_switch_intents(
             .iter()
             .position(|account| account.id == intent.account)
         else {
-            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+            // The account is gone; any credential left by the switch must go
+            // too. A failed delete keeps the intent so the next start retries.
+            match secrets.delete(&intent.account) {
+                Ok(()) => finish_recovered_intent(store, &secrets, &intent, &mut warnings),
+                Err(error) => warnings.push(format!(
+                    "Could not clear the credential of an account removed during an interrupted backend switch ({}); the switch will be retried at the next start.",
+                    error.safe_message
+                )),
+            }
             continue;
         };
 
-        let current = &doc.accounts[index];
-        let target_applied = intent_target_applied(current, &intent);
-        let previous_applied = current.label == intent.previous.label
-            && current.email == intent.previous.email
-            && current.display_name == intent.previous.display_name
-            && current.backend == intent.previous.backend
-            && current.contact_sources == intent.previous.contact_sources;
+        let target_applied;
+        let previous_applied;
+        let backend_is_target;
+        let backend_is_previous;
+        {
+            let current = &doc.accounts[index];
+            target_applied = intent_target_applied(current, &intent);
+            previous_applied = intent_previous_applied(current, &intent);
+            backend_is_target = current.backend == intent.target.backend;
+            backend_is_previous = current.backend == intent.previous.backend;
+        }
+
         if !target_applied && !previous_applied {
+            // An unrelated edit landed while the switch was interrupted. Do not
+            // overwrite it, but never leave a credential that might belong to
+            // the other side of the switch attached to it either.
             warnings.push(
-                "The account changed outside an interrupted backend switch; its previous credential was left untouched."
+                "The account changed outside an interrupted backend switch; its configuration was left as edited."
                     .to_string(),
             );
-            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
-            continue;
-        }
-        let forward = target_applied && !intent.session_only;
-        if forward {
-            let cleared = if intent.previous.backend != intent.target.backend {
-                match store.clear_provider_cache(&intent.account) {
-                    Ok(files) => {
-                        for path in files {
-                            let _ = std::fs::remove_file(path);
+            let settle = if backend_is_target {
+                match confirm_target_credential(&secrets, store, &intent) {
+                    Ok(true) => match clear_switch_cache(store, &intent) {
+                        Ok(()) => true,
+                        Err(warning) => {
+                            warnings.push(warning);
+                            false
                         }
-                        Ok(())
-                    }
-                    Err(error) => Err(format!(
-                        "Could not finish clearing the previous provider cache: {error}"
-                    )),
-                }
-            } else {
-                // A same-backend/contact-source switch replaces only the
-                // sources that disappeared, exactly like the live commit path.
-                let mut result = Ok(());
-                for source in replaced_contact_sources(&intent.previous, &intent.target) {
-                    if let Err(error) = store.clear_contact_source_cache(&intent.account, &source) {
-                        result = Err(format!(
-                            "Could not finish clearing a replaced contact source cache: {error}"
-                        ));
-                        break;
-                    }
-                }
-                result
-            };
-            if let Err(warning) = cleared {
-                warnings.push(warning);
-                // Keep the intent so the next start retries the clear.
-                continue;
-            }
-            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
-            continue;
-        }
-
-        // Roll back the published configuration when it is the target. If the
-        // document is neither the target nor the previous shape, leave it alone:
-        // an unrelated edit must not be overwritten.
-        if target_applied && intent.previous.backend != intent.target.backend {
-            doc.accounts[index] = intent.previous.clone();
-            if let Err(error) = config::save(config_path, doc) {
-                warnings.push(format!(
-                    "Could not restore the previous account setup: {error}"
-                ));
-                continue;
-            }
-            if let Err(error) = store.sync_accounts(&doc.accounts) {
-                warnings.push(format!(
-                    "Could not restore the previous account cache: {error}"
-                ));
-                continue;
-            }
-        }
-
-        if intent.phase >= 1 {
-            let restored = if intent.previous_present {
-                match intent
-                    .backup_ref
-                    .as_deref()
-                    .and_then(|raw| StagedSecretRef::from_stored_key(raw).ok())
-                {
-                    Some(reference) => match secrets.load_staged(&reference) {
-                        Ok(Some(envelope)) => {
-                            let ctx = recovery_context(store, &intent.account);
-                            match restore_secret(
-                                &secrets,
-                                &ctx,
-                                &intent.account,
-                                Some(&envelope),
-                                intent.previous_persistent,
-                            ) {
-                                Ok(()) => true,
-                                Err(error) => {
-                                    warnings.push(format!(
-                                        "Could not restore the previous credential: {}",
-                                        error.safe_message
-                                    ));
-                                    false
-                                }
-                            }
+                    },
+                    Ok(false) => match secrets.delete(&intent.account) {
+                        Ok(()) => {
+                            warnings.push(
+                                "An interrupted switch's credential could not be matched to the edited account; sign in again."
+                                    .to_string(),
+                            );
+                            true
                         }
-                        Ok(None) => false,
                         Err(error) => {
                             warnings.push(format!(
-                                "Could not read the previous credential: {}",
+                                "An interrupted switch's credential could not be cleared ({}); it will be retried at the next start.",
                                 error.safe_message
                             ));
                             false
                         }
                     },
-                    None => false,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "The interrupted switch's credential could not be verified ({}); it will be retried at the next start.",
+                            error.safe_message
+                        ));
+                        false
+                    }
                 }
+            } else if backend_is_previous {
+                settle_previous_credential(&secrets, store, &intent, &mut warnings)
             } else {
-                // The account had no active credential before the switch; do
-                // not leave the new one paired with the old backend.
-                let _ = secrets.delete(&intent.account);
-                true
+                match secrets.delete(&intent.account) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "An interrupted switch's credential could not be cleared ({}); it will be retried at the next start.",
+                            error.safe_message
+                        ));
+                        false
+                    }
+                }
             };
-
-            if !restored && intent.previous_present {
-                // No trustworthy backup: remove the possibly-new secret rather
-                // than leave a backend paired with credentials for another one.
-                let _ = secrets.delete(&intent.account);
-                warnings.push(
-                    "A previous credential could not be restored after an interrupted backend switch; sign in again."
-                        .to_string(),
-                );
+            if settle {
+                finish_recovered_intent(store, &secrets, &intent, &mut warnings);
             }
+            continue;
         }
 
-        finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+        // A session-only credential cannot survive a restart, so a published
+        // target must be rolled back even though the phase says it was written.
+        if target_applied && intent.session_only {
+            if !rollback_config_to_previous(store, config_path, doc, index, &intent, &mut warnings)
+            {
+                continue;
+            }
+            if !settle_previous_credential(&secrets, store, &intent, &mut warnings) {
+                continue;
+            }
+            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+            continue;
+        }
+
+        if target_applied {
+            let ready = match confirm_target_credential(&secrets, store, &intent) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    warnings.push(format!(
+                        "The new backend credential could not be verified ({}); the switch will be retried at the next start.",
+                        error.safe_message
+                    ));
+                    continue;
+                }
+            };
+            if !ready {
+                // The staged candidate is gone and the new credential is not
+                // confirmed. Roll the account back rather than pair the target
+                // backend with the old credential.
+                if !rollback_config_to_previous(
+                    store,
+                    config_path,
+                    doc,
+                    index,
+                    &intent,
+                    &mut warnings,
+                ) {
+                    continue;
+                }
+                if !settle_previous_credential(&secrets, store, &intent, &mut warnings) {
+                    continue;
+                }
+                warnings.push(
+                    "An interrupted backend switch could not activate its new credential; the previous account setup was restored."
+                        .to_string(),
+                );
+                finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+                continue;
+            }
+
+            // The config and credential are a matching pair; finish the same
+            // cleanup the live commit would have done before dropping the intent.
+            if let Err(warning) = clear_switch_cache(store, &intent) {
+                warnings.push(warning);
+                continue;
+            }
+            if let Err(error) = store.set_switch_intent_phase(&intent.account, PHASE_COMPLETED) {
+                warnings.push(format!(
+                    "Could not record a completed interrupted backend switch: {error}"
+                ));
+                continue;
+            }
+            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+            continue;
+        }
+
+        // The pre-switch configuration is still published: restore its credential.
+        if settle_previous_credential(&secrets, store, &intent, &mut warnings) {
+            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+        }
     }
 
     Ok(warnings)
@@ -917,27 +1219,27 @@ fn cleanup_intent_references(
     }
 }
 
-/// Discard a recovered intent only after its references are gone. A cleanup
-/// failure keeps the intent so the next start can retry instead of orphaning a
-/// protected rollback backup.
+/// Remove a recovered intent whose pair is already consistent, *then* discard
+/// its temporary references. A crash between the two can only leave an orphaned
+/// reference for the startup sweep; it can never leave an intent that needs a
+/// backup which was already discarded.
 fn finish_recovered_intent(
     store: &Store,
     secrets: &dyn SecretRepository,
     intent: &SwitchIntent,
     warnings: &mut Vec<String>,
 ) {
-    match cleanup_intent_references(secrets, intent) {
-        Ok(()) => {
-            if let Err(error) = store.remove_switch_intent(&intent.account) {
-                warnings.push(format!(
-                    "Could not clear an interrupted backend switch: {error}"
-                ));
-            }
-        }
-        Err(error) => warnings.push(format!(
-            "Temporary switch credentials could not be discarded ({}); the switch will be retried at the next start.",
+    if let Err(error) = store.remove_switch_intent(&intent.account) {
+        warnings.push(format!(
+            "Could not clear an interrupted backend switch: {error}"
+        ));
+        return;
+    }
+    if let Err(error) = cleanup_intent_references(secrets, intent) {
+        warnings.push(format!(
+            "Temporary switch credentials could not be discarded ({}); the startup orphan sweep will retry.",
             error.safe_message
-        )),
+        ));
     }
 }
 
@@ -948,8 +1250,8 @@ fn finish_recovered_intent(
 /// This runs *after* the restored document is durable. A crash before this
 /// completes still leaves the intent for startup recovery, which makes the same
 /// choice. If a credential cannot be made to match, the active credential is
-/// removed (forcing re-authentication) rather than pairing a new backend with
-/// an old secret, and the intent is kept for the next start.
+/// removed (forcing re-authentication) rather than pairing a new backend with an
+/// old secret; a failed delete keeps the intent for the next start.
 pub(crate) fn reconcile_restored_switches(
     store: &Arc<Store>,
     credentials: &Arc<dyn CredentialStore>,
@@ -971,51 +1273,90 @@ pub(crate) fn reconcile_restored_switches(
             .iter()
             .find(|candidate| candidate.id == intent.account)
         else {
-            // The restore dropped the account; its credential cleanup belongs
-            // to the restore's dropped-account path.
-            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+            // The restore dropped the account; clear any credential the switch
+            // may have left, but only finish once the delete succeeded.
+            match secrets.delete(&intent.account) {
+                Ok(()) => finish_recovered_intent(store, &secrets, &intent, &mut warnings),
+                Err(error) => warnings.push(format!(
+                    "A restored-away account's switch credential could not be cleared ({}); it will be retried at the next start.",
+                    error.safe_message
+                )),
+            }
             continue;
         };
 
         if intent.previous.backend == intent.target.backend {
-            // The backend did not change, so either credential is still
-            // semantically valid for the restored account. Keep the active one.
+            // Either credential is semantically valid for the restored account.
+            // Still apply the forward cleanup when the restored shape is the
+            // target so a replaced contact source is not replayed.
+            if intent_target_applied(restored, &intent)
+                && let Err(warning) = clear_switch_cache(store, &intent)
+            {
+                warnings.push(warning);
+                continue;
+            }
             finish_recovered_intent(store, &secrets, &intent, &mut warnings);
             continue;
         }
 
         if restored.backend == intent.target.backend {
-            if intent.phase == 0
-                && let Err(error) = activate_staged_credential(&secrets, store, &intent)
-            {
-                let _ = secrets.delete(&intent.account);
-                warnings.push(format!(
-                    "A restored account could not be paired with its new credential ({}); sign in again.",
-                    error.safe_message
-                ));
+            // The target backend needs the *new* credential. Never keep the old
+            // one merely because a phase says a write was attempted.
+            let ready = match confirm_target_credential(&secrets, store, &intent) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    warnings.push(format!(
+                        "A restored account's new credential could not be verified ({}); it will be retried at the next start.",
+                        error.safe_message
+                    ));
+                    continue;
+                }
+            };
+            if !ready {
+                match secrets.delete(&intent.account) {
+                    Ok(()) => {
+                        warnings.push(
+                            "A restored account could not be paired with its new credential; sign in again."
+                                .to_string(),
+                        );
+                        finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+                    }
+                    Err(error) => warnings.push(format!(
+                        "A restored account's mismatched credential could not be cleared ({}); it will be retried at the next start.",
+                        error.safe_message
+                    )),
+                }
                 continue;
             }
-        } else if restored.backend == intent.previous.backend {
-            if intent.phase >= 1
-                && let Err(error) = restore_intent_credential(&secrets, store, &intent)
-            {
-                let _ = secrets.delete(&intent.account);
-                warnings.push(format!(
-                    "A restored account's previous credential could not be restored ({}); sign in again.",
-                    error.safe_message
-                ));
+            if let Err(warning) = clear_switch_cache(store, &intent) {
+                warnings.push(warning);
                 continue;
             }
-        } else {
-            // A third backend cannot be proven to pair with either credential.
-            let _ = secrets.delete(&intent.account);
-            warnings.push(
-                "The restored account uses a different backend than the interrupted switch; sign in again."
-                    .to_string(),
-            );
+            finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+            continue;
         }
 
-        finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+        if restored.backend == intent.previous.backend {
+            if settle_previous_credential(&secrets, store, &intent, &mut warnings) {
+                finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+            }
+            continue;
+        }
+
+        // A third backend cannot be proven to pair with either credential.
+        match secrets.delete(&intent.account) {
+            Ok(()) => {
+                warnings.push(
+                    "The restored account uses a different backend than the interrupted switch; sign in again."
+                        .to_string(),
+                );
+                finish_recovered_intent(store, &secrets, &intent, &mut warnings);
+            }
+            Err(error) => warnings.push(format!(
+                "A restored account's switch credential could not be cleared ({}); it will be retried at the next start.",
+                error.safe_message
+            )),
+        }
     }
     warnings
 }
@@ -1024,63 +1365,26 @@ fn switch_backup_ref(account: &AccountId) -> Option<StagedSecretRef> {
     StagedSecretRef::from_stored_key(&format!("switch_backup_{}", account.0)).ok()
 }
 
-/// Activate the staged authentication candidate for a restored target account.
-fn activate_staged_credential(
-    secrets: &dyn SecretRepository,
-    store: &Store,
-    intent: &SwitchIntent,
-) -> Result<(), ProviderError> {
-    let reference = StagedSecretRef::from_stored_key(&intent.credential_ref)?;
-    let staged = secrets.load_staged(&reference)?.ok_or_else(|| {
-        ProviderError::unsupported("the authentication candidate is no longer available")
-    })?;
-    let ctx = recovery_context(store, &intent.account);
-    if intent.session_only {
-        secrets.save_session(&ctx, &staged)
-    } else {
-        secrets.save(&ctx, &staged)
-    }
-}
-
-/// Restore the credential captured before an interrupted switch.
-fn restore_intent_credential(
-    secrets: &dyn SecretRepository,
-    store: &Store,
-    intent: &SwitchIntent,
-) -> Result<(), ProviderError> {
-    if !intent.previous_present {
-        return secrets.delete(&intent.account);
-    }
-    let raw = intent.backup_ref.as_deref().ok_or_else(|| {
-        ProviderError::unsupported("the previous credential backup is no longer available")
-    })?;
-    let reference = StagedSecretRef::from_stored_key(raw)?;
-    let envelope = secrets.load_staged(&reference)?.ok_or_else(|| {
-        ProviderError::unsupported("the previous credential backup is no longer available")
-    })?;
-    let ctx = recovery_context(store, &intent.account);
-    restore_secret(
-        secrets,
-        &ctx,
-        &intent.account,
-        Some(&envelope),
-        intent.previous_persistent,
-    )
-}
-
 /// Delete a `switch_backup_<account>` reference even when its intent row was
 /// already lost. Used by explicit removal/reset paths and the startup sweep.
 pub(crate) fn discard_switch_backup(credentials: &Arc<dyn CredentialStore>, account: &AccountId) {
+    if let Err(error) = discard_switch_backup_reporting(credentials, account) {
+        log::warn!("discard switch rollback credential for {account}: {error}");
+    }
+}
+
+/// Fallible form used where the caller reports cleanup warnings to the user.
+pub(crate) fn discard_switch_backup_reporting(
+    credentials: &Arc<dyn CredentialStore>,
+    account: &AccountId,
+) -> Result<(), String> {
     let Some(reference) = switch_backup_ref(account) else {
-        return;
+        return Ok(());
     };
     let secrets = CredentialSecretRepository::new(credentials.clone());
-    if let Err(error) = secrets.discard_reference(&reference) {
-        log::warn!(
-            "discard switch rollback credential for {account}: {}",
-            error.safe_message
-        );
-    }
+    secrets
+        .discard_reference(&reference)
+        .map_err(|error| error.safe_message)
 }
 
 /// Remove rollback backups that have no matching switch intent. The secure
@@ -1111,25 +1415,27 @@ pub(crate) fn sweep_orphaned_switch_references(
 
 /// Discard every unfinished switch and its temporary credentials. Factory reset
 /// is an explicit user action that supersedes a crash remnant; leaving a
-/// rollback backup behind would leak a protected secret.
+/// rollback backup behind would leak a protected secret. Cleanup failures are
+/// returned as warnings and retried by the normal startup sweep while the
+/// account id is still known.
 pub(crate) fn discard_pending_switches(
     store: &Arc<Store>,
     credentials: &Arc<dyn CredentialStore>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let secrets = CredentialSecretRepository::with_gate(credentials.clone(), store.clone());
+    let mut warnings = Vec::new();
     for intent in store.switch_intents().map_err(map_store)? {
         if let Err(error) = cleanup_intent_references(&secrets, &intent) {
-            log::warn!(
-                "discard switch references for {}: {}",
-                intent.account,
+            warnings.push(format!(
+                "A temporary credential from an interrupted backend switch could not be discarded ({}); it will be retried by the startup sweep.",
                 error.safe_message
-            );
+            ));
         }
         store
             .remove_switch_intent(&intent.account)
             .map_err(map_store)?;
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Discard one account's unfinished switch before an explicit removal.

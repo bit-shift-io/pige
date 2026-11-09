@@ -97,13 +97,20 @@ A successful switch:
    generation;
 2. waits for the account's work gate to drain;
 3. writes a non-secret switch intent and a rollback copy of the previous
-   credential in the secure store;
-4. marks the intent durable, activates the new credential, and publishes the new
-   account backend in `pige.json`;
-5. clears only provider-derived cache and checkpoints; and
-6. removes the intent and the rollback copy, but only after the configuration
-   and active credential are confirmed to be a pair. If restoring the old
-   credential fails, the intent and backup are kept so startup can repair it.
+   credential in the secure store, then records `BackedUp`;
+4. writes the new active credential and records `CredentialWritten` only after
+   that write returned success;
+5. publishes the new account backend in `pige.json`, then records
+   `ConfigWritten`;
+6. clears only provider-derived cache and checkpoints, then records `Completed`;
+7. removes the intent *before* discarding the rollback copy, so a crash in
+   between can only leave a temporary reference for the startup sweep. If
+   restoring the old credential fails, the intent, backup, and candidate are
+   kept so startup can repair the pair.
+
+The persisted phase records what has actually been **confirmed**, never what is
+about to be attempted. In particular, a phase below `CredentialWritten` is never
+treated as evidence that the new credential is active.
 
 A session-only switch deletes the previous persistent OS entry before storing the
 new session credential: `get` prefers the persistent entry, so leaving it would
@@ -123,24 +130,40 @@ source's checkpoint; other sources' checkpoints and all mail remain.
 ### Crash recovery
 
 The switch intent is written before any credential or configuration is
-activated, and its phase is advanced durably:
+activated, and its phase is advanced only after the matching step is confirmed:
 
-- **before the credential may change** — startup rolls back, discards the
-  candidate, and leaves the old account/credential untouched;
-- **after the credential may have changed, before config publication** — startup
-  restores the previous credential from the secure-store rollback reference and
-  keeps the old backend;
-- **after config publication** — startup completes forward for a persistent
-  credential and clears the previous provider cache, or only the replaced
-  contact-source checkpoint for a same-backend switch;
-- **after config publication with a session-only credential** — the session
+- **`BackedUp`** — the rollback reference exists (or the account had no
+  credential). Startup can safely roll back, but must not assume the active
+  credential changed.
+- **`CredentialWritten`** — the new active credential write returned success.
+  A crash before config publication restores the previous credential from the
+  rollback reference and keeps the old backend.
+- **`ConfigWritten`** — the target backend is published and matches the new
+  credential. Startup completes forward and clears the previous provider cache
+  (or only the replaced contact-source checkpoint for a same-backend switch).
+- **`Completed`** — the cache clear finished; startup only retires the intent.
+- **After config publication with a session-only credential** — the session
   secret cannot survive a restart, so startup restores the previous backend and
   credential rather than leaving a new backend with no or stale credentials.
 
-The invariant is that a new backend is never paired with old credentials. If a
-rollback reference cannot be read (for example the OS store is unavailable), the
-possibly-new credential is removed and the user is asked to sign in again rather
-than guessed at. Startup reports a warning for any incomplete recovery.
+Forward recovery verifies that the target credential is actually present (or
+reactivates a still-staged candidate); if it cannot, it rolls the configuration
+back instead of pairing the new backend with the old secret.
+
+The invariant is that a new backend is never paired with old credentials (or the
+inverse) without a surviving intent and a retry path. If a restore, delete, or
+cache clear fails — including `NoStorageAccess` where the entry may still exist —
+the intent and backup are kept and the operation is retried at the next start.
+Only a delete that returned success (or a verified absence) counts as cleanup.
+Startup reports a warning for any incomplete recovery. Removing the intent before
+discarding the rollback reference guarantees a crash cannot leave an intent whose
+recovery data is already gone.
+
+The startup orphan sweep retries rollback-reference cleanup for every account id
+still named by `pige.json` or the SQLite mirror. A reference whose account id has
+already disappeared from both stores cannot be enumerated through the OS
+credential store; that residual is documented rather than silently assumed gone.
+Factory reset reports a warning when an explicit cleanup cannot be completed.
 
 ## Restore, removal, and factory reset
 

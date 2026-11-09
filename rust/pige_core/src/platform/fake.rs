@@ -30,6 +30,9 @@ pub struct FakeCredentials {
     session_only: Mutex<HashSet<AccountId>>,
     deleted: Mutex<Vec<AccountId>>,
     fail_next_set: AtomicBool,
+    /// Accounts whose next persistent `set` call fails once. Unlike
+    /// [`Self::fail_set`], the write that follows (a rollback restore) succeeds.
+    fail_next_set_for: Mutex<HashSet<AccountId>>,
     /// Accounts whose next (and every subsequent) persistent `set` call fails.
     /// Used by lifecycle recovery tests to fail both a new active write and the
     /// rollback that would otherwise follow it.
@@ -76,6 +79,12 @@ impl FakeCredentials {
         self.fail_next_set.store(true, Ordering::SeqCst);
     }
 
+    /// Make only the next persistent `set` call for `id` fail. A subsequent
+    /// rollback restore for the same account still succeeds.
+    pub fn fail_next_set_for(&self, id: &AccountId) {
+        self.fail_next_set_for.lock().unwrap().insert(id.clone());
+    }
+
     /// Make every persistent `set` call for `id` fail until
     /// [`Self::allow_set_for`] is called. A lifecycle recovery test uses this so
     /// the new active write and the rollback restore both fail.
@@ -97,6 +106,11 @@ impl FakeCredentials {
     /// Make every `delete` call fail.
     pub fn fail_delete(&self) {
         self.fail_delete.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop failing `delete` calls.
+    pub fn allow_delete(&self) {
+        self.fail_delete.store(false, Ordering::SeqCst);
     }
 
     pub fn deleted(&self) -> Vec<AccountId> {
@@ -132,6 +146,9 @@ impl CredentialStore for FakeCredentials {
         }
         if self.fail_next_set.swap(false, Ordering::SeqCst) {
             return Err("fake credential set failed".to_string());
+        }
+        if self.fail_next_set_for.lock().unwrap().remove(id) {
+            return Err("fake credential set failed for this account".to_string());
         }
         if self.fail_set.lock().unwrap().contains(id) {
             return Err("fake credential set failed for this account".to_string());
