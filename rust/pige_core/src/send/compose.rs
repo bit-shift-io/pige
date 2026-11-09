@@ -194,6 +194,32 @@ pub fn build_mime_with_parts(
     message: &OutgoingMessage,
     attachments: &[SubmissionAttachment],
 ) -> Result<Vec<u8>, ComposeError> {
+    build_mime_inner(from, message, attachments, None, false)
+}
+
+/// Render the bytes offered to a provider whose API derives the envelope from
+/// the RFC 5322 headers (the Gmail `messages.send` and draft paths).
+///
+/// Unlike [`build_mime_with_parts`], the `Bcc` header is kept: the provider
+/// needs it to deliver blind recipients. Gmail processes and strips that header
+/// from the copies it delivers, so a To/Cc recipient never sees it. The caller
+/// supplies a stable Message-ID so a retry reuses the same operation evidence.
+pub fn build_mime_with_parts_for_api(
+    from: &Address,
+    message: &OutgoingMessage,
+    attachments: &[SubmissionAttachment],
+    message_id: &str,
+) -> Result<Vec<u8>, ComposeError> {
+    build_mime_inner(from, message, attachments, Some(message_id), true)
+}
+
+fn build_mime_inner(
+    from: &Address,
+    message: &OutgoingMessage,
+    attachments: &[SubmissionAttachment],
+    message_id: Option<&str>,
+    keep_bcc: bool,
+) -> Result<Vec<u8>, ComposeError> {
     let recipient_count = message.to.len() + message.cc.len() + message.bcc.len();
     if recipient_count == 0 {
         return Err(ComposeError::NoRecipients);
@@ -210,7 +236,11 @@ pub fn build_mime_with_parts(
     let mut builder = Message::builder()
         .from(from_mailbox)
         .date_now()
-        .message_id(Some(format!("<{}@{domain}>", uuid::Uuid::new_v4())))
+        .message_id(Some(
+            message_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("<{}@{domain}>", uuid::Uuid::new_v4())),
+        ))
         .header(MIME_VERSION_1_0)
         .subject(message.subject.clone());
 
@@ -229,6 +259,9 @@ pub fn build_mime_with_parts(
     }
     if !message.references.is_empty() {
         builder = builder.references(message.references.join(" "));
+    }
+    if keep_bcc {
+        builder = builder.keep_bcc();
     }
 
     let formatted = if attachments.is_empty() {
@@ -252,7 +285,15 @@ pub fn build_mime_with_parts(
                 .header(content_type)
                 .header(disposition);
             if let Some(content_id) = &attachment.content_id {
-                part = part.header(ContentId::from(content_id.clone()));
+                let content_id = content_id.trim();
+                // RFC 2045 Content-ID is an angle-bracketed address; accept a
+                // bare id from callers and normalize it once for every path.
+                let content_id = if content_id.starts_with('<') && content_id.ends_with('>') {
+                    content_id.to_string()
+                } else {
+                    format!("<{content_id}>")
+                };
+                part = part.header(ContentId::from(content_id));
             }
             multipart = multipart.singlepart(part.body(attachment.bytes.clone()));
         }

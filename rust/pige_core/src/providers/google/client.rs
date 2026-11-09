@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -246,6 +247,68 @@ impl GmailApi {
     ) -> Result<(), ProviderError> {
         self.client.delete(ctx, self.url(&["messages", id])?).await
     }
+
+    /// List the account's allowed From aliases. Submission validates the
+    /// configured sender against this list before rendering or sending.
+    pub(crate) async fn send_as(
+        &self,
+        ctx: &OperationContext,
+    ) -> Result<Vec<SendAs>, ProviderError> {
+        let response: ListSendAsResponse = self
+            .client
+            .get_json(ctx, self.url(&["settings", "sendAs"])?)
+            .await?;
+        Ok(response.send_as)
+    }
+
+    /// Send an RFC 5322 message natively. Gmail derives To/Cc/Bcc from the raw
+    /// headers, so the bytes (including Bcc) are passed through unchanged.
+    pub(crate) async fn send_message(
+        &self,
+        raw: &[u8],
+        ctx: &OperationContext,
+    ) -> Result<Message, ProviderError> {
+        let body = serde_json::json!({
+            "raw": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw),
+        });
+        self.client
+            .post_json_ambiguous(ctx, self.url(&["messages", "send"])?, &body)
+            .await
+    }
+
+    /// Search the authenticated account's mail. Reconciliation uses an exact
+    /// `rfc822msgid:` query; a subject match is never delivery evidence.
+    pub(crate) async fn search_messages(
+        &self,
+        query: &str,
+        ctx: &OperationContext,
+    ) -> Result<MessageListResponse, ProviderError> {
+        let url = with_query(
+            self.url(&["messages"])?,
+            &[
+                ("q", query.to_string()),
+                ("maxResults", "10".to_string()),
+                ("includeSpamTrash", "true".to_string()),
+            ],
+        );
+        self.client.get_json(ctx, url).await
+    }
+
+    /// Header-only metadata for an explicit header set. Reconciliation needs
+    /// `Message-ID` and label membership, not the full message.
+    pub(crate) async fn message_metadata_headers(
+        &self,
+        id: &str,
+        headers: &[&str],
+        ctx: &OperationContext,
+    ) -> Result<Message, ProviderError> {
+        let mut query = vec![("format", "metadata".to_string())];
+        for header in headers {
+            query.push(("metadataHeaders", (*header).to_string()));
+        }
+        let url = with_query(self.url(&["messages", id])?, &query);
+        self.client.get_json(ctx, url).await
+    }
 }
 
 pub(crate) fn with_query(mut url: Url, query: &[(&str, String)]) -> Url {
@@ -339,6 +402,39 @@ impl GoogleClient {
         decode_json(&bytes)
     }
 
+    /// POST a non-idempotent write (message submission).
+    ///
+    /// A connection that was never established is a safe `Offline` retry. Once
+    /// the request may have reached Google, a timeout, transport failure, 5xx,
+    /// or unreadable success body becomes [`ErrorKind::UnknownWriteOutcome`]:
+    /// the outbox must surface uncertainty instead of resending. A 4xx is a
+    /// definite provider rejection.
+    async fn post_json_ambiguous<B: Serialize, T: DeserializeOwned>(
+        &self,
+        ctx: &OperationContext,
+        url: Url,
+        body: &B,
+    ) -> Result<T, ProviderError> {
+        let bytes = self
+            .send_with(
+                ApiSurface::Gmail,
+                ctx,
+                reqwest::Method::POST,
+                url,
+                Some(serde_json::to_value(body).map_err(|error| {
+                    ProviderError::transient("could not encode a Gmail request")
+                        .with_source_detail(error.to_string())
+                })?),
+                true,
+            )
+            .await?;
+        decode_json(&bytes).map_err(|_| {
+            ProviderError::unknown_write_outcome(
+                "Google accepted the request but its response could not be read",
+            )
+        })
+    }
+
     async fn post_empty(&self, ctx: &OperationContext, url: Url) -> Result<(), ProviderError> {
         self.send(ApiSurface::Gmail, ctx, reqwest::Method::POST, url, None)
             .await
@@ -358,6 +454,18 @@ impl GoogleClient {
         method: reqwest::Method,
         url: Url,
         body: Option<Value>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.send_with(surface, ctx, method, url, body, false).await
+    }
+
+    async fn send_with(
+        &self,
+        surface: ApiSurface,
+        ctx: &OperationContext,
+        method: reqwest::Method,
+        url: Url,
+        body: Option<Value>,
+        ambiguous: bool,
     ) -> Result<Vec<u8>, ProviderError> {
         ctx.ensure_active()?;
         let token = self.access_token(ctx).await?;
@@ -385,7 +493,7 @@ impl GoogleClient {
             _ = ctx.cancellation.cancelled() => {
                 return Err(ProviderError::cancelled("operation cancelled"));
             }
-            result = request.send() => result.map_err(map_transport_error)?,
+            result = request.send() => result.map_err(|error| map_transport_error(error, ambiguous))?,
         };
         let status = response.status();
         let retry_after = response
@@ -401,15 +509,22 @@ impl GoogleClient {
             }
             result = tokio::time::timeout_at(ctx.deadline, response.bytes()) => {
                 match result {
-                    Ok(result) => result.map_err(map_transport_error)?,
-                    Err(_) => return Err(ProviderError::transient("operation deadline exceeded")),
+                    Ok(result) => result.map_err(|error| map_transport_error(error, ambiguous))?,
+                    Err(_) if ambiguous => {
+                        return Err(ProviderError::unknown_write_outcome(
+                            "Google did not confirm whether the message was accepted",
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(ProviderError::transient("operation deadline exceeded"));
+                    }
                 }
             }
         };
         if status.is_success() {
             Ok(bytes.to_vec())
         } else {
-            Err(map_status(surface, status, retry_after, &bytes))
+            Err(map_status(surface, status, retry_after, &bytes, ambiguous))
         }
     }
 }
@@ -421,10 +536,15 @@ fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProviderError> {
     })
 }
 
-fn map_transport_error(error: reqwest::Error) -> ProviderError {
+fn map_transport_error(error: reqwest::Error, ambiguous: bool) -> ProviderError {
     let detail = error.to_string();
     if error.is_connect() {
+        // No connection was established, so nothing reached the provider.
         ProviderError::offline("Google could not be reached").with_source_detail(detail)
+    } else if ambiguous {
+        // The request may have been written before the connection failed.
+        ProviderError::unknown_write_outcome("Google did not confirm the write outcome")
+            .with_source_detail(detail)
     } else if error.is_timeout() {
         ProviderError::transient("Google did not respond in time").with_source_detail(detail)
     } else {
@@ -437,6 +557,7 @@ fn map_status(
     status: reqwest::StatusCode,
     retry_after: Option<Duration>,
     body: &[u8],
+    ambiguous: bool,
 ) -> ProviderError {
     let detail = String::from_utf8_lossy(body).to_string();
     let value = serde_json::from_slice::<Value>(body).ok();
@@ -482,32 +603,62 @@ fn map_status(
             .with_source_detail(detail);
     }
 
-    let error = match status {
-        reqwest::StatusCode::UNAUTHORIZED => {
-            ProviderError::reauthenticate("Google sign-in has expired")
-        }
-        reqwest::StatusCode::FORBIDDEN => {
-            // Google returns 403 for permission denial *and* for quota/rate
-            // exhaustion. Reasons are not case-normalized (`RATE_LIMIT_EXCEEDED`
-            // is common), and a quota blip must not permanently disable a
-            // contact source as if consent had been revoked.
-            if rate_limited {
-                ProviderError::rate_limited(retry_after.unwrap_or(Duration::from_secs(1)))
-            } else {
-                ProviderError::forbidden("Google did not permit this request")
+    let error = if ambiguous {
+        match status {
+            reqwest::StatusCode::UNAUTHORIZED => {
+                ProviderError::reauthenticate("Google sign-in has expired")
             }
+            reqwest::StatusCode::FORBIDDEN if rate_limited => {
+                ProviderError::rate_limited(retry_after.unwrap_or(Duration::from_secs(1)))
+            }
+            reqwest::StatusCode::FORBIDDEN => {
+                ProviderError::forbidden("Google rejected the message")
+            }
+            reqwest::StatusCode::NOT_FOUND => {
+                ProviderError::not_found("Google rejected the message")
+            }
+            reqwest::StatusCode::CONFLICT | reqwest::StatusCode::PRECONDITION_FAILED => {
+                ProviderError::conflict("the Google message changed")
+            }
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                ProviderError::rate_limited(retry_after.unwrap_or(Duration::from_secs(1)))
+            }
+            status if status.is_server_error() => ProviderError::unknown_write_outcome(
+                "Google did not confirm whether the message was accepted",
+            ),
+            // Any other 4xx is a definite refusal of this submission.
+            _ => ProviderError::forbidden("Google rejected the message"),
         }
-        reqwest::StatusCode::NOT_FOUND => ProviderError::not_found("the Google item was not found"),
-        reqwest::StatusCode::CONFLICT | reqwest::StatusCode::PRECONDITION_FAILED => {
-            ProviderError::conflict("the Google item changed")
+    } else {
+        match status {
+            reqwest::StatusCode::UNAUTHORIZED => {
+                ProviderError::reauthenticate("Google sign-in has expired")
+            }
+            reqwest::StatusCode::FORBIDDEN => {
+                // Google returns 403 for permission denial *and* for quota/rate
+                // exhaustion. Reasons are not case-normalized (`RATE_LIMIT_EXCEEDED`
+                // is common), and a quota blip must not permanently disable a
+                // contact source as if consent had been revoked.
+                if rate_limited {
+                    ProviderError::rate_limited(retry_after.unwrap_or(Duration::from_secs(1)))
+                } else {
+                    ProviderError::forbidden("Google did not permit this request")
+                }
+            }
+            reqwest::StatusCode::NOT_FOUND => {
+                ProviderError::not_found("the Google item was not found")
+            }
+            reqwest::StatusCode::CONFLICT | reqwest::StatusCode::PRECONDITION_FAILED => {
+                ProviderError::conflict("the Google item changed")
+            }
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                ProviderError::rate_limited(retry_after.unwrap_or(Duration::from_secs(1)))
+            }
+            status if status.is_server_error() => {
+                ProviderError::transient("Google had a temporary problem")
+            }
+            _ => ProviderError::transient("Google rejected the request"),
         }
-        reqwest::StatusCode::TOO_MANY_REQUESTS => {
-            ProviderError::rate_limited(retry_after.unwrap_or(Duration::from_secs(1)))
-        }
-        status if status.is_server_error() => {
-            ProviderError::transient("Google had a temporary problem")
-        }
-        _ => ProviderError::transient("Google rejected the request"),
     };
     error.with_source_detail(detail)
 }
@@ -542,6 +693,26 @@ pub(crate) struct ProfileResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessageRef {
     pub(crate) id: String,
+}
+
+/// One Gmail `settings.sendAs` alias. Only the submission-relevant fields are
+/// decoded; no alias setting is ever written by the adapter.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendAs {
+    #[serde(default)]
+    pub(crate) send_as_email: Option<String>,
+    #[serde(default)]
+    pub(crate) is_primary: Option<bool>,
+    #[serde(default)]
+    pub(crate) verification_status: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ListSendAsResponse {
+    #[serde(default)]
+    pub(crate) send_as: Vec<SendAs>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]

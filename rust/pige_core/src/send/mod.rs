@@ -10,8 +10,8 @@ use crate::mail::Address;
 use crate::transport::{SendError, SmtpSender};
 
 pub use compose::{
-    ComposeError, build_mime, build_mime_with_parts, forward_message, forward_subject, quote_body,
-    raw_message_id, reply_message, reply_subject,
+    ComposeError, build_mime, build_mime_with_parts, build_mime_with_parts_for_api,
+    forward_message, forward_subject, quote_body, raw_message_id, reply_message, reply_subject,
 };
 pub use outbox::{
     OutboxEntry, OutboxId, OutboxReport, OutboxState, discard_draft, drafts, flush_outbox,

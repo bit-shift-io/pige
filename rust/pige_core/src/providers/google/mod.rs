@@ -13,6 +13,7 @@ mod mailbox;
 mod mutations;
 mod normalize;
 mod people;
+mod submission;
 mod sync;
 
 use std::collections::HashMap;
@@ -32,6 +33,7 @@ use crate::providers::{
 pub use mailbox::GmailMailbox;
 pub use mutations::GmailMutations;
 pub use people::{GOOGLE_OTHER_CONTACTS_SOURCE, GOOGLE_SAVED_CONTACTS_SOURCE, GoogleAddressBook};
+pub use submission::GmailSubmission;
 pub use sync::{GmailSync, cursor_stage, request_collection};
 
 pub use android::{
@@ -185,9 +187,10 @@ impl ProviderFactory for GoogleProviderFactory {
                 // v1 holds gmail.modify, which cannot permanently delete.
                 permanent_delete: false,
             },
-            // Submission is G4. Contacts are read-only in v1: People lists are
-            // full snapshots with deletion metadata, and compose remains local.
-            submission: false,
+            // Gmail owns the Sent copy. Contacts are read-only in v1: People
+            // lists are full snapshots with deletion metadata, and compose
+            // remains local.
+            submission: true,
             contacts: ContactCapabilities {
                 read: true,
                 incremental_sync: true,
@@ -202,7 +205,8 @@ impl ProviderFactory for GoogleProviderFactory {
         session.mailbox = Some(Box::new(GmailMailbox::new(client.clone(), user)));
         session.sync = Some(Box::new(GmailSync::new(client.clone(), user)));
         session.address_book = Some(Box::new(GoogleAddressBook::new(client.clone(), user)));
-        session.mutations = Some(Box::new(GmailMutations::new(client, user)));
+        session.mutations = Some(Box::new(GmailMutations::new(client.clone(), user)));
+        session.submission = Some(Box::new(GmailSubmission::new(client, account.clone())));
         Ok(session)
     }
 }
