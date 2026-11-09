@@ -33,7 +33,9 @@ use crate::mail::{
     thread::participants_of,
 };
 use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
-use crate::providers::{ProviderCapabilities, ProviderFactory, RemoteAttachmentId};
+use crate::providers::{
+    OperationContext, ProviderCapabilities, ProviderFactory, RemoteAttachmentId,
+};
 use crate::search::{SearchHit, SearchScope};
 use crate::send::{
     self, OutboxEntry, OutboxId, OutgoingMessage, compose::forward_message, compose::reply_message,
@@ -44,7 +46,7 @@ use crate::sync::scheduler::AccountScheduler;
 use crate::transport::{RemoteFolder, UidRange};
 
 use body::document_from_body;
-use mailbox::{INTERACTIVE_TIMEOUT, SYNC_TIMEOUT, scheduler_message};
+use mailbox::{INTERACTIVE_TIMEOUT, SYNC_TIMEOUT, open_session, scheduler_message};
 
 /// How many change pages one account sync pass may apply before it returns the
 /// account gate. A bounded budget keeps background sync from occupying an
@@ -1716,6 +1718,13 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
                 .store
                 .oldest_uid_in_folder(folder)
                 .map_err(|error| format!("read oldest uid: {error}"))?;
+            // The context and gate are captured here (under the state lock) so
+            // the backfill can run through `AccountScheduler` exactly like a
+            // sync page, after every lock is released.
+            let ctx = state
+                .sessions
+                .context(&account.id, SYNC_TIMEOUT)
+                .map_err(|error| error.safe_message)?;
             let sender = state.events.clone();
             (
                 Some(BackfillRequest {
@@ -1724,6 +1733,8 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
                     folder: folder_row,
                     oldest,
                     limit,
+                    ctx,
+                    scheduler: state.scheduler.clone(),
                 }),
                 sender,
             )
@@ -1738,20 +1749,33 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
     let store = Store::open(database_path(&request.config.data_dir))
         .map_err(|error| format!("open backfill store: {error}"))?;
 
-    match backfill_older(
-        &request.config,
-        &store,
-        &request.account,
-        &request.folder,
-        request.oldest,
-    )
-    .await
-    {
+    // The backfill reads remote headers and durably upserts them, so it holds
+    // the account's gate like a sync pass: a concurrent mutation cannot
+    // interleave its read/apply, and a stale page cannot reverse a mutation
+    // that already completed. (The provider contract has no neutral
+    // "older-than-UID" read; see the note on [`backfill_older`].)
+    let BackfillRequest {
+        config,
+        account,
+        folder: backfill_folder,
+        oldest,
+        limit,
+        ctx,
+        scheduler,
+    } = request;
+    let operation = backfill_older(&config, &store, &account, &backfill_folder, oldest);
+    let outcome = scheduler
+        .run_interactive(&ctx, operation)
+        .await
+        .map_err(scheduler_message)
+        .and_then(|stored| stored);
+
+    match outcome {
         Ok((stored, server_more)) => {
             let mut guard = lock_state();
             if let Some(state) = guard.as_mut()
-                && state.selected_folder.as_ref() == Some(&request.folder.id)
-                && state.conversation_limit == request.limit
+                && state.selected_folder.as_ref() == Some(&backfill_folder.id)
+                && state.conversation_limit == limit
             {
                 state.conversation_limit = state.conversation_limit.saturating_add(stored as u32);
                 state.server_more = Some(server_more);
@@ -1839,15 +1863,20 @@ pub async fn prefetch_bodies() {
             return;
         }
     };
-    let mut groups = HashMap::<_, Vec<_>>::new();
+    // One authenticated session for the whole per-account batch: opening a
+    // session per candidate amplified a prefetch pass into hundreds of logins,
+    // which Gmail's per-account connection limit rejects outright. The batch
+    // reuses the session; only the (unauthenticated) durable caching stays
+    // per candidate.
+    let mut groups = HashMap::<AccountId, Vec<_>>::new();
     for candidate in candidates {
         groups
-            .entry((candidate.account_id.clone(), candidate.folder_id.clone()))
+            .entry(candidate.account_id.clone())
             .or_default()
             .push(candidate);
     }
     futures::stream::iter(groups)
-        .map(|((account_id, folder_id), candidates)| {
+        .map(|(account_id, candidates)| {
             let store = &store;
             let config = &config;
             let sessions = &sessions;
@@ -1855,6 +1884,11 @@ pub async fn prefetch_bodies() {
             async move {
                 let result: Result<(), String> = async {
                     let account = find_account(store, &account_id)?;
+                    let ctx = sessions
+                        .context(&account_id, INTERACTIVE_TIMEOUT)
+                        .map_err(|error| error.safe_message)?;
+                    let providers = config.providers.clone();
+                    let mut session = open_session(&providers, &account, &ctx).await?;
                     for candidate in candidates {
                         // A removed/replaced account or reset invalidates this batch.
                         {
@@ -1883,13 +1917,8 @@ pub async fn prefetch_bodies() {
                         else {
                             continue;
                         };
-                        let Ok(ctx) = sessions.context(&account_id, INTERACTIVE_TIMEOUT) else {
-                            break;
-                        };
-                        let providers = config.providers.clone();
-                        let account = account.clone();
                         let operation =
-                            async { body::fetch_body(&providers, &account, &ctx, &remote).await };
+                            async { body::fetch_body_with(&mut session, &ctx, &remote).await };
                         let content = match scheduler.run_background(&ctx, operation).await {
                             Ok(Some(Ok(content))) => content,
                             // A busy gate skips this candidate; the next quiet
@@ -1923,7 +1952,6 @@ pub async fn prefetch_bodies() {
                 if let Err(error) = result {
                     log::warn!("prefetch {account_id}: {error}");
                 }
-                let _ = folder_id;
             }
         })
         .buffer_unordered(PREFETCH_CONCURRENCY)
@@ -2599,6 +2627,9 @@ struct BackfillRequest {
     /// Visible page size when the backfill started; used to detect a selection
     /// or paging change while the network wait was in flight.
     limit: u32,
+    /// The account-bound context whose gate the backfill runs under.
+    ctx: OperationContext,
+    scheduler: Arc<AccountScheduler>,
 }
 
 fn locate_folder(store: &Store, id: &FolderId) -> Result<(Account, Folder), String> {
@@ -2618,6 +2649,36 @@ fn locate_folder(store: &Store, id: &FolderId) -> Result<(Account, Folder), Stri
 
 /// Fetch up to one page of headers below `oldest`, storing them with the sync
 /// engine's temporary per-message thread ids. Returns `(stored, server_more)`.
+///
+/// **Contract gap (F8 follow-up).** This is the one remaining mail read that
+/// still speaks the protocol transport directly. The provider contract has no
+/// neutral "older page" primitive: [`SyncService`](crate::providers::SyncService)
+/// pages *newer* mail from a durable cursor, and
+/// [`MailboxService::history`](crate::providers::MailboxService::history) is a
+/// newest-first crawl across every mailbox that cannot target one collection
+/// below a UID or UIDVALIDITY. The caller gates this call under
+/// `AccountScheduler`, so it cannot interleave a mutation, but it should
+/// eventually route through the boundary.
+///
+/// The minimal neutral addition would be a mailbox-scoped history request, for
+/// example:
+///
+/// ```ignore
+/// // In HistoryRequest (F1-owned), add an optional collection scope and an
+/// // exclusive "older than" bound in provider-neutral terms:
+/// pub struct HistoryRequest {
+///     pub cursor: Option<ProviderCursor>,
+///     pub page_size: u32,
+///     pub collection: Option<RemoteCollectionId>,
+///     pub before: Option<RemoteMessageId>, // "strictly older than this message"
+/// }
+/// ```
+///
+/// With `collection` set and `before` naming the oldest cached message, the
+/// adapter can translate the bound into its own UID space internally (and
+/// reject a UIDVALIDITY change as `CursorInvalid`) without the application ever
+/// inventing a UID. That request shape is an F1 contract change and out of this
+/// task's file scope.
 async fn backfill_older(
     config: &Config,
     store: &Store,

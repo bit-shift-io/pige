@@ -16,11 +16,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::account::Account;
 use crate::auth::secrets::{
     CredentialSecretRepository, SecretEnvelope, SecretRepository, StoredCredentials,
 };
+use crate::mail::{Flags, Uid};
 use crate::platform::{CredentialStore, TransportFactory};
 use crate::providers::error::ProviderError;
 use crate::providers::registry::ProviderRegistry;
@@ -28,7 +30,10 @@ use crate::providers::traits::{ProviderFactory, ProviderSession};
 use crate::providers::types::{
     IMAP_SMTP_PROVIDER, MutationCapabilities, OperationContext, ProviderCapabilities,
 };
-use crate::transport::{Capabilities, MailTransport};
+use crate::transport::{
+    Capabilities, FlagOp, FolderState, MailTransport, RemoteFolder, RemoteMessage, TransportError,
+    UidRange,
+};
 
 pub use mailbox::ImapMailbox;
 pub use mutations::ImapMutations;
@@ -147,28 +152,129 @@ impl ProviderFactory for ImapProviderFactory {
             ));
         }
 
-        // Each service owns its own connection: a service never borrows another
-        // service's mutable connection. The first connection also probes the
-        // server's capability set, which now drives the advertised mutations.
-        let mut sync_transport = self.open_transport(account).await?;
-        let server = sync_transport
-            .capabilities()
-            .await
-            .map_err(transport_error)?;
+        // Authenticate once and probe the server's capability set with the same
+        // connection the services will use. Opening three connections (one per
+        // service) amplified every interaction into three logins — and, against
+        // Gmail's per-account connection limits, made a body-prefetch batch
+        // unusable. The services share this one connection through
+        // [`SharedTransport`]; only one capability is ever driven per session,
+        // so there is no borrow conflict between services.
+        let mut transport = self.open_transport(account).await?;
+        let server = transport.capabilities().await.map_err(transport_error)?;
         // Re-check after the connection attempt; the account may have been
         // invalidated while it was in flight.
         ctx.ensure_active()?;
 
-        let mailbox_transport = self.open_transport(account).await?;
-        let mutation_transport = self.open_transport(account).await?;
+        let shared = Arc::new(AsyncMutex::new(transport));
 
         let mut session = ProviderSession::new(imap_capabilities(server)).with_provider(
             crate::providers::types::ProviderId::from(crate::providers::IMAP_SMTP_PROVIDER),
         );
-        session.mailbox = Some(Box::new(ImapMailbox::new(mailbox_transport)));
-        session.sync = Some(Box::new(ImapSync::new(sync_transport)));
-        session.mutations = Some(Box::new(ImapMutations::new(mutation_transport, server)));
+        session.mailbox = Some(Box::new(ImapMailbox::new(Box::new(SharedTransport::new(
+            shared.clone(),
+        )))));
+        session.sync = Some(Box::new(ImapSync::new(Box::new(SharedTransport::new(
+            shared.clone(),
+        )))));
+        session.mutations = Some(Box::new(ImapMutations::new(
+            Box::new(SharedTransport::new(shared)),
+            server,
+        )));
         Ok(session)
+    }
+}
+
+/// A [`MailTransport`] shared by every capability service of one session.
+///
+/// Opening a session authenticates exactly once; the mailbox, sync, and
+/// mutation services each hold a handle to this same connection and take it
+/// under the mutex for the duration of one call. A session is only ever driven
+/// through a single capability at a time (a caller opens a session and uses one
+/// service), so sharing the connection avoids three separate logins per open
+/// without a borrow conflict between services.
+struct SharedTransport(Arc<AsyncMutex<Box<dyn MailTransport>>>);
+
+impl SharedTransport {
+    fn new(transport: Arc<AsyncMutex<Box<dyn MailTransport>>>) -> Self {
+        Self(transport)
+    }
+}
+
+#[async_trait]
+impl MailTransport for SharedTransport {
+    async fn capabilities(&mut self) -> Result<Capabilities, TransportError> {
+        self.0.lock().await.capabilities().await
+    }
+
+    async fn list_folders(&mut self) -> Result<Vec<RemoteFolder>, TransportError> {
+        self.0.lock().await.list_folders().await
+    }
+
+    async fn select(&mut self, folder: &RemoteFolder) -> Result<FolderState, TransportError> {
+        self.0.lock().await.select(folder).await
+    }
+
+    async fn fetch_headers(
+        &mut self,
+        range: UidRange,
+    ) -> Result<Vec<RemoteMessage>, TransportError> {
+        self.0.lock().await.fetch_headers(range).await
+    }
+
+    async fn list_uids(&mut self) -> Result<Vec<Uid>, TransportError> {
+        self.0.lock().await.list_uids().await
+    }
+
+    async fn fetch_learning_headers(
+        &mut self,
+        uids: &[Uid],
+    ) -> Result<Vec<RemoteMessage>, TransportError> {
+        self.0.lock().await.fetch_learning_headers(uids).await
+    }
+
+    async fn fetch_texts(
+        &mut self,
+        uids: &[Uid],
+        max_bytes: usize,
+    ) -> Result<Vec<(Uid, String)>, TransportError> {
+        self.0.lock().await.fetch_texts(uids, max_bytes).await
+    }
+
+    async fn fetch_body(&mut self, uid: Uid) -> Result<Vec<u8>, TransportError> {
+        self.0.lock().await.fetch_body(uid).await
+    }
+
+    async fn fetch_flags(&mut self, uids: &[Uid]) -> Result<Vec<(Uid, Flags)>, TransportError> {
+        self.0.lock().await.fetch_flags(uids).await
+    }
+
+    async fn search(&mut self, query: &str) -> Result<Vec<Uid>, TransportError> {
+        self.0.lock().await.search(query).await
+    }
+
+    async fn store_flags(&mut self, uids: &[Uid], flags: FlagOp) -> Result<(), TransportError> {
+        self.0.lock().await.store_flags(uids, flags).await
+    }
+
+    async fn move_messages(&mut self, uids: &[Uid], dest: &str) -> Result<(), TransportError> {
+        self.0.lock().await.move_messages(uids, dest).await
+    }
+
+    async fn copy_messages(&mut self, uids: &[Uid], dest: &str) -> Result<(), TransportError> {
+        self.0.lock().await.copy_messages(uids, dest).await
+    }
+
+    async fn delete_messages(&mut self, uids: &[Uid]) -> Result<(), TransportError> {
+        self.0.lock().await.delete_messages(uids).await
+    }
+
+    async fn append(
+        &mut self,
+        folder: &str,
+        message: &[u8],
+        flags: Flags,
+    ) -> Result<(), TransportError> {
+        self.0.lock().await.append(folder, message, flags).await
     }
 }
 

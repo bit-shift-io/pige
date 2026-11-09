@@ -112,8 +112,15 @@ fn primary_actions(app: &App) -> Vec<ReaderAction> {
         context.current_kind,
         context.has_archive,
     );
-    let trash = context.has_trash && context.current_kind != FolderKind::Trash;
-    let permanent = context.current_kind == FolderKind::Trash || !context.has_trash;
+    // A folder being present is not enough: the provider must actually
+    // implement the mutation. Gmail reports a Trash label but cannot permanently
+    // delete (its per-label UIDs cannot name a message's canonical home), so a
+    // Trash folder alone must not offer "Delete permanently".
+    let trash = context.capabilities.mutations.trash
+        && context.has_trash
+        && context.current_kind != FolderKind::Trash;
+    let permanent = context.capabilities.mutations.permanent_delete
+        && (context.current_kind == FolderKind::Trash || !context.has_trash);
     let read = detail
         .messages
         .first()

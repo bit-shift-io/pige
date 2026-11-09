@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::mail::{AttachmentDisposition, AttachmentPart, MessageId, ThreadId};
@@ -68,69 +68,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-
-        let mut existing = Vec::new();
-        {
-            let mut statement =
-                tx.prepare("SELECT part_id FROM attachments WHERE message_id = ?1")?;
-            let mut rows = statement.query([&message_id.0])?;
-            while let Some(row) = rows.next()? {
-                existing.push(row.get::<_, String>(0)?);
-            }
-        }
-
-        for part in parts {
-            tx.execute(
-                "INSERT INTO attachments (
-                     id, message_id, part_id, filename, content_type, size,
-                     content_id, disposition
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(message_id, part_id) DO UPDATE SET
-                     filename = excluded.filename,
-                     content_type = excluded.content_type,
-                     size = excluded.size,
-                     content_id = excluded.content_id,
-                     disposition = excluded.disposition",
-                params![
-                    Uuid::new_v4().to_string(),
-                    message_id.0,
-                    part.part_id,
-                    part.filename,
-                    part.content_type,
-                    i64::try_from(part.size).unwrap_or(i64::MAX),
-                    part.content_id,
-                    part.disposition.as_str(),
-                ],
-            )?;
-        }
-
-        for part_id in existing {
-            if !parts.iter().any(|part| part.part_id == part_id) {
-                tx.execute(
-                    "DELETE FROM attachments WHERE message_id = ?1 AND part_id = ?2",
-                    params![message_id.0, part_id],
-                )?;
-            }
-        }
-
-        // Sync only writes headers, so it cannot know whether a message has
-        // user-visible attachments. Recompute the flag from the metadata we
-        // just stored, and refresh the thread aggregate that the list reads.
-        let thread_id: Option<String> = tx
-            .query_row(
-                "SELECT thread_id FROM messages WHERE id = ?1",
-                [&message_id.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        tx.execute(
-            "UPDATE messages SET has_attachments = ?1 WHERE id = ?2",
-            params![!parts.is_empty(), message_id.0],
-        )?;
-        if let Some(thread_id) = thread_id {
-            recompute_thread_on(&tx, &ThreadId(thread_id))?;
-        }
-
+        store_attachments_on(&tx, message_id, parts)?;
         tx.commit()?;
         Ok(())
     }
@@ -139,6 +77,10 @@ impl Store {
     /// including each part's stable *remote* id. The local MIME `part_id` keeps
     /// naming the row, while the remote id is what an `attachment` fetch must
     /// send back to the provider.
+    ///
+    /// The metadata upsert and the remote-id writes commit as one transaction,
+    /// so a reader can never observe a part with metadata but no remote id (or
+    /// the reverse) if the process dies between them.
     pub fn store_provider_attachments(
         &self,
         message_id: &MessageId,
@@ -155,10 +97,18 @@ impl Store {
                 disposition: descriptor.disposition,
             })
             .collect();
-        self.store_attachments(message_id, &parts)?;
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        store_attachments_on(&tx, message_id, &parts)?;
         for descriptor in descriptors {
-            self.set_attachment_remote_id(message_id, &descriptor.part_id, &descriptor.remote_id)?;
+            set_attachment_remote_id_on(
+                &tx,
+                message_id,
+                &descriptor.part_id,
+                &descriptor.remote_id,
+            )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -169,11 +119,7 @@ impl Store {
         part_id: &str,
         remote_id: &RemoteAttachmentId,
     ) -> Result<(), StoreError> {
-        self.connection().execute(
-            "UPDATE attachments SET remote_id = ?1 WHERE message_id = ?2 AND part_id = ?3",
-            params![remote_id.as_str(), message_id.0, part_id],
-        )?;
-        Ok(())
+        set_attachment_remote_id_on(&self.connection(), message_id, part_id, remote_id)
     }
 
     /// The provider remote id recorded for an attachment part, when a provider
@@ -210,6 +156,92 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Upsert one message's attachment metadata on `conn`, which may be a
+/// transaction. Removes rows for parts that disappeared from the MIME tree and
+/// recomputes the message/thread attachment flags.
+fn store_attachments_on(
+    conn: &Connection,
+    message_id: &MessageId,
+    parts: &[AttachmentPart],
+) -> Result<(), StoreError> {
+    let mut existing = Vec::new();
+    {
+        let mut statement = conn.prepare("SELECT part_id FROM attachments WHERE message_id = ?1")?;
+        let mut rows = statement.query([&message_id.0])?;
+        while let Some(row) = rows.next()? {
+            existing.push(row.get::<_, String>(0)?);
+        }
+    }
+
+    for part in parts {
+        conn.execute(
+            "INSERT INTO attachments (
+                 id, message_id, part_id, filename, content_type, size,
+                 content_id, disposition
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(message_id, part_id) DO UPDATE SET
+                 filename = excluded.filename,
+                 content_type = excluded.content_type,
+                 size = excluded.size,
+                 content_id = excluded.content_id,
+                 disposition = excluded.disposition",
+            params![
+                Uuid::new_v4().to_string(),
+                message_id.0,
+                part.part_id,
+                part.filename,
+                part.content_type,
+                i64::try_from(part.size).unwrap_or(i64::MAX),
+                part.content_id,
+                part.disposition.as_str(),
+            ],
+        )?;
+    }
+
+    for part_id in existing {
+        if !parts.iter().any(|part| part.part_id == part_id) {
+            conn.execute(
+                "DELETE FROM attachments WHERE message_id = ?1 AND part_id = ?2",
+                params![message_id.0, part_id],
+            )?;
+        }
+    }
+
+    // Sync only writes headers, so it cannot know whether a message has
+    // user-visible attachments. Recompute the flag from the metadata we
+    // just stored, and refresh the thread aggregate that the list reads.
+    let thread_id: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM messages WHERE id = ?1",
+            [&message_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    conn.execute(
+        "UPDATE messages SET has_attachments = ?1 WHERE id = ?2",
+        params![!parts.is_empty(), message_id.0],
+    )?;
+    if let Some(thread_id) = thread_id {
+        recompute_thread_on(conn, &ThreadId(thread_id))?;
+    }
+    Ok(())
+}
+
+/// Record one already-stored attachment part's provider remote id on `conn`,
+/// which may be a transaction.
+fn set_attachment_remote_id_on(
+    conn: &Connection,
+    message_id: &MessageId,
+    part_id: &str,
+    remote_id: &RemoteAttachmentId,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE attachments SET remote_id = ?1 WHERE message_id = ?2 AND part_id = ?3",
+        params![remote_id.as_str(), message_id.0, part_id],
+    )?;
+    Ok(())
 }
 
 fn part_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentPart> {

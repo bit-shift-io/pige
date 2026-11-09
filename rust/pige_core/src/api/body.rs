@@ -13,7 +13,8 @@ use crate::account::Account;
 use crate::html::{MailDocument, parse_html, plain_text_document};
 use crate::mail::{MessageId, snippet_from_parts};
 use crate::providers::{
-    BodyContent, OperationContext, ProviderFactory, RemoteAttachmentId, RemoteMessageId,
+    BodyContent, OperationContext, ProviderFactory, ProviderSession, RemoteAttachmentId,
+    RemoteMessageId,
 };
 use crate::store::{Body, Store};
 
@@ -34,6 +35,17 @@ pub(crate) async fn fetch_body(
     remote: &RemoteMessageId,
 ) -> Result<BodyContent, String> {
     let mut session = open_session(providers, account, ctx).await?;
+    fetch_body_with(&mut session, ctx, remote).await
+}
+
+/// Fetch one normalized body through an already-open session. A batch (the
+/// body prefetch) opens one session per account and reuses it here, so the
+/// connection count is bounded by the batch rather than the message count.
+pub(crate) async fn fetch_body_with(
+    session: &mut ProviderSession,
+    ctx: &OperationContext,
+    remote: &RemoteMessageId,
+) -> Result<BodyContent, String> {
     let service = session.mailbox_service().map_err(provider_message)?;
     service.body(remote, ctx).await.map_err(provider_message)
 }

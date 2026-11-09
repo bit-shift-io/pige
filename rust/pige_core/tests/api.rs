@@ -1454,6 +1454,62 @@ async fn prefetch_marks_unreadable_bodies_and_does_not_refetch() {
 }
 
 #[tokio::test]
+async fn prefetch_opens_one_session_for_the_whole_account_batch() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account_id = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+
+    let store = harness.open_store();
+    let inbox = folder("inbox", &account_id, "INBOX", FolderKind::Inbox, 0);
+    store.upsert_folder(&inbox).unwrap();
+    // Five independent conversations are all candidates in one prefetch pass.
+    let mut bodies = HashMap::new();
+    for uid in 1..=5u32 {
+        let mut message = stored_message(&inbox, uid);
+        message.id = MessageId(format!("inbox-message-{uid}"));
+        message.thread_id = ThreadId(format!("thread-{uid}"));
+        store.upsert_message(&message).unwrap();
+        bodies.insert(
+            Uid(uid),
+            format!("Subject: {uid}\r\n\r\nbody {uid}").into_bytes(),
+        );
+    }
+    harness.factory.add_transport(
+        account_id.clone(),
+        FakeTransport {
+            folders: vec![RemoteFolder {
+                name: "INBOX".to_string(),
+                delimiter: Some("/".to_string()),
+                kind: FolderKind::Inbox,
+            }],
+            bodies: HashMap::from([("INBOX".to_string(), bodies)]),
+            ..FakeTransport::default()
+        },
+    );
+
+    api::prefetch_bodies().await;
+
+    let transport = harness.factory.transport(&account_id).await.unwrap();
+    assert_eq!(
+        transport.fetch_body_calls.len(),
+        5,
+        "every candidate is still fetched exactly once"
+    );
+    assert_eq!(
+        harness.factory.imap_open_count(&account_id),
+        1,
+        "prefetch must open one authenticated session for the whole batch, \
+         not one per candidate; got {} opens",
+        harness.factory.imap_open_count(&account_id)
+    );
+}
+
+#[tokio::test]
 async fn prefetch_gives_up_quietly_without_a_transport() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
@@ -2040,6 +2096,84 @@ async fn backfill_result_is_discarded_when_selection_changes() {
     assert_eq!(snapshot.selected_folder.as_ref(), Some(&archive.id));
     assert_eq!(snapshot.conversations.len(), 300);
     assert!(snapshot.has_more);
+}
+
+#[tokio::test]
+async fn load_older_holds_the_account_gate_against_a_mutation() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+
+    let added = api::add_account(input("Personal", "ada@example.com"))
+        .await
+        .expect("add account");
+    let account_id = added.accounts[0].id.clone();
+
+    let store = harness.open_store();
+    let inbox = Folder {
+        id: FolderId("inbox".to_string()),
+        account_id: account_id.clone(),
+        name: "INBOX".to_string(),
+        delimiter: Some("/".to_string()),
+        kind: FolderKind::Inbox,
+        unread: 0,
+        total: 400,
+        uidvalidity: Some(1),
+        uidnext: Some(401),
+    };
+    store.upsert_folder(&inbox).unwrap();
+    // One cached, unseen message at UID 400: `load_older` finds the cache
+    // exhausted and backfills headers below it.
+    store.upsert_message(&stored_message(&inbox, 400)).unwrap();
+
+    let started = Arc::new(Semaphore::new(0));
+    let pause = Arc::new(Semaphore::new(0));
+    let mut transport = inbox_transport(
+        (1..=400)
+            .map(|uid| remote_message(uid, &format!("Subject {uid}"), "sender@example.com"))
+            .collect(),
+    );
+    transport.fetch_headers_started = Some(started.clone());
+    transport.fetch_headers_pause = Some(pause.clone());
+    harness.factory.add_transport(account_id.clone(), transport);
+
+    let folder = inbox.id.clone();
+    let loading = tokio::spawn(async move { api::load_older(&folder).await });
+    // Wait until the gated backfill is inside its remote header fetch.
+    let permit = started.acquire().await.unwrap();
+    drop(permit);
+
+    // Give the mutation its own connection (registered after the backfill
+    // opened the paused one) so its session is not serialized behind the
+    // paused fetch by the fake's shared transport mutex. Its capability probe
+    // is the first network work a mutation does once it holds the account gate.
+    let caps_started = Arc::new(Semaphore::new(0));
+    let mut mutation_transport = inbox_transport(Vec::new());
+    mutation_transport.capabilities_started = Some(caps_started.clone());
+    harness
+        .factory
+        .add_transport(account_id.clone(), mutation_transport);
+
+    // A mutation of the same account must wait behind the account gate, so it
+    // must not even reach its capability probe while the backfill holds it.
+    let thread = ThreadId("thread-400".into());
+    let mutating = tokio::spawn(async move { api::set_read(&thread, true).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), caps_started.acquire())
+            .await
+            .is_err(),
+        "a mutation must not reach the network while load_older holds the account gate"
+    );
+
+    // Release the backfill; the mutation should then reach its probe and finish.
+    pause.add_permits(1);
+    loading.await.unwrap().expect("backfill completes");
+    let _ = tokio::time::timeout(Duration::from_secs(5), caps_started.acquire())
+        .await
+        .expect("the mutation reaches the network once the gate is free");
+    mutating
+        .await
+        .expect("mutation task joins")
+        .expect("set_read");
 }
 
 #[tokio::test]

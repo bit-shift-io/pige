@@ -374,6 +374,10 @@ pub struct FakeTransportFactory {
     imap_failures: Mutex<HashSet<AccountId>>,
     smtp_failures: Mutex<HashSet<AccountId>>,
     smtp_sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// How many IMAP connections have been handed out per account. A provider
+    /// session must not open more than it needs, so tests assert a ceiling here
+    /// rather than counting the (shared) handle.
+    imap_opens: Mutex<HashMap<AccountId, usize>>,
 }
 
 impl FakeTransportFactory {
@@ -408,6 +412,17 @@ impl FakeTransportFactory {
 
     pub fn clear_sent(&self) {
         self.smtp_sent.lock().unwrap().clear();
+    }
+
+    /// How many IMAP connections have been opened for `id` since the factory
+    /// was created. Used to bound connection amplification.
+    pub fn imap_open_count(&self, id: &AccountId) -> usize {
+        self.imap_opens
+            .lock()
+            .unwrap()
+            .get(id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Snapshot of the scripted transport currently registered for `id`,
@@ -498,7 +513,15 @@ impl TransportFactory for FakeTransportFactory {
 
             let transport = { self.transports.lock().unwrap().get(&id).map(Arc::clone) };
             transport
-                .map(|transport| Box::new(FakeTransportHandle(transport)) as Box<dyn MailTransport>)
+                .map(|transport| {
+                    *self
+                        .imap_opens
+                        .lock()
+                        .unwrap()
+                        .entry(id.clone())
+                        .or_insert(0) += 1;
+                    Box::new(FakeTransportHandle(transport)) as Box<dyn MailTransport>
+                })
                 .ok_or_else(|| format!("no fake IMAP transport for {}", account.label))
         })
     }
