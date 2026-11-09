@@ -28,8 +28,8 @@ fn header(message_id: &str, references: &[&str], subject: &str) -> MessageHeader
         from: vec![address("sender@example.com")],
         to: Vec::new(),
         cc: Vec::new(),
-    reply_to: Vec::new(),
-    bcc: Vec::new(),
+        reply_to: Vec::new(),
+        bcc: Vec::new(),
         date: 0,
         size: 0,
     }
@@ -593,6 +593,10 @@ async fn open_conversation_returns_every_message_in_the_thread() {
         data_dir: dir.path().join("data"),
         cache_dir: dir.path().join("cache"),
         config_dir: dir.path().join("config"),
+        providers: Arc::new(pige_core::providers::imap::imap_registry(
+            factory.clone(),
+            credentials.clone(),
+        )),
         credentials,
         notifier,
         opener,

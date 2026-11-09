@@ -18,7 +18,7 @@ use pige_core::account::{
     Account, AccountId, AuthKind, ContactSourceConfig, MailBackend, Security, ServerConfig,
 };
 use pige_core::api::{self, Config, DB_FILE_NAME};
-use pige_core::config::{self, ConfigDocument, ConfigError, CURRENT_VERSION};
+use pige_core::config::{self, CURRENT_VERSION, ConfigDocument, ConfigError};
 use pige_core::platform::BackupStore;
 use pige_core::platform::fake::{
     FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
@@ -159,8 +159,17 @@ fn native_account_needs_no_imap_endpoint() {
     // The document must not invent an IMAP or SMTP endpoint for a native
     // backend.
     let text = std::fs::read_to_string(&path).unwrap();
-    for forbidden in ["imap_host", "imap.gmail.com", "smtp_host", "\"imap\"", "\"smtp\""] {
-        assert!(!text.contains(forbidden), "document contains {forbidden}:\n{text}");
+    for forbidden in [
+        "imap_host",
+        "imap.gmail.com",
+        "smtp_host",
+        "\"imap\"",
+        "\"smtp\"",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "document contains {forbidden}:\n{text}"
+        );
     }
 
     assert!(account.imap_smtp().is_none());
@@ -198,15 +207,22 @@ async fn restore_v1_has_no_contacts_or_tokens() {
     let name = "pige-backup-2026-01-01-000000.json";
     backups.write(name, V1_DOCUMENT.as_bytes()).unwrap();
 
+    let credentials = Arc::new(FakeCredentials::default());
+    let transport: Arc<dyn pige_core::platform::TransportFactory> =
+        Arc::new(FakeTransportFactory::default());
     api::reset_for_tests();
     api::init(Config {
         data_dir: dir.path().join("data"),
         cache_dir: dir.path().join("cache"),
         config_dir: dir.path().join("config"),
-        credentials: Arc::new(FakeCredentials::default()),
+        providers: Arc::new(pige_core::providers::imap::imap_registry(
+            transport.clone(),
+            credentials.clone(),
+        )),
+        credentials,
         notifier: Arc::new(FakeNotifier::default()),
         opener: Arc::new(FakeOpener::default()),
-        transport: Arc::new(FakeTransportFactory::default()),
+        transport,
         backups: backups.clone(),
     })
     .expect("init api");
@@ -228,9 +244,18 @@ async fn restore_v1_has_no_contacts_or_tokens() {
     // or token material for the account.
     let path = config::document_path(&dir.path().join("config"));
     let text = std::fs::read_to_string(path).unwrap();
-    assert!(text.contains("\"contact_sources\": []"), "no contacts expected: {text}");
-    assert!(!text.contains("\"enabled\""), "no contact sources expected: {text}");
-    assert!(!text.to_ascii_lowercase().contains("token"), "no tokens expected: {text}");
+    assert!(
+        text.contains("\"contact_sources\": []"),
+        "no contacts expected: {text}"
+    );
+    assert!(
+        !text.contains("\"enabled\""),
+        "no contact sources expected: {text}"
+    );
+    assert!(
+        !text.to_ascii_lowercase().contains("token"),
+        "no tokens expected: {text}"
+    );
 
     api::reset_for_tests();
 }
@@ -283,7 +308,9 @@ fn store_mirror_matches_json_backend() {
 
     let store = Store::open(dir.path().join(DB_FILE_NAME)).expect("open store");
     store.migrate().expect("migrate store");
-    store.sync_accounts(&loaded.accounts).expect("mirror accounts");
+    store
+        .sync_accounts(&loaded.accounts)
+        .expect("mirror accounts");
 
     // The mirror reconstructs the same typed backend and contacts the JSON has.
     assert_eq!(store.accounts().unwrap(), loaded.accounts);

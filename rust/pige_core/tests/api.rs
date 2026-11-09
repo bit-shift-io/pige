@@ -50,6 +50,10 @@ impl Harness {
             credentials: credentials.clone(),
             notifier: notifier.clone(),
             opener,
+            providers: Arc::new(pige_core::providers::imap::imap_registry(
+                factory.clone(),
+                credentials.clone(),
+            )),
             transport: factory.clone(),
             backups: backups.clone(),
         })
@@ -964,7 +968,8 @@ async fn sync_all_errors_when_every_account_fails() {
     harness.factory.fail_imap(account_id);
 
     let error = api::sync_all().await.expect_err("all accounts failed");
-    assert!(error.contains("imap connection failed"));
+    // The provider boundary redacts the transport failure to a safe message.
+    assert!(error.contains("could not connect"), "got {error}");
     assert!(matches!(api::snapshot().status, SyncStatus::Error(_)));
 }
 
@@ -1336,7 +1341,10 @@ async fn block_sender_persists_normalised_addresses_without_duplicates() {
 
     let path = pige_core::config::document_path(&harness.dir.path().join("config"));
     let document = pige_core::config::load(&path).unwrap().unwrap();
-    assert_eq!(document.blocked_senders, vec!["bob@example.com".to_string()]);
+    assert_eq!(
+        document.blocked_senders,
+        vec!["bob@example.com".to_string()]
+    );
 }
 
 async fn seed_prefetch(harness: &Harness, raw: &[u8]) -> AccountId {
@@ -1353,6 +1361,25 @@ async fn seed_prefetch(harness: &Harness, raw: &[u8]) -> AccountId {
     harness.factory.add_transport(
         account.clone(),
         FakeTransport {
+            // The provider adapter resolves the Archive/Trash destinations by
+            // listing folders, so the scripted server advertises them.
+            folders: vec![
+                RemoteFolder {
+                    name: "INBOX".to_string(),
+                    delimiter: Some("/".to_string()),
+                    kind: FolderKind::Inbox,
+                },
+                RemoteFolder {
+                    name: "Archive".to_string(),
+                    delimiter: Some("/".to_string()),
+                    kind: FolderKind::Archive,
+                },
+                RemoteFolder {
+                    name: "Trash".to_string(),
+                    delimiter: Some("/".to_string()),
+                    kind: FolderKind::Trash,
+                },
+            ],
             bodies: HashMap::from([("INBOX".into(), HashMap::from([(Uid(1), raw.to_vec())]))]),
             ..FakeTransport::default()
         },
@@ -1489,6 +1516,26 @@ async fn delayed_mutation_of_a_does_not_cancel_a_newer_open_of_b() {
         harness.factory.add_transport(
             account,
             FakeTransport {
+                // The mutation session is opened from this replacement, so it
+                // must advertise the Archive/Trash destinations the adapter
+                // resolves by listing folders.
+                folders: vec![
+                    RemoteFolder {
+                        name: "INBOX".to_string(),
+                        delimiter: Some("/".to_string()),
+                        kind: FolderKind::Inbox,
+                    },
+                    RemoteFolder {
+                        name: "Archive".to_string(),
+                        delimiter: Some("/".to_string()),
+                        kind: FolderKind::Archive,
+                    },
+                    RemoteFolder {
+                        name: "Trash".to_string(),
+                        delimiter: Some("/".to_string()),
+                        kind: FolderKind::Trash,
+                    },
+                ],
                 bodies: HashMap::from([(
                     "INBOX".into(),
                     HashMap::from([(Uid(2), b"Subject: B\r\n\r\nbravo".to_vec())]),
@@ -2204,14 +2251,21 @@ fn seeded_account(id: &str, label: &str) -> pige_core::Account {
 }
 
 fn test_config(dir: &TempDir) -> Config {
+    let credentials = Arc::new(FakeCredentials::new());
+    let transport: Arc<dyn pige_core::platform::TransportFactory> =
+        Arc::new(FakeTransportFactory::new());
     Config {
         data_dir: dir.path().join("data"),
         cache_dir: dir.path().join("cache"),
         config_dir: dir.path().join("config"),
-        credentials: Arc::new(FakeCredentials::new()),
+        credentials: credentials.clone(),
         notifier: Arc::new(FakeNotifier::new()),
         opener: Arc::new(FakeOpener::new()),
-        transport: Arc::new(FakeTransportFactory::new()),
+        providers: Arc::new(pige_core::providers::imap::imap_registry(
+            transport.clone(),
+            credentials.clone(),
+        )),
+        transport,
         backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
     }
 }

@@ -168,6 +168,11 @@ impl SyncService for ImapSync {
             Some(cursor) => decode_sync_cursor(cursor)?,
             None => ImapSyncState::empty(),
         };
+        // A cursor that has never tracked a mailbox is this account's first
+        // sync: its inbox mail is genuinely new to the user and worth
+        // notifying. Any later bootstrap (a UIDVALIDITY reset) is a re-read of
+        // pre-existing mail and must not notify.
+        let account_first_sync = state.mailboxes.is_empty();
 
         let folders = self
             .transport
@@ -236,6 +241,20 @@ impl SyncService for ImapSync {
                 Err(_) => continue,
             };
 
+            // Report the server's total message count so the application can
+            // tell whether older mail remains on the server (paging) even after
+            // a bounded window. `unread` is left to the application to recompute
+            // from the cached flags. An idempotent re-upsert for an already
+            // known collection is harmless.
+            changes.push(MailChange::UpsertCollection(CollectionRecord {
+                remote_id: identity::collection_remote_id(&name),
+                name: name.clone(),
+                kind: folder.kind,
+                delimiter: folder.delimiter.clone(),
+                total: Some(folder_state.exists),
+                unread: None,
+            }));
+
             let mut prior = state.progress(&name).cloned();
             // A changed UIDVALIDITY invalidates everything cached under the old
             // epoch for *this* mailbox only; the same UID now names a different
@@ -255,7 +274,8 @@ impl SyncService for ImapSync {
 
             let progress = match prior {
                 None => {
-                    self.bootstrap(&name, folder_state, &request, &mut changes)
+                    let new_arrival = account_first_sync && folder.kind == FolderKind::Inbox;
+                    self.bootstrap(&name, folder_state, new_arrival, &request, &mut changes)
                         .await?
                 }
                 Some(prior) => {
@@ -289,6 +309,7 @@ impl ImapSync {
         &mut self,
         name: &str,
         folder_state: FolderState,
+        new_arrival: bool,
         request: &SyncRequest,
         changes: &mut Vec<MailChange>,
     ) -> Result<MailboxProgress, ProviderError> {
@@ -311,8 +332,11 @@ impl ImapSync {
             })
             .collect();
         for message in fetched {
-            // A bootstrap reports pre-existing mail, never a new arrival.
-            changes.push(upsert(name, folder_state.uidvalidity, message, false));
+            // The account's first inbox bootstrap reports mail the user is
+            // seeing for the first time; any other bootstrap (a UIDVALIDITY
+            // reset or a later adoption) is pre-existing mail and never a new
+            // arrival.
+            changes.push(upsert(name, folder_state.uidvalidity, message, new_arrival));
         }
         Ok(MailboxProgress {
             name: name.to_string(),

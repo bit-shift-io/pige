@@ -20,6 +20,24 @@ impl Store {
         folders_on(&conn, account)
     }
 
+    /// Recompute a folder's cached `unread` rollup from its memberships. `total`
+    /// is deliberately left as the value the provider last reported (server
+    /// `exists`), because paging (`has_more`) compares it against the cached
+    /// count; recomputing it from the cache would hide older mail on the server.
+    pub fn recompute_folder_unread(&self, folder: &FolderId) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE folders SET
+                 unread = (
+                     SELECT COUNT(*) FROM message_collections mc
+                     JOIN messages m ON m.id = mc.message_id
+                     WHERE mc.folder_id = ?1 AND (m.flags & 1) = 0
+                 )
+             WHERE id = ?1",
+            [&folder.0],
+        )?;
+        Ok(())
+    }
+
     /// Start a new UIDVALIDITY epoch for a folder: drop every cached message
     /// from the old epoch and clear the sync counters so the next sync refetches
     /// from scratch. Unknown folders are a no-op.

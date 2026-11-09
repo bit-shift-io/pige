@@ -25,7 +25,7 @@ pub fn reader_body_kind(message: &MessageSummary) -> ReaderBody {
 }
 
 use pige_core::mail::FolderKind;
-use pige_core::transport::Capabilities;
+use pige_core::providers::ProviderCapabilities;
 
 use crate::app::App;
 use crate::components::{self, ButtonVariant, PaneTone};
@@ -259,7 +259,7 @@ fn fit_action_count(total: usize, width: f32) -> usize {
 
 /// The capabilities and special-folder availability for the open conversation.
 struct ReaderContext {
-    capabilities: Capabilities,
+    capabilities: ProviderCapabilities,
     current_kind: FolderKind,
     has_archive: bool,
     has_trash: bool,

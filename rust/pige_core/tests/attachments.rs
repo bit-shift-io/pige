@@ -202,13 +202,18 @@ async fn harness(thread: &str) -> Harness {
     let dir = TempDir::new().unwrap();
     let opener = Arc::new(FakeOpener::default());
     let factory = Arc::new(FakeTransportFactory::default());
+    let credentials = Arc::new(FakeCredentials::new());
 
     api::reset_for_tests();
     api::init(Config {
         data_dir: dir.path().join("data"),
         cache_dir: dir.path().join("cache"),
         config_dir: dir.path().join("config"),
-        credentials: Arc::new(FakeCredentials::new()),
+        providers: Arc::new(pige_core::providers::imap::imap_registry(
+            factory.clone(),
+            credentials.clone(),
+        )),
+        credentials,
         notifier: Arc::new(FakeNotifier::new()),
         opener: opener.clone(),
         transport: factory.clone(),

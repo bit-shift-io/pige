@@ -8,6 +8,7 @@ use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::mail::{AttachmentDisposition, AttachmentPart, MessageId, ThreadId};
+use crate::providers::{AttachmentDescriptor, RemoteAttachmentId};
 
 use super::{Store, StoreError, messages::recompute_thread_on};
 
@@ -132,6 +133,66 @@ impl Store {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Insert or refresh the attachment metadata a provider body carried,
+    /// including each part's stable *remote* id. The local MIME `part_id` keeps
+    /// naming the row, while the remote id is what an `attachment` fetch must
+    /// send back to the provider.
+    pub fn store_provider_attachments(
+        &self,
+        message_id: &MessageId,
+        descriptors: &[AttachmentDescriptor],
+    ) -> Result<(), StoreError> {
+        let parts: Vec<AttachmentPart> = descriptors
+            .iter()
+            .map(|descriptor| AttachmentPart {
+                part_id: descriptor.part_id.clone(),
+                filename: descriptor.filename.clone(),
+                content_type: descriptor.content_type.clone(),
+                size: descriptor.size,
+                content_id: descriptor.content_id.clone(),
+                disposition: descriptor.disposition,
+            })
+            .collect();
+        self.store_attachments(message_id, &parts)?;
+        for descriptor in descriptors {
+            self.set_attachment_remote_id(message_id, &descriptor.part_id, &descriptor.remote_id)?;
+        }
+        Ok(())
+    }
+
+    /// Record the provider's remote id for one already-stored attachment part.
+    pub fn set_attachment_remote_id(
+        &self,
+        message_id: &MessageId,
+        part_id: &str,
+        remote_id: &RemoteAttachmentId,
+    ) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE attachments SET remote_id = ?1 WHERE message_id = ?2 AND part_id = ?3",
+            params![remote_id.as_str(), message_id.0, part_id],
+        )?;
+        Ok(())
+    }
+
+    /// The provider remote id recorded for an attachment part, when a provider
+    /// body fetch stored one. Falls back to the local part id at the API layer
+    /// for rows written before this column existed.
+    pub fn attachment_remote_id(
+        &self,
+        message_id: &MessageId,
+        part_id: &str,
+    ) -> Result<Option<RemoteAttachmentId>, StoreError> {
+        let raw: Option<Option<String>> = self
+            .connection()
+            .query_row(
+                "SELECT remote_id FROM attachments WHERE message_id = ?1 AND part_id = ?2",
+                params![message_id.0, part_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.flatten().map(RemoteAttachmentId::new))
     }
 
     /// Remember where an opened attachment was cached.

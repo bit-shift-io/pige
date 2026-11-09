@@ -378,6 +378,10 @@ impl ApiHarness {
             data_dir: dir.path().join("data"),
             cache_dir: dir.path().join("cache"),
             config_dir: dir.path().join("config"),
+            providers: Arc::new(pige_core::providers::imap::imap_registry(
+                factory.clone(),
+                credentials.clone(),
+            )),
             credentials,
             notifier: Arc::new(FakeNotifier::default()),
             opener: Arc::new(FakeOpener::default()),

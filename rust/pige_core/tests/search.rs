@@ -663,15 +663,22 @@ async fn api_search_mail_returns_hits_and_updates_the_snapshot() {
     let _guard = TEST_LOCK.lock().await;
     let dir = TempDir::new().unwrap();
     let data_dir = dir.path().join("data");
+    let credentials = Arc::new(FakeCredentials::new());
+    let transport: Arc<dyn pige_core::platform::TransportFactory> =
+        Arc::new(FakeTransportFactory::new());
     api::reset_for_tests();
     api::init(Config {
         data_dir: data_dir.clone(),
         cache_dir: dir.path().join("cache"),
         config_dir: dir.path().join("config"),
-        credentials: Arc::new(FakeCredentials::new()),
+        providers: Arc::new(pige_core::providers::imap::imap_registry(
+            transport.clone(),
+            credentials.clone(),
+        )),
+        credentials,
         notifier: Arc::new(FakeNotifier::new()),
         opener: Arc::new(FakeOpener::new()),
-        transport: Arc::new(FakeTransportFactory::new()),
+        transport,
         backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
     })
     .expect("init api");

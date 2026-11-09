@@ -13,13 +13,18 @@ use pige_core::api;
 #[cfg(target_os = "linux")]
 pub(crate) fn config() -> api::Config {
     use pige_core::platform::{
-        CredentialStore,
+        CredentialStore, TransportFactory,
         linux::{
             LinuxBackupStore, LinuxCredentials, LinuxNotifier, LinuxOpener, LinuxTransportFactory,
         },
     };
 
     let credentials: Arc<dyn CredentialStore> = Arc::new(LinuxCredentials::new());
+    let transport: Arc<dyn TransportFactory> =
+        Arc::new(LinuxTransportFactory::new(credentials.clone()));
+    let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(
+        pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone()),
+    );
     api::Config {
         data_dir: xdg_dir("XDG_DATA_HOME", ".local/share"),
         cache_dir: xdg_dir("XDG_CACHE_HOME", ".cache"),
@@ -27,7 +32,8 @@ pub(crate) fn config() -> api::Config {
         credentials: credentials.clone(),
         notifier: Arc::new(LinuxNotifier::new()),
         opener: Arc::new(LinuxOpener::new()),
-        transport: Arc::new(LinuxTransportFactory::new(credentials)),
+        providers,
+        transport,
         backups: Arc::new(LinuxBackupStore::new()),
     }
 }
@@ -38,7 +44,7 @@ pub(crate) fn config() -> api::Config {
 #[cfg(target_os = "android")]
 pub(crate) fn config() -> api::Config {
     use pige_core::platform::{
-        CredentialStore,
+        CredentialStore, TransportFactory,
         android::{
             AndroidBackupStore, AndroidCredentials, AndroidNotifier, AndroidOpener, AndroidPaths,
         },
@@ -56,6 +62,12 @@ pub(crate) fn config() -> api::Config {
         }
     });
     let credentials: Arc<dyn CredentialStore> = Arc::new(AndroidCredentials::new());
+    let transport: Arc<dyn TransportFactory> = Arc::new(
+        pige_core::platform::android::AndroidTransportFactory::new(credentials.clone()),
+    );
+    let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(
+        pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone()),
+    );
     api::Config {
         config_dir: paths.config_dir,
         data_dir: paths.data_dir,
@@ -63,9 +75,8 @@ pub(crate) fn config() -> api::Config {
         credentials: credentials.clone(),
         notifier: Arc::new(AndroidNotifier::new()),
         opener: Arc::new(AndroidOpener::new(paths.cache_dir)),
-        transport: Arc::new(pige_core::platform::android::AndroidTransportFactory::new(
-            credentials,
-        )),
+        providers,
+        transport,
         backups: Arc::new(AndroidBackupStore::new()),
     }
 }
@@ -74,19 +85,26 @@ pub(crate) fn config() -> api::Config {
 /// their own platform layer is implemented.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn config() -> api::Config {
-    use pige_core::platform::fake::{
-        FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
+    use pige_core::platform::{
+        CredentialStore, TransportFactory,
+        fake::{FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory},
     };
 
     let root = std::env::temp_dir().join(format!("pige-dev-{}", std::process::id()));
+    let credentials: Arc<dyn CredentialStore> = Arc::new(FakeCredentials::new());
+    let transport: Arc<dyn TransportFactory> = Arc::new(FakeTransportFactory::new());
+    let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(
+        pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone()),
+    );
     api::Config {
         data_dir: root.join("data"),
         cache_dir: root.join("cache"),
         config_dir: root.join("config"),
-        credentials: Arc::new(FakeCredentials::new()),
+        credentials: credentials.clone(),
         notifier: Arc::new(FakeNotifier::new()),
         opener: Arc::new(FakeOpener::new()),
-        transport: Arc::new(FakeTransportFactory::new()),
+        providers,
+        transport,
         backups: Arc::new(FakeBackupStore::new()),
     }
 }

@@ -8,6 +8,7 @@ mod v4;
 mod v5;
 mod v6;
 mod v7;
+mod v8;
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -55,7 +56,8 @@ impl Store {
     /// versions the account mirror by typed backend; v6 adds durable account
     /// generations, cross-process leases, pending-auth references, and
     /// generation-fenced checkpoints; v7 separates remote message identity from
-    /// collection membership.
+    /// collection membership; v8 records the provider signature status and the
+    /// remote attachment id on the cached message and attachment.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -129,6 +131,10 @@ impl Store {
         if version < 7 && target >= 7 {
             v7::apply(&tx)?;
             version = 7;
+        }
+        if version < 8 && target >= 8 {
+            v8::apply(&tx)?;
+            version = 8;
         }
 
         // The rebuild must not leave a dangling reference behind; check before

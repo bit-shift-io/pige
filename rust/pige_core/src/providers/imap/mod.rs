@@ -18,11 +18,16 @@ use async_trait::async_trait;
 use secrecy::ExposeSecret;
 
 use crate::account::Account;
-use crate::auth::secrets::{SecretEnvelope, SecretRepository, StoredCredentials};
-use crate::platform::TransportFactory;
+use crate::auth::secrets::{
+    CredentialSecretRepository, SecretEnvelope, SecretRepository, StoredCredentials,
+};
+use crate::platform::{CredentialStore, TransportFactory};
 use crate::providers::error::ProviderError;
+use crate::providers::registry::ProviderRegistry;
 use crate::providers::traits::{ProviderFactory, ProviderSession};
-use crate::providers::types::{MutationCapabilities, OperationContext, ProviderCapabilities};
+use crate::providers::types::{
+    IMAP_SMTP_PROVIDER, MutationCapabilities, OperationContext, ProviderCapabilities,
+};
 use crate::transport::{Capabilities, MailTransport};
 
 pub use mailbox::ImapMailbox;
@@ -50,7 +55,10 @@ impl ImapProviderFactory {
     /// entry point (a legacy raw password is read back as-is). With no stored
     /// credential the transport resolves its own; a non-password credential on
     /// an IMAP account is a genuine misconfiguration, not a silent fallback.
-    async fn open_transport(&self, account: &Account) -> Result<Box<dyn MailTransport>, ProviderError> {
+    async fn open_transport(
+        &self,
+        account: &Account,
+    ) -> Result<Box<dyn MailTransport>, ProviderError> {
         match self.secrets.load(&account.id)? {
             Some(SecretEnvelope {
                 credentials: StoredCredentials::Password(password),
@@ -68,6 +76,28 @@ impl ImapProviderFactory {
     }
 }
 
+/// Build a provider registry containing only the IMAP/SMTP adapter.
+///
+/// The shells (desktop, Android, and the test/temp fake) hand the application a
+/// single `Arc<dyn ProviderFactory>`; until a native adapter lands, that registry
+/// contains just this one entry. The protected-secret repository wraps the
+/// platform credential store, so the adapter resolves passwords exactly as the
+/// legacy transport factory did.
+pub fn imap_registry(
+    transports: Arc<dyn TransportFactory>,
+    credentials: Arc<dyn CredentialStore>,
+) -> ProviderRegistry {
+    let secrets: Arc<dyn SecretRepository> = Arc::new(CredentialSecretRepository::new(credentials));
+    let mut registry = ProviderRegistry::new();
+    registry
+        .register(
+            crate::providers::types::ProviderId::from(IMAP_SMTP_PROVIDER),
+            Arc::new(ImapProviderFactory::new(transports, secrets)),
+        )
+        .expect("the imap-smtp provider is registered exactly once");
+    registry
+}
+
 /// Capabilities advertised by the IMAP adapter, derived from the server's own
 /// capability set. Submission arrives with F9. The mutation booleans are honest
 /// about what the adapter actually implements:
@@ -83,7 +113,7 @@ impl ImapProviderFactory {
 /// - `permanent_delete` is true only where it is genuinely implemented: a
 ///   plain-IMAP expunge permanently deletes from the source mailbox. A Gmail
 ///   source UID addresses only that label, so Gmail stays false.
-fn imap_capabilities(server: Capabilities) -> ProviderCapabilities {
+pub fn imap_capabilities(server: Capabilities) -> ProviderCapabilities {
     ProviderCapabilities {
         mailbox: true,
         sync: true,
@@ -132,10 +162,9 @@ impl ProviderFactory for ImapProviderFactory {
         let mailbox_transport = self.open_transport(account).await?;
         let mutation_transport = self.open_transport(account).await?;
 
-        let mut session = ProviderSession::new(imap_capabilities(server))
-            .with_provider(crate::providers::types::ProviderId::from(
-                crate::providers::IMAP_SMTP_PROVIDER,
-            ));
+        let mut session = ProviderSession::new(imap_capabilities(server)).with_provider(
+            crate::providers::types::ProviderId::from(crate::providers::IMAP_SMTP_PROVIDER),
+        );
         session.mailbox = Some(Box::new(ImapMailbox::new(mailbox_transport)));
         session.sync = Some(Box::new(ImapSync::new(sync_transport)));
         session.mutations = Some(Box::new(ImapMutations::new(mutation_transport, server)));
@@ -158,6 +187,5 @@ pub(crate) fn transport_error(error: crate::transport::TransportError) -> Provid
 
 /// Map a connection failure (a platform string) to a redacted provider error.
 fn connect_error(message: String) -> ProviderError {
-    ProviderError::transient("could not connect to the mail server")
-        .with_source_detail(message)
+    ProviderError::transient("could not connect to the mail server").with_source_detail(message)
 }

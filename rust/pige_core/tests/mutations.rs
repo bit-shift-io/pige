@@ -12,7 +12,8 @@ use pige_core::{
     ServerConfig, Store, StoredMessage, ThreadId, Uid,
     api::{self, AccountInput, Config, DB_FILE_NAME},
     platform::fake::{FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory},
-    transport::{Capabilities, FakeTransport, FlagOp, FolderState, RemoteMessage},
+    providers::{MutationCapabilities, ProviderCapabilities},
+    transport::{Capabilities, FakeTransport, FlagOp, FolderState, RemoteFolder, RemoteMessage},
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -37,6 +38,10 @@ impl Harness {
             data_dir: dir.path().join("data"),
             cache_dir: dir.path().join("cache"),
             config_dir: dir.path().join("config"),
+            providers: Arc::new(pige_core::providers::imap::imap_registry(
+                factory.clone(),
+                credentials.clone(),
+            )),
             credentials,
             notifier,
             opener,
@@ -122,10 +127,28 @@ fn seed_message(store: &Store, folder: &Folder, uid: u32, thread: &str) -> Store
     message
 }
 
-/// A transport that records mutation calls and responds to `select` for `INBOX`.
+/// A transport that records mutation calls and responds to `select` for
+/// `INBOX`. The provider adapter resolves the Archive/Trash target folders by
+/// listing them, so the scripted server must advertise them: a Gmail server
+/// names its Archive folder `[Gmail]/All Mail`.
 fn mutation_transport(capabilities: Capabilities) -> FakeTransport {
+    let archive = if capabilities.gmail {
+        "[Gmail]/All Mail"
+    } else {
+        "Archive"
+    };
+    let folder = |name: &str, kind: FolderKind| RemoteFolder {
+        name: name.to_string(),
+        delimiter: Some("/".to_string()),
+        kind,
+    };
     FakeTransport {
         capabilities,
+        folders: vec![
+            folder("INBOX", FolderKind::Inbox),
+            folder(archive, FolderKind::Archive),
+            folder("Trash", FolderKind::Trash),
+        ],
         states: HashMap::from([(
             "INBOX".to_string(),
             FolderState {
@@ -423,7 +446,8 @@ async fn failed_remote_move_rolls_back_local_state() {
         .await
         .expect_err("remote move failed");
 
-    assert!(error.contains("mutation failed"), "got {error}");
+    // The provider boundary reports a safe message, never the wire detail.
+    assert!(error.contains("did not confirm"), "got {error}");
 
     // The optimistic removal must have been rolled back.
     let messages = harness
@@ -509,33 +533,37 @@ async fn no_trash_folder_requires_confirmation_for_permanent_delete() {
 
 #[tokio::test]
 async fn archive_is_hidden_without_gmail_or_an_archive_folder() {
-    let capabilities = Capabilities {
-        gmail: false,
-        move_ext: false,
+    let mutations = |labels: bool| ProviderCapabilities {
+        mailbox: true,
+        sync: true,
+        mutations: MutationCapabilities {
+            archive: true,
+            labels,
+            ..MutationCapabilities::default()
+        },
+        ..ProviderCapabilities::default()
     };
+    let generic = mutations(false);
 
-    // No Gmail and no Archive folder: archive is unavailable.
-    assert!(!api::archive_available(
-        &capabilities,
-        FolderKind::Inbox,
-        false
-    ));
+    // No label-based archive and no Archive folder: archive is unavailable.
+    assert!(!api::archive_available(&generic, FolderKind::Inbox, false));
     // A generic server with an Archive folder can archive.
-    assert!(api::archive_available(
-        &capabilities,
-        FolderKind::Inbox,
-        true
-    ));
-    // Gmail can archive without an Archive folder (it removes the label).
-    let gmail = Capabilities {
-        gmail: true,
-        move_ext: false,
-    };
+    assert!(api::archive_available(&generic, FolderKind::Inbox, true));
+    // A label-based provider (Gmail) can archive without an Archive folder (it
+    // removes the source label).
+    let gmail = mutations(true);
     assert!(api::archive_available(&gmail, FolderKind::Inbox, false));
     // Never archive from Trash, Spam, or Archive (Gmail All Mail included).
     assert!(!api::archive_available(&gmail, FolderKind::Trash, false));
     assert!(!api::archive_available(&gmail, FolderKind::Junk, false));
     assert!(!api::archive_available(&gmail, FolderKind::Archive, true));
+    // A provider that cannot archive is never offered it.
+    let no_archive = ProviderCapabilities::default();
+    assert!(!api::archive_available(
+        &no_archive,
+        FolderKind::Inbox,
+        true
+    ));
 }
 
 #[tokio::test]

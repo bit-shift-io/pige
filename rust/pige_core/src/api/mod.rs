@@ -6,7 +6,9 @@
 //! after the lock is released, and sync uses its own connection so a snapshot
 //! never blocks behind a slow server.
 
+pub mod body;
 pub mod events;
+pub mod mailbox;
 pub mod mutations;
 pub mod snapshot;
 
@@ -25,20 +27,29 @@ use crate::account::{
     is_supported_account_color,
 };
 use crate::config::{self, ConfigDocument};
-use crate::html::{MailDocument, parse_html, plain_text_document};
 use crate::mail::{
     AttachmentPart, Folder, FolderId, FolderKind, MessageId, StoredMessage, ThreadAssigner,
-    ThreadId, Uid, attachment_bytes, cache_attachment, check_attachment_size, extract_attachments,
-    sender_display, snippet_from_parts, thread::participants_of,
+    ThreadId, Uid, attachment_bytes, cache_attachment, check_attachment_size, sender_display,
+    thread::participants_of,
 };
 use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
+use crate::providers::{ProviderCapabilities, ProviderFactory, RemoteAttachmentId};
 use crate::search::{SearchHit, SearchScope};
 use crate::send::{
     self, OutboxEntry, OutboxId, OutgoingMessage, compose::forward_message, compose::reply_message,
 };
-use crate::store::{Body, ImapCoords, PrefetchCandidate, Store};
-use crate::sync::sync_account as run_sync_account;
-use crate::transport::{Capabilities, RemoteFolder, UidRange};
+use crate::store::{ImapCoords, PrefetchCandidate, Store};
+use crate::sync::provider::{WorkBudget, sync_account as provider_sync_account};
+use crate::sync::scheduler::AccountScheduler;
+use crate::transport::{RemoteFolder, UidRange};
+
+use body::document_from_body;
+use mailbox::{INTERACTIVE_TIMEOUT, SYNC_TIMEOUT, scheduler_message};
+
+/// How many change pages one account sync pass may apply before it returns the
+/// account gate. A bounded budget keeps background sync from occupying an
+/// account indefinitely.
+const SYNC_PAGES: u32 = 8;
 
 pub use crate::settings::{Settings, ThemeMode};
 pub use events::{CoreEvent, back_pressed, subscribe};
@@ -66,7 +77,7 @@ const SYNC_WINDOW: u32 = 300;
 /// whose cached `RFC822.SIZE` exceeds this cap are opened without a body and
 /// shown a "message too large" state instead of fetching hundreds of MiB.
 /// This is separate from the sanitizer's 2 MiB HTML input cap.
-const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
 const PREFETCH_LIMIT: u32 = 50;
 const PREFETCH_CONCURRENCY: usize = 2;
 static PREFETCH_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
@@ -105,6 +116,13 @@ pub struct Config {
     pub credentials: Arc<dyn CredentialStore>,
     pub notifier: Arc<dyn Notifier>,
     pub opener: Arc<dyn Opener>,
+    /// Provider sessions for mailbox read, sync, and mutation work. The API
+    /// dispatches every such operation through this factory and never touches a
+    /// protocol transport for them.
+    pub providers: Arc<dyn ProviderFactory>,
+    /// Protocol factory retained only for SMTP submission and account
+    /// connection testing until provider submission lands; mailbox reads and
+    /// mutations do not use it.
     pub transport: Arc<dyn TransportFactory>,
     /// Reads and writes configuration backups in the platform's Downloads.
     pub backups: Arc<dyn BackupStore>,
@@ -241,9 +259,12 @@ struct AppState {
     /// `Some(true/false)` once a server backfill has probed for older mail;
     /// `None` means fall back to comparing the server total with the cache.
     server_more: Option<bool>,
-    /// Server capabilities observed during the last sync, per account. Used by
-    /// the UI to decide which mutation actions to offer.
-    capabilities: HashMap<AccountId, Capabilities>,
+    /// Provider-neutral capabilities observed during the last sync, per account.
+    /// Used by the UI to decide which mutation actions to offer.
+    capabilities: HashMap<AccountId, ProviderCapabilities>,
+    /// Serializes an account's remote-read/apply sequences so a sync and a
+    /// mutation cannot interleave.
+    scheduler: Arc<AccountScheduler>,
     status: SyncStatus,
     events: broadcast::Sender<CoreEvent>,
 }
@@ -552,6 +573,7 @@ pub fn init(config: Config) -> Result<(), String> {
         search: SearchState::default(),
         server_more: None,
         capabilities: HashMap::new(),
+        scheduler: Arc::new(AccountScheduler::new()),
         status: SyncStatus::Idle,
         events: sender.clone(),
     };
@@ -1435,7 +1457,7 @@ fn delete_secret(state: &AppState, id: &AccountId, target: SecretTarget) -> Resu
 /// others; unread rollups in the returned snapshot cover all of them.
 pub async fn sync_all() -> Result<ModelSnapshot, String> {
     let _sync = SYNC_LOCK.lock().await;
-    let (config, accounts, sender) = {
+    let (config, sessions, scheduler, accounts, sender) = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
@@ -1446,12 +1468,15 @@ pub async fn sync_all() -> Result<ModelSnapshot, String> {
             .map_err(|error| format!("read accounts: {error}"))?;
         state.status = SyncStatus::Syncing;
         let config = state.config.clone();
+        let sessions = state.sessions.clone();
+        let scheduler = state.scheduler.clone();
         let sender = state.events.clone();
-        (config, accounts, sender)
+        (config, sessions, scheduler, accounts, sender)
     };
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
-    let (outcome, capabilities) = sync_accounts(&config, &accounts, &sender).await;
+    let (outcome, capabilities) =
+        sync_accounts(&config, &sessions, &scheduler, &accounts, &sender).await;
 
     let status = finish_sync(accounts.len(), outcome, capabilities);
     // The account sync never visits non-special folders; if one is open,
@@ -1473,7 +1498,7 @@ pub async fn sync_all() -> Result<ModelSnapshot, String> {
 /// reported through events and the returned snapshot's status.
 pub async fn sync_account(id: &AccountId) -> Result<ModelSnapshot, String> {
     let _sync = SYNC_LOCK.lock().await;
-    let (config, account, sender) = {
+    let (config, sessions, scheduler, account, sender) = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
@@ -1486,12 +1511,19 @@ pub async fn sync_account(id: &AccountId) -> Result<ModelSnapshot, String> {
             .find(|account| &account.id == id)
             .ok_or_else(|| format!("unknown account {id}"))?;
         state.status = SyncStatus::Syncing;
-        (state.config.clone(), account, state.events.clone())
+        (
+            state.config.clone(),
+            state.sessions.clone(),
+            state.scheduler.clone(),
+            account,
+            state.events.clone(),
+        )
     };
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
     let accounts = std::slice::from_ref(&account);
-    let (outcome, capabilities) = sync_accounts(&config, accounts, &sender).await;
+    let (outcome, capabilities) =
+        sync_accounts(&config, &sessions, &scheduler, accounts, &sender).await;
 
     let status = finish_sync(accounts.len(), outcome, capabilities);
     let snapshot = snapshot();
@@ -1515,42 +1547,68 @@ pub async fn sync_folder(id: &FolderId) -> Result<ModelSnapshot, String> {
 /// account and folder, connects, and runs the engine's one-folder sync with a
 /// thread index seeded from the account's cached messages.
 async fn sync_folder_inner(id: &FolderId) -> Result<ModelSnapshot, String> {
-    let (config, account, folder, sender) = {
+    let (config, account, folder, ctx, scheduler, sender) = {
         let guard = lock_state();
         let state = guard
             .as_ref()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
         let (account, folder) = locate_folder(&state.store, id)?;
-        (state.config.clone(), account, folder, state.events.clone())
+        let ctx = state.sessions.context(&account.id, SYNC_TIMEOUT).ok();
+        (
+            state.config.clone(),
+            account,
+            folder,
+            ctx,
+            state.scheduler.clone(),
+            state.events.clone(),
+        )
+    };
+    let Some(ctx) = ctx else {
+        return Err(not_initialized_message());
     };
 
     let store = Store::open(database_path(&config.data_dir))
         .map_err(|error| format!("open folder store: {error}"))?;
-    let mut transport = config
-        .transport
-        .imap(&account)
-        .await
-        .map_err(|error| format!("{}: {error}", account.label))?;
-    let remote = RemoteFolder {
-        name: folder.name.clone(),
-        delimiter: folder.delimiter.clone(),
-        kind: folder.kind,
+    // Hold the account's gate for the whole remote-read/apply sequence so a
+    // concurrent mutation for the same account cannot interleave it.
+    let operation = {
+        let account = account.clone();
+        let folder = folder.clone();
+        let config = config.clone();
+        let store = store;
+        async move {
+            let mut transport = config
+                .transport
+                .imap(&account)
+                .await
+                .map_err(|error| format!("{}: {error}", account.label))?;
+            let remote = RemoteFolder {
+                name: folder.name.clone(),
+                delimiter: folder.delimiter.clone(),
+                kind: folder.kind,
+            };
+            let mut threads = ThreadAssigner::from_messages(
+                &store
+                    .messages_for_account(&account.id)
+                    .map_err(|error| format!("read thread index: {error}"))?,
+            );
+            crate::sync::engine::sync_folder(
+                &store,
+                &account,
+                transport.as_mut(),
+                &remote,
+                &folder,
+                SYNC_WINDOW,
+                &mut threads,
+            )
+            .await
+            .map(|_| ())
+        }
     };
-    let mut threads = ThreadAssigner::from_messages(
-        &store
-            .messages_for_account(&account.id)
-            .map_err(|error| format!("read thread index: {error}"))?,
-    );
-    crate::sync::engine::sync_folder(
-        &store,
-        &account,
-        transport.as_mut(),
-        &remote,
-        &folder,
-        SYNC_WINDOW,
-        &mut threads,
-    )
-    .await?;
+    scheduler
+        .run_interactive(&ctx, operation)
+        .await
+        .map_err(scheduler_message)??;
 
     let _ = sender.send(CoreEvent::SnapshotChanged);
     Ok(snapshot())
@@ -1747,7 +1805,7 @@ pub async fn prefetch_bodies() {
     let Ok(_prefetch) = PREFETCH_LOCK.try_lock() else {
         return;
     };
-    let (config, candidates, generation) = {
+    let (config, sessions, scheduler, candidates, generation) = {
         let guard = lock_state();
         let Some(state) = guard.as_ref() else { return };
         if !state.config_doc.settings.prefetch_bodies {
@@ -1763,7 +1821,13 @@ pub async fn prefetch_bodies() {
                 return;
             }
         };
-        (state.config.clone(), candidates, state.prefetch_generation)
+        (
+            state.config.clone(),
+            state.sessions.clone(),
+            state.scheduler.clone(),
+            candidates,
+            state.prefetch_generation,
+        )
     };
     if candidates.is_empty() {
         return;
@@ -1786,33 +1850,12 @@ pub async fn prefetch_bodies() {
         .map(|((account_id, folder_id), candidates)| {
             let store = &store;
             let config = &config;
+            let sessions = &sessions;
+            let scheduler = &scheduler;
             async move {
                 let result: Result<(), String> = async {
                     let account = find_account(store, &account_id)?;
-                    let folder = store
-                        .folders(&account_id)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .find(|f| f.id == folder_id)
-                        .ok_or("prefetch folder missing")?;
-                    let mut transport = config
-                        .transport
-                        .imap(&account)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let selected = transport
-                        .select(&RemoteFolder {
-                            name: folder.name,
-                            delimiter: folder.delimiter,
-                            kind: folder.kind,
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
                     for candidate in candidates {
-                        if candidate.uidvalidity != selected.uidvalidity {
-                            log::debug!("skip prefetch after UIDVALIDITY change for {folder_id}");
-                            continue;
-                        }
                         // A removed/replaced account or reset invalidates this batch.
                         {
                             let guard = lock_state();
@@ -1834,18 +1877,44 @@ pub async fn prefetch_bodies() {
                                 continue;
                             }
                         }
-                        match transport.fetch_body(candidate.uid).await {
-                            Ok(raw) => {
-                                // Revalidate and cache atomically with respect to reset/removal.
-                                let guard = lock_state();
-                                if let Some(state) = guard.as_ref()
-                                    && generation == state.prefetch_generation
-                                    && prefetch_candidate_is_current(state, &candidate)
-                                {
-                                    cache_fetched_body(&state.store, &candidate.message_id, &raw);
-                                }
+                        // The remote mapping names the body fetch; a message with
+                        // no provider identity cannot be prefetched.
+                        let Ok(remote) = store.remote_message(&account_id, &candidate.message_id)
+                        else {
+                            continue;
+                        };
+                        let Ok(ctx) = sessions.context(&account_id, INTERACTIVE_TIMEOUT) else {
+                            break;
+                        };
+                        let providers = config.providers.clone();
+                        let account = account.clone();
+                        let operation =
+                            async { body::fetch_body(&providers, &account, &ctx, &remote).await };
+                        let content = match scheduler.run_background(&ctx, operation).await {
+                            Ok(Some(Ok(content))) => content,
+                            // A busy gate skips this candidate; the next quiet
+                            // pass retries it. `None` is not an error.
+                            Ok(Some(Err(error))) => {
+                                log::warn!("prefetch {}: {error}", candidate.message_id);
+                                continue;
                             }
-                            Err(error) => log::warn!("prefetch {}: {error}", candidate.message_id),
+                            Ok(None) => continue,
+                            Err(error) => {
+                                log::debug!(
+                                    "prefetch {} deferred: {}",
+                                    candidate.message_id,
+                                    scheduler_message(error)
+                                );
+                                continue;
+                            }
+                        };
+                        // Revalidate and cache atomically with respect to reset/removal.
+                        let guard = lock_state();
+                        if let Some(state) = guard.as_ref()
+                            && generation == state.prefetch_generation
+                            && prefetch_candidate_is_current(state, &candidate)
+                        {
+                            body::cache_body_content(&state.store, &candidate.message_id, &content);
                         }
                     }
                     Ok(())
@@ -1854,6 +1923,7 @@ pub async fn prefetch_bodies() {
                 if let Err(error) = result {
                     log::warn!("prefetch {account_id}: {error}");
                 }
+                let _ = folder_id;
             }
         })
         .buffer_unordered(PREFETCH_CONCURRENCY)
@@ -1878,14 +1948,16 @@ fn prefetch_candidate_is_current(state: &AppState, candidate: &PrefetchCandidate
                     .message_memberships(&m.id)
                     .map(|memberships| memberships.contains(&candidate.folder_id))
                     .unwrap_or(false);
-                let same_remote = state
-                    .store
-                    .imap_coords(&m.id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|coords| {
-                        coords.uid == candidate.uid && coords.uidvalidity == candidate.uidvalidity
-                    });
+                let same_remote =
+                    state
+                        .store
+                        .imap_coords(&m.id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|coords| {
+                            coords.uid == candidate.uid
+                                && coords.uidvalidity == candidate.uidvalidity
+                        });
                 m.account_id == candidate.account_id
                     && in_folder
                     && same_remote
@@ -1894,15 +1966,15 @@ fn prefetch_candidate_is_current(state: &AppState, candidate: &PrefetchCandidate
 }
 
 /// Open a conversation for the reader: load its messages, resolve the newest
-/// message's body (from cache or through the account's transport), and install
-/// the resulting [`ConversationDetail`] as the selected conversation.
+/// message's body (from cache or through the account's provider session), and
+/// install the resulting [`ConversationDetail`] as the selected conversation.
 ///
 /// A body over [`MAX_BODY_BYTES`] is opened without a fetch and marked
 /// [`MessageBody::TooLarge`]; a missing or unreachable body degrades to
 /// `body: None` so the reader always renders its chrome even offline.
 pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, String> {
     // Phase 1: read the conversation, its cached body, and the fetch decision.
-    let (messages, config, account, folder, uid, cached, too_large, events, initial, generation) = {
+    let (messages, config, account, remote, cached, too_large, ctx, events, initial, generation) = {
         let mut guard = lock_state();
         let state = guard
             .as_mut()
@@ -1921,26 +1993,12 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             .into_iter()
             .find(|account| account.id == messages[0].account_id)
             .ok_or_else(|| "conversation account missing".to_string())?;
-        let location = state
+        // The remote mapping names the body fetch. A native account with no
+        // mapping opens its cached body (or an empty reader) without a fetch.
+        let remote = state
             .store
-            .message_location(&messages[0].id)
-            .map_err(|error| format!("read message location: {error}"))?
-            .ok_or_else(|| "conversation message missing".to_string())?;
-        let folder = state
-            .store
-            .folders(&account.id)
-            .map_err(|error| format!("read folders: {error}"))?
-            .into_iter()
-            .find(|folder| folder.id == location.folder_id)
-            .ok_or_else(|| "conversation folder missing".to_string())?;
-        // IMAP coordinates are optional: a native provider message has none and
-        // simply opens its cached body (or an empty reader) without a fetch.
-        let uid = state
-            .store
-            .imap_coords(&messages[0].id)
-            .ok()
-            .flatten()
-            .map(|coords| coords.uid);
+            .remote_message(&account.id, &messages[0].id)
+            .ok();
         let cached = state
             .store
             .body(&messages[0].id)
@@ -1963,14 +2021,18 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
             body,
         ));
         let initial = state.build_snapshot();
+        let ctx = state
+            .sessions
+            .context(&account.id, INTERACTIVE_TIMEOUT)
+            .ok();
         (
             messages,
             state.config.clone(),
             account,
-            folder,
-            uid,
+            remote,
             cached,
             too_large,
+            ctx,
             state.events.clone(),
             initial,
             generation,
@@ -1981,20 +2043,23 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
         return Ok(initial);
     }
 
-    // Phase 2: fetch raw bytes only when uncached and under the size cap.
-    let fetched = if cached.is_none() && !too_large {
-        match uid {
-            Some(uid) => match fetch_body_bytes(&config, &account, &folder, uid).await {
-                Ok(raw) => Some(raw),
+    // Phase 2: fetch an uncached, under-cap body through the provider session.
+    // A body read applies nothing durable, so it does not take the account's
+    // sync/mutation gate: it opens its own connection and never blocks an
+    // interactive read behind a background sync (or vice versa).
+    let fetched = match (remote, ctx) {
+        (Some(remote), Some(ctx)) => {
+            let providers = config.providers.clone();
+            let account = account.clone();
+            match body::fetch_body(&providers, &account, &ctx, &remote).await {
+                Ok(content) => Some(content),
                 Err(error) => {
                     log::warn!("open conversation {thread_id}: {error}");
                     None
                 }
-            },
-            None => None,
+            }
         }
-    } else {
-        None
+        _ => None,
     };
 
     // Phase 3: cache and build the detail under the lock, using the shared
@@ -2004,13 +2069,16 @@ pub async fn open_conversation(thread_id: &ThreadId) -> Result<ModelSnapshot, St
         let state = guard
             .as_mut()
             .ok_or_else(|| "pige api is not initialized".to_string())?;
-        let body = resolve_body(
-            &state.store,
-            &messages[0].id,
-            cached,
-            fetched.as_deref(),
-            too_large,
-        );
+        let body = if too_large {
+            Some(MessageBody::TooLarge)
+        } else if let Some(cached) = cached {
+            document_from_body(&cached).map(MessageBody::Document)
+        } else if let Some(content) = &fetched {
+            body::cache_body_content(&state.store, &messages[0].id, content)
+                .map(MessageBody::Document)
+        } else {
+            None
+        };
         if generation != state.open_generation {
             return Ok(state.build_snapshot());
         }
@@ -2294,7 +2362,7 @@ pub fn open_url(url: &str) -> Result<(), String> {
 /// hands the file to [`Opener::open_file`]. Parts over
 /// [`crate::mail::MAX_ATTACHMENT_BYTES`] are rejected before they are written.
 pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf, String> {
-    let (config, account, folder, uid, stored_part, cached_path) = {
+    let (config, account, remote, cached_path, ctx) = {
         let guard = lock_state();
         let state = guard
             .as_ref()
@@ -2305,87 +2373,120 @@ pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf,
             .message(message)
             .map_err(|error| format!("read message: {error}"))?
             .ok_or_else(|| format!("unknown message {message}"))?;
-        let uid = state
-            .store
-            .imap_coords(&stored_message.id)
-            .ok()
-            .flatten()
-            .map(|coords| coords.uid);
         let account = find_account(&state.store, &stored_message.account_id)?;
-        let location = state
-            .store
-            .message_location(message)
-            .map_err(|error| format!("read message location: {error}"))?
-            .ok_or_else(|| format!("unknown message {message}"))?;
-        let folder = state
-            .store
-            .folders(&account.id)
-            .map_err(|error| format!("read folders: {error}"))?
-            .into_iter()
-            .find(|folder| folder.id == location.folder_id)
-            .ok_or_else(|| "message folder is not cached".to_string())?;
-
-        let stored = state
+        // The remote identity names the attachment fetch; the provider resolves
+        // the part within the message it owns.
+        let remote = state.store.remote_message(&account.id, message).ok();
+        let cached_path = state
             .store
             .attachment(message, part)
-            .map_err(|error| format!("read attachment: {error}"))?;
-        let cached_path = stored
-            .as_ref()
-            .and_then(|attachment| attachment.cached_path.as_deref())
-            .and_then(|path| verified_cached_attachment(&state.config.cache_dir, path));
-        let stored_part = stored.map(|attachment| attachment.part);
-
-        (
-            state.config.clone(),
-            account,
-            folder,
-            uid,
-            stored_part,
-            cached_path,
-        )
+            .map_err(|error| format!("read attachment: {error}"))?
+            .and_then(|attachment| attachment.cached_path)
+            .and_then(|path| verified_cached_attachment(&state.config.cache_dir, &path));
+        let ctx = state
+            .sessions
+            .context(&account.id, INTERACTIVE_TIMEOUT)
+            .ok();
+        (state.config.clone(), account, remote, cached_path, ctx)
     };
 
     let path = match cached_path {
         Some(path) => path,
         None => {
-            // Reject a previously known oversized part before downloading the
-            // whole message again.
-            if let Some(part) = &stored_part {
-                check_attachment_size(part.size).map_err(|error| error.to_string())?;
-            }
-
-            let Some(uid) = uid else {
-                return Err("this message has no IMAP identity to fetch".to_string());
+            let Some(remote) = remote else {
+                return Err("this message has no remote identity to fetch".to_string());
             };
-            let raw = fetch_body_bytes(&config, &account, &folder, uid).await?;
-            let parts = extract_attachments(&raw);
-            let part_meta = parts
-                .iter()
-                .find(|candidate| candidate.part_id == part)
-                .cloned()
-                .ok_or_else(|| format!("attachment part {part} is not present in the message"))?;
-            // Refuse before allocating and decoding an oversized MIME part.
-            check_attachment_size(part_meta.size).map_err(|error| error.to_string())?;
-            let bytes = attachment_bytes(&raw, &part_meta.part_id).ok_or_else(|| {
-                format!("attachment part {} could not be decoded", part_meta.part_id)
-            })?;
+            let Some(ctx) = ctx else {
+                return Err(not_initialized_message());
+            };
+
+            // The provider body fetch records each part's metadata and remote
+            // id; without it there is nothing to name the fetch or the file.
+            let metadata = {
+                let guard = lock_state();
+                let state = guard.as_ref().ok_or_else(not_initialized_message)?;
+                state
+                    .store
+                    .attachment(message, part)
+                    .map_err(|error| format!("read attachment: {error}"))?
+            };
+            // When the part was not cached yet, fetch the body once to learn its
+            // descriptors. Its original bytes (when the provider supplies them)
+            // are reused so an IMAP message is never downloaded twice for the
+            // same open; a provider with no raw form falls back to an explicit
+            // `attachment` fetch named by the persisted remote descriptor.
+            let (metadata, prefetched) = match metadata {
+                Some(metadata) => (metadata, None),
+                None => {
+                    let providers = config.providers.clone();
+                    let account = account.clone();
+                    let remote_body = remote.clone();
+                    let content = body::fetch_body(&providers, &account, &ctx, &remote_body)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let guard = lock_state();
+                    let state = guard.as_ref().ok_or_else(not_initialized_message)?;
+                    body::cache_body_content(&state.store, message, &content);
+                    let metadata = state
+                        .store
+                        .attachment(message, part)
+                        .map_err(|error| format!("read attachment: {error}"))?
+                        .ok_or_else(|| {
+                            format!("attachment part {part} is not present in the message")
+                        })?;
+                    (metadata, Some(content))
+                }
+            };
+
+            // Reject a known oversized part before downloading it again.
+            check_attachment_size(metadata.part.size).map_err(|error| error.to_string())?;
+
+            let bytes = match prefetched.as_ref().and_then(|content| content.raw.clone()) {
+                Some(raw) => attachment_bytes(&raw, &metadata.part.part_id).ok_or_else(|| {
+                    format!(
+                        "attachment part {} could not be decoded",
+                        metadata.part.part_id
+                    )
+                })?,
+                None => {
+                    // Prefer the provider's remote id; fall back to the local
+                    // MIME part id for a part cached before the remote id column
+                    // existed.
+                    let remote_attachment = {
+                        let guard = lock_state();
+                        let state = guard.as_ref().ok_or_else(not_initialized_message)?;
+                        state
+                            .store
+                            .attachment_remote_id(message, part)
+                            .map_err(|error| format!("read attachment remote id: {error}"))?
+                            .unwrap_or_else(|| RemoteAttachmentId::from(part.to_string()))
+                    };
+
+                    let providers = config.providers.clone();
+                    let account = account.clone();
+                    let remote_message = remote.clone();
+                    let remote_attachment_for_fetch = remote_attachment.clone();
+                    body::fetch_attachment(
+                        &providers,
+                        &account,
+                        &ctx,
+                        &remote_message,
+                        &remote_attachment_for_fetch,
+                    )
+                    .await?
+                }
+            };
             check_attachment_size(bytes.len() as u64).map_err(|error| error.to_string())?;
 
-            let path = cache_attachment(&config.cache_dir, message, &part_meta, &bytes)
+            let path = cache_attachment(&config.cache_dir, message, &metadata.part, &bytes)
                 .map_err(|error| error.to_string())?;
 
             {
                 let guard = lock_state();
-                let state = guard
-                    .as_ref()
-                    .ok_or_else(|| "pige api is not initialized".to_string())?;
+                let state = guard.as_ref().ok_or_else(not_initialized_message)?;
                 state
                     .store
-                    .store_attachments(message, &parts)
-                    .map_err(|error| format!("store attachment metadata: {error}"))?;
-                state
-                    .store
-                    .set_attachment_cached_path(message, &part_meta.part_id, &path)
+                    .set_attachment_cached_path(message, &metadata.part.part_id, &path)
                     .map_err(|error| format!("store attachment path: {error}"))?;
             }
 
@@ -2397,7 +2498,7 @@ pub async fn open_attachment(message: &MessageId, part: &str) -> Result<PathBuf,
         let guard = lock_state();
         guard
             .as_ref()
-            .ok_or_else(|| "pige api is not initialized".to_string())?
+            .ok_or_else(not_initialized_message)?
             .config
             .opener
             .clone()
@@ -2423,103 +2524,6 @@ fn verified_cached_attachment(cache_dir: &Path, path: &Path) -> Option<PathBuf> 
     canonical_path
         .starts_with(&canonical_root)
         .then(|| path.to_path_buf())
-}
-
-/// Fetch the raw bytes of a message through the account's transport.
-async fn fetch_body_bytes(
-    config: &Config,
-    account: &Account,
-    folder: &Folder,
-    uid: Uid,
-) -> Result<Vec<u8>, String> {
-    let mut transport = config
-        .transport
-        .imap(account)
-        .await
-        .map_err(|error| format!("{}: {error}", account.label))?;
-    let remote = RemoteFolder {
-        name: folder.name.clone(),
-        delimiter: folder.delimiter.clone(),
-        kind: folder.kind,
-    };
-    transport
-        .select(&remote)
-        .await
-        .map_err(|error| format!("select {}: {error}", folder.name))?;
-    transport
-        .fetch_body(uid)
-        .await
-        .map_err(|error| format!("fetch body {uid}: {error}"))
-}
-
-/// Resolve the newest message's body: too-large wins, then the cached body,
-/// then a freshly fetched raw message. Fetched bodies with no text are left
-/// uncached so a later retry can succeed.
-fn resolve_body(
-    store: &Store,
-    message_id: &MessageId,
-    cached: Option<Body>,
-    fetched: Option<&[u8]>,
-    too_large: bool,
-) -> Option<MessageBody> {
-    if too_large {
-        return Some(MessageBody::TooLarge);
-    }
-    if let Some(body) = cached {
-        return document_from_body(&body).map(MessageBody::Document);
-    }
-    cache_fetched_body(store, message_id, fetched?).map(MessageBody::Document)
-}
-
-/// Cache a fetched message through the same path for opens and prefetch.
-fn cache_fetched_body(store: &Store, message_id: &MessageId, raw: &[u8]) -> Option<MailDocument> {
-    let parts = extract_attachments(raw);
-    if let Err(error) = store.store_attachments(message_id, &parts) {
-        log::warn!("cache attachments {message_id}: {error}");
-    }
-    let (html, plain_text) = extract_body_parts(raw);
-    let body = Body {
-        plain_text: plain_text.clone(),
-        html: html.clone(),
-        fetched_at: now_unix(),
-    };
-    let document = document_from_body(&body);
-    if document.is_none()
-        && let Err(error) = store.set_body_state(message_id, "none")
-    {
-        log::warn!("record unreadable body {message_id}: {error}");
-    }
-    if document.is_some()
-        && let Err(error) = store.upsert_body(message_id, &body)
-    {
-        log::warn!("cache body {message_id}: {error}");
-    }
-    // A decoded body also repairs the list preview. Snippets cached before the
-    // decoder landed held the raw transfer-encoded text; rewriting them here
-    // keeps prefetched and opened mail readable.
-    if let Some(snippet) = snippet_from_parts(body.plain_text.as_deref(), body.html.as_deref())
-        && let Err(error) = store.set_snippet(message_id, &snippet)
-    {
-        log::warn!("update preview {message_id}: {error}");
-    }
-    document
-}
-
-/// Extract the HTML and plain-text bodies from a raw RFC 5322 message.
-///
-/// Delegates to the shared MIME entry point so the reader cache and provider
-/// adapters decode bodies identically.
-fn extract_body_parts(raw: &[u8]) -> (Option<String>, Option<String>) {
-    crate::mail::body_parts(raw)
-}
-
-/// Build a [`MailDocument`] from a cached body, preferring HTML.
-fn document_from_body(body: &Body) -> Option<MailDocument> {
-    if let Some(html) = &body.html {
-        Some(parse_html(html, false))
-    } else {
-        body.plain_text.as_deref().map(plain_text_document)
-    }
 }
 
 /// Assemble the reader view for a conversation, attaching the newest message's
@@ -2574,8 +2578,14 @@ fn build_conversation_detail(
     }
 }
 
+/// The user-facing error when a captured context is gone (removed account or
+/// uninitialized state), shared by the API's orchestration modules.
+pub(crate) fn not_initialized_message() -> String {
+    "pige api is not initialized".to_string()
+}
+
 /// Unix seconds, UTC, for the body cache's `fetched_at`.
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
@@ -2703,7 +2713,11 @@ async fn backfill_older(
         let remote_id = ImapCoords::new(folder.name.clone(), uidvalidity, uid).encode();
         // A re-page of an already-cached UID reuses its local content id.
         let id = store
-            .remote_message_for(&account.id, crate::providers::IMAP_SMTP_PROVIDER, &remote_id)
+            .remote_message_for(
+                &account.id,
+                crate::providers::IMAP_SMTP_PROVIDER,
+                &remote_id,
+            )
             .map_err(|error| format!("read remote older {}: {error}", folder.name))?
             .unwrap_or_else(MessageId::new);
         let participants = participants_of(&header);
@@ -2768,9 +2782,11 @@ struct SyncOutcome {
 /// capabilities observed for each successfully synced account.
 async fn sync_accounts(
     config: &Config,
+    sessions: &crate::auth::AccountSessionManager,
+    scheduler: &AccountScheduler,
     accounts: &[Account],
     sender: &broadcast::Sender<CoreEvent>,
-) -> (SyncOutcome, Vec<(AccountId, Capabilities)>) {
+) -> (SyncOutcome, Vec<(AccountId, ProviderCapabilities)>) {
     let store = match Store::open(database_path(&config.data_dir)) {
         Ok(store) => store,
         Err(error) => {
@@ -2809,7 +2825,7 @@ async fn sync_accounts(
             account: account.id.clone(),
         });
 
-        match sync_one(&store, config, account, sender).await {
+        match sync_one(&store, config, sessions, scheduler, account, sender).await {
             Ok(caps) => {
                 outcome.succeeded += 1;
                 capabilities.push((account.id.clone(), caps));
@@ -2834,43 +2850,79 @@ async fn sync_accounts(
 async fn sync_one(
     store: &Store,
     config: &Config,
+    sessions: &crate::auth::AccountSessionManager,
+    scheduler: &AccountScheduler,
     account: &Account,
     sender: &broadcast::Sender<CoreEvent>,
-) -> Result<Capabilities, String> {
-    let mut transport = config
-        .transport
-        .imap(account)
-        .await
-        .map_err(|error| format!("{}: {error}", account.label))?;
-
-    // Capabilities drive the UI's archive/move choices. A failure here must not
-    // abort the whole sync, so fall back to the (generic) default.
-    let capabilities = match transport.capabilities().await {
-        Ok(caps) => caps,
-        Err(error) => {
-            log::warn!("capabilities for {}: {error}", account.label);
-            Capabilities::default()
-        }
+) -> Result<ProviderCapabilities, String> {
+    // A missing or cancelled session means the account was removed or
+    // invalidated; report it as an unreachable account rather than syncing.
+    let Ok(ctx) = sessions.context(&account.id, SYNC_TIMEOUT) else {
+        return Err(format!("{}: {RECONNECT_ERROR}", account.label));
     };
 
-    let report = run_sync_account(store, account, transport.as_mut(), SYNC_WINDOW)
+    // The whole remote-read/apply sequence holds the account's gate so a
+    // concurrent mutation for the same account cannot interleave it, and a late
+    // sync page can never reverse a completed mutation.
+    let providers = config.providers.clone();
+    let target = account.clone();
+    let sync_ctx = ctx.clone();
+    let inner = scheduler
+        .run_interactive(&ctx, async move {
+            let mut session = providers
+                .open(&target, &sync_ctx)
+                .await
+                .map_err(|error| error.safe_message)?;
+            let capabilities = session.capabilities;
+            let budget = WorkBudget::new(SYNC_WINDOW, SYNC_PAGES, sync_ctx.deadline);
+            let report = provider_sync_account(store, &mut session, &sync_ctx, budget)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((report, capabilities))
+        })
         .await
-        .map_err(|error| format!("{}: {error}", account.label))?;
+        .map_err(scheduler_message)?;
+    let (report, capabilities) = inner.map_err(|error| format!("{}: {error}", account.label))?;
 
-    // Outbox delivery shares this account's connection. A missing SMTP
-    // connection is expected offline: the rows stay queued for the next sync.
+    // The provider page reports each collection's server total but not its
+    // unread rollup, so recompute `unread` locally from the cached flags. This
+    // keeps the navigation rail's counts correct after an ordinary sync without
+    // touching the server-reported total that paging compares against.
+    if let Ok(folders) = store.folders(&account.id) {
+        for folder in folders {
+            if let Err(error) = store.recompute_folder_unread(&folder.id) {
+                log::warn!("recompute unread for {}: {error}", folder.id);
+            }
+        }
+    }
+
+    // Outbox delivery is still protocol-side (SMTP + a best-effort Sent APPEND)
+    // until provider submission lands; a missing SMTP connection is expected
+    // offline, so the rows stay queued for the next sync.
     let mut outbox_errors = Vec::new();
     let has_pending = store
         .outbox_pending(&account.id)
         .is_ok_and(|pending| !pending.is_empty());
     if has_pending {
         match config.transport.smtp(account).await {
-            Ok(mut smtp) => {
-                match send::flush_outbox(store, account, smtp.as_mut(), transport.as_mut()).await {
-                    Ok(outbox) => outbox_errors.extend(outbox.errors),
-                    Err(error) => outbox_errors.push(error.to_string()),
+            Ok(mut smtp) => match config.transport.imap(account).await {
+                Ok(mut imap) => {
+                    match send::flush_outbox(store, account, smtp.as_mut(), imap.as_mut()).await {
+                        Ok(outbox) => outbox_errors.extend(outbox.errors),
+                        Err(error) => outbox_errors.push(error.to_string()),
+                    }
                 }
-            }
+                Err(error) => {
+                    log::warn!(
+                        "IMAP unavailable for {} while appending Sent; sending without the copy: {error}",
+                        account.label
+                    );
+                    match send::flush_outbox_smtp_only(store, account, smtp.as_mut()).await {
+                        Ok(outbox) => outbox_errors.extend(outbox.errors),
+                        Err(error) => outbox_errors.push(error.to_string()),
+                    }
+                }
+            },
             Err(error) => log::debug!("outbox for {} is waiting: {error}", account.label),
         }
     }
@@ -2905,7 +2957,7 @@ async fn sync_one(
 fn finish_sync(
     attempted: usize,
     outcome: SyncOutcome,
-    capabilities: Vec<(AccountId, Capabilities)>,
+    capabilities: Vec<(AccountId, ProviderCapabilities)>,
 ) -> SyncStatus {
     let status = if outcome.failed == 0 || outcome.succeeded > 0 || attempted == 0 {
         SyncStatus::Idle

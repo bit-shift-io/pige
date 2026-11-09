@@ -4,9 +4,9 @@
 use crate::account::AccountId;
 use crate::html::MailDocument;
 use crate::mail::{AttachmentPart, Flags, FolderId, FolderKind, MessageId, ThreadId};
+use crate::providers::ProviderCapabilities;
 use crate::search::{SearchHit, SearchScope};
 use crate::send::OutboxEntry;
-use crate::transport::Capabilities;
 
 /// One account row in the navigation rail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,9 +28,10 @@ pub struct AccountSection {
     pub email: String,
     /// Sum of the section's folder unread counts.
     pub unread: u32,
-    /// Server capabilities observed during the last sync; the UI uses these to
-    /// decide which mutation actions to offer.
-    pub capabilities: Capabilities,
+    /// Provider-neutral capabilities observed during the last sync; the UI uses
+    /// these to decide which mutation actions to offer. Never a protocol
+    /// capability set.
+    pub capabilities: ProviderCapabilities,
     pub folders: Vec<FolderSummary>,
 }
 

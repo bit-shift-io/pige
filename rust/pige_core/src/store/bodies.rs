@@ -5,6 +5,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use crate::mail::MessageId;
+use crate::providers::SignatureStatus;
 
 use super::{Store, StoreError};
 
@@ -44,6 +45,37 @@ impl Store {
         .map_err(StoreError::from)
     }
 
+    /// Record the signature trust state a provider reported with a body fetch.
+    /// Provider-neutral; the IMAP adapter reports `NotApplicable`.
+    pub fn set_signature_status(
+        &self,
+        id: &MessageId,
+        status: SignatureStatus,
+    ) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE messages SET signature = ?1 WHERE id = ?2",
+            params![signature_to_db(status), id.0],
+        )?;
+        Ok(())
+    }
+
+    /// The last signature trust state recorded for a message. Missing rows and
+    /// rows written before v8 read back as `NotApplicable`.
+    pub fn signature_status(&self, id: &MessageId) -> Result<SignatureStatus, StoreError> {
+        let raw: Option<String> = self
+            .connection()
+            .query_row(
+                "SELECT signature FROM messages WHERE id = ?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .as_deref()
+            .map(signature_from_db)
+            .unwrap_or(SignatureStatus::NotApplicable))
+    }
+
     /// Store (or replace) the cached body for a message and refresh its search
     /// entry with the plain-text half.
     pub fn upsert_body(&self, message_id: &MessageId, body: &Body) -> Result<(), StoreError> {
@@ -61,5 +93,31 @@ impl Store {
         super::search::index_message_on(&tx, message_id)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+/// Stable string form of a signature status. Kept explicit (not derived) so a
+/// future variant cannot silently change the meaning of a stored value.
+fn signature_to_db(status: SignatureStatus) -> &'static str {
+    match status {
+        SignatureStatus::NotApplicable => "not_applicable",
+        SignatureStatus::Verified => "verified",
+        SignatureStatus::Unsigned => "unsigned",
+        SignatureStatus::Unverified => "unverified",
+        SignatureStatus::Invalid => "invalid",
+        SignatureStatus::Unsupported => "unsupported",
+    }
+}
+
+/// Parse a stored signature status. An unknown legacy value degrades to
+/// `NotApplicable` rather than failing a read.
+fn signature_from_db(raw: &str) -> SignatureStatus {
+    match raw {
+        "verified" => SignatureStatus::Verified,
+        "unsigned" => SignatureStatus::Unsigned,
+        "unverified" => SignatureStatus::Unverified,
+        "invalid" => SignatureStatus::Invalid,
+        "unsupported" => SignatureStatus::Unsupported,
+        _ => SignatureStatus::NotApplicable,
     }
 }
