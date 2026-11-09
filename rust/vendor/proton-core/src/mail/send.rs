@@ -328,7 +328,6 @@ impl Client {
 
         // 3. encrypt the transport body.
         let (material, data_packet) = crypto::encrypt_for_transport(provider, addr, &opts.body)?;
-        let algo = crypto::algo_name(material.algo);
 
         // 4. per-recipient packaging.
         let recipients = dedupe(&[&opts.to, &opts.cc, &opts.bcc]);
@@ -336,7 +335,6 @@ impl Client {
         let mut internal_addrs = Map::new();
         let mut pgp_addrs = Map::new();
         let mut eo_addrs = Map::new();
-        let mut external_addrs = Map::new();
         let mut modulus_cache: Option<(String, String)> = None;
 
         // Build a per-recipient encrypted entry (Type 1 or Type 8) wrapping the
@@ -429,11 +427,13 @@ impl Client {
                 tracing::debug!(target: "proton_core::send", recipient = %email, "external recipient — encrypted-outside (Type 2)");
                 eo_addrs.insert(email.clone(), entry);
             } else {
-                tracing::warn!(target: "proton_core::send", recipient = %email, "external recipient with no key — sending CLEARTEXT (Type 4)");
-                external_addrs.insert(
-                    email.clone(),
-                    json!({ "Type": package_type::CLEAR, "Signature": 0 }),
-                );
+                // Pige P4 patch: never silently downgrade to cleartext when a
+                // recipient has no usable encryption key and no explicitly
+                // requested encrypted-outside password. The caller must fail
+                // closed and report an actionable policy error.
+                return Err(Error::Other(format!(
+                    "recipient {email} has no usable encryption key; refusing cleartext"
+                )));
             }
         }
 
@@ -468,27 +468,6 @@ impl Client {
                 "Body": STANDARD.encode(&data_packet),
             }));
         }
-        if !external_addrs.is_empty() {
-            let mut pkg = json!({
-                "Addresses": Value::Object(external_addrs),
-                "MIMEType": mime_type,
-                "Type": package_type::CLEAR,
-                "Body": STANDARD.encode(&data_packet),
-                "BodyKey": { "Key": STANDARD.encode(&material.key), "Algorithm": algo },
-            });
-            if !uploaded.is_empty() {
-                let mut ak = Map::new();
-                for u in &uploaded {
-                    ak.insert(
-                        u.id.clone(),
-                        json!({ "Key": STANDARD.encode(&u.material.key), "Algorithm": crypto::algo_name(u.material.algo) }),
-                    );
-                }
-                pkg["AttachmentKeys"] = Value::Object(ak);
-            }
-            packages.push(pkg);
-        }
-
         // 6. send.
         let mut body = json!({
             "ExpirationTime": Value::Null,

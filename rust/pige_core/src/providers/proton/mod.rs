@@ -11,10 +11,12 @@
 
 pub mod auth;
 pub mod client;
-pub mod keys;
 mod contacts;
+pub mod keys;
 mod mailbox;
 mod normalize;
+mod policy;
+mod submission;
 mod sync;
 
 use std::collections::HashMap;
@@ -39,7 +41,11 @@ pub use client::{PROTON_APP_VERSION, ProtonClient, ProtonEndpoints};
 pub use contacts::ProtonAddressBook;
 pub use keys::{ProtonAddressKeys, ProtonKeyStores, UnlockedKeyStore};
 pub use mailbox::ProtonMailbox;
+pub use policy::{DeliverySecurity, ProtonRecipientPolicy, RecipientDelivery};
+pub use submission::ProtonSubmission;
 pub use sync::{ProtonMutations, ProtonSync, cursor_stage};
+
+pub(crate) use policy::ContactPolicyStore;
 
 // Re-exported for adapter code and synthetic tests. These are still private to
 // `providers::proton` from the application's point of view.
@@ -53,6 +59,10 @@ pub struct ProtonProviderFactory {
     endpoints: ProtonEndpoints,
     keys: Arc<ProtonKeyStores>,
     token_sources: Mutex<HashMap<AccountId, Arc<dyn TokenSource>>>,
+    /// One adapter-private contact-policy cache per account, shared by the
+    /// address book and submission services so encrypted card policy survives
+    /// a snapshot and is never exposed through a public DTO.
+    contact_policies: Mutex<HashMap<AccountId, Arc<ContactPolicyStore>>>,
     /// One refresher for every token source this factory builds (and, via
     /// [`proton_registration`], for the interactive auth service). A refresher
     /// serializes rotation per instance; sharing it keeps a cold resume and a
@@ -76,6 +86,7 @@ impl ProtonProviderFactory {
             endpoints,
             keys,
             token_sources: Mutex::new(HashMap::new()),
+            contact_policies: Mutex::new(HashMap::new()),
             refresher,
         }
     }
@@ -127,6 +138,17 @@ impl ProtonProviderFactory {
             self.endpoints.clone(),
         )
     }
+
+    fn contact_policies(&self, account: &AccountId) -> Arc<ContactPolicyStore> {
+        let mut policies = self
+            .contact_policies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        policies
+            .entry(account.clone())
+            .or_insert_with(|| Arc::new(ContactPolicyStore::default()))
+            .clone()
+    }
 }
 
 impl fmt::Debug for ProtonProviderFactory {
@@ -159,15 +181,16 @@ impl ProviderFactory for ProtonProviderFactory {
             return Err(ProviderError::unsupported("Proton for this account"));
         }
         // Build the shared client eagerly so every capability opened for this
-        // account uses the same token source and key store.
+        // account uses the same token source and key store. The contact-policy
+        // cache is shared by contacts and submission for this account.
         let client = self.client(&account.id);
+        let contacts = self.contact_policies(&account.id);
         let mutations = ProtonMutations::new(client.clone()).capabilities();
         let mut session = ProviderSession::new(ProviderCapabilities {
             mailbox: true,
             sync: true,
             mutations,
-            // P4 attaches submission; P3 attaches body reading and contacts.
-            submission: false,
+            submission: true,
             contacts: crate::providers::ContactCapabilities {
                 read: true,
                 // Proton exposes a full contact snapshot, not a delta stream.
@@ -181,7 +204,15 @@ impl ProviderFactory for ProtonProviderFactory {
         .with_provider(ProviderId::from(PROTON_PROVIDER));
         session.mailbox = Some(Box::new(ProtonMailbox::new(client.clone())));
         session.sync = Some(Box::new(ProtonSync::new(client.clone())));
-        session.address_book = Some(Box::new(ProtonAddressBook::new(client.clone())));
+        session.address_book = Some(Box::new(ProtonAddressBook::with_policy_store(
+            client.clone(),
+            contacts.clone(),
+        )));
+        session.submission = Some(Box::new(ProtonSubmission::with_contact_store(
+            client.clone(),
+            account.clone(),
+            contacts,
+        )));
         session.mutations = Some(Box::new(ProtonMutations::new(client)));
         Ok(session)
     }

@@ -38,6 +38,16 @@ This copy matches the S3-approved extraction patch inventory in
   `tracing-subscriber`; pinned `proton-crypto 0.14.1` with `rustpgp` and
   `default-features = false`, and `proton-srp 0.8`; removed upstream live /
   wiremock test targets.
+- `src/api/contacts.rs` (P3): `Contact`/`ContactEmail` retain `Cards`, `UID`
+  and unknown policy fields so encrypted contact policy can be read
+  adapter-privately rather than discarded by the public name/email projection.
+- `src/crypto/message.rs` (P3): added bounded body/attachment decryption helpers
+  used by Pige to reject decompression bombs before materializing plaintext.
+- `src/mail/send.rs` (P4): removed the silent `Type 4` cleartext fallback for
+  keyless external recipients. A recipient with no usable key and no explicit
+  encrypted-outside password now fails with an error instead of being sent in
+  cleartext. Pige's submission path resolves contact/key policy itself and never
+  calls this high-level send pipeline.
 
 No further behavioural changes are made. The vendored `session` module is left
 in the source for API completeness but Pige's Proton adapter never calls it:

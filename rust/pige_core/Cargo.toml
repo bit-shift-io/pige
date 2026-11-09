@@ -13,6 +13,7 @@ provider-proton = [
     "dep:proton-core",
     "dep:proton-crypto",
     "dep:proton-srp",
+    "dep:sha2",
     "dep:zeroize",
 ]
 # Test-only surface (mock cleartext endpoints, deterministic install hook).

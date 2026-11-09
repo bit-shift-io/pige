@@ -8,6 +8,7 @@
 //! never projected into the public read-only DTO.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use proton_core::api;
 use proton_core::api::contacts::{Contact, ContactCard, ContactEmail};
 
 use super::client::ProtonClient;
+use super::policy::{ContactMaterial, ContactPolicyStore};
 
 const CURSOR_VERSION: u32 = 1;
 const PAGE_SIZE: u32 = 100;
@@ -44,13 +46,23 @@ pub(crate) struct ProtonContactPrivate {
 pub struct ProtonAddressBook {
     client: ProtonClient,
     private: HashMap<String, ProtonContactPrivate>,
+    /// Shared with the submission policy. Raw cards stay adapter-private.
+    policy_store: Arc<ContactPolicyStore>,
 }
 
 impl ProtonAddressBook {
     pub fn new(client: ProtonClient) -> Self {
+        Self::with_policy_store(client, Arc::new(ContactPolicyStore::default()))
+    }
+
+    pub(crate) fn with_policy_store(
+        client: ProtonClient,
+        policy_store: Arc<ContactPolicyStore>,
+    ) -> Self {
         Self {
             client,
             private: HashMap::new(),
+            policy_store,
         }
     }
 
@@ -138,8 +150,12 @@ impl AddressBookService for ProtonAddressBook {
         let first_page = state.page == 0;
         if first_page {
             // A new full snapshot supersedes the previous cycle's retained
-            // card material; keep only what this enumeration reports.
+            // card material; keep only what this enumeration reports. The
+            // shared policy store accumulates the snapshot separately and only
+            // replaces the previous policy when the snapshot completes, so an
+            // interrupted sweep cannot erase a mandatory policy.
             self.private.clear();
+            self.policy_store.begin_snapshot();
         }
         let http = self.client.request_http(ctx).await?;
         let (total, contacts) =
@@ -157,6 +173,8 @@ impl AddressBookService for ProtonAddressBook {
                     emails: contact.emails.clone(),
                 },
             );
+            self.policy_store
+                .push_snapshot(ContactMaterial::from_contact(&contact));
             changes.push(ContactChange::Upsert(contact_record(remote, &contact)));
         }
 
@@ -172,6 +190,7 @@ impl AddressBookService for ProtonAddressBook {
             ));
         }
         let has_more = !at_end;
+        self.policy_store.finish_snapshot(!has_more);
         let checkpoint = ContactsCursor {
             v: CURSOR_VERSION,
             page: state.page.saturating_add(1),
