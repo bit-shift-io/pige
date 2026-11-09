@@ -5,9 +5,10 @@ edition = "2024"
 
 [features]
 default = []
-# Reserved for the native adapters. They stay empty until the respective plans
-# land, but declaring them now keeps every build combination compiling.
-provider-google = []
+# Native Google authorization and the Gmail/People adapter. The optional
+# dependencies are only compiled when the adapter is enabled, so the default
+# desktop/Android build is unchanged until G5 turns it on.
+provider-google = ["dep:rand", "dep:reqwest", "dep:sha2", "dep:url"]
 provider-proton = []
 
 [dependencies]
@@ -20,6 +21,13 @@ html5ever = "0.39"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "hostname"] }
 log = "0.4"
 mail-parser = "1"
+# Google token acquisition (feature `provider-google`). `reqwest` is the
+# minimal blocking-free HTTPS client for the token endpoint; rustls keeps the
+# existing ring/Android TLS stack instead of adding OpenSSL.
+rand = { version = "0.9", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+sha2 = { version = "0.10", optional = true }
+url = { version = "2", optional = true }
 markup5ever_rcdom = "0.39"
 rusqlite = { version = "0.41", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

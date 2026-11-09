@@ -4,6 +4,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- IMAP/SMTP over TLS. Background sync uses WorkManager. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Google authorization uses Play services Identity AuthorizationClient
+         (S2 §9.4). It has no redirect URI and needs no intent filter here. -->
+
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- Reading config backups written by a previous install in Downloads. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>

@@ -8,6 +8,8 @@
 
 pub mod error;
 pub mod fake;
+#[cfg(feature = "provider-google")]
+pub mod google;
 pub mod imap;
 pub mod registry;
 pub mod traits;

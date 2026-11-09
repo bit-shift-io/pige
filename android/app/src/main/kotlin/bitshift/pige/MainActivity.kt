@@ -16,6 +16,7 @@ class MainActivity : IcedActivity() {
         System.loadLibrary("pige")
         PigeBridge.install(applicationContext)
         nativeInit()
+        GoogleAuthorization.restoreAttempt(savedInstanceState?.getString(KEY_GOOGLE_ATTEMPT))
         super.onCreate(savedInstanceState)
         // NativeActivity.onCreate resets this to RGB_565. Set it afterwards,
         // before the surface is created, or Vulkan's inherited alpha is opaque.
@@ -28,6 +29,22 @@ class MainActivity : IcedActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         forwardNotificationTap(intent)
+    }
+
+    // Google Identity Services returns consent through our Activity, not a
+    // redirect URI. The helper binds it to the Rust attempt id and answers only
+    // through the validated JNI payload.
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (GoogleAuthorization.onActivityResult(this, requestCode, resultCode, data)) {
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString(KEY_GOOGLE_ATTEMPT, GoogleAuthorization.savedAttempt())
+        super.onSaveInstanceState(outState)
     }
 
     /// Forward a notification's account/thread extras exactly once, then drop
@@ -70,5 +87,6 @@ class MainActivity : IcedActivity() {
         const val EXTRA_ACCOUNT = "account"
         const val EXTRA_THREAD = "thread"
         private const val REQUEST_NOTIFICATIONS = 1
+        private const val KEY_GOOGLE_ATTEMPT = "google-auth-attempt"
     }
 }

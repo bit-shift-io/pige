@@ -175,6 +175,40 @@ pub extern "system" fn Java_bitshift_pige_MainActivity_onBackPressedEvent(
     api::back_pressed();
 }
 
+/// Validated result from `GoogleAuthorization.kt` (Google Identity Services on
+/// Android). The payload contains only the attempt id and the frozen,
+/// platform-reported fields; Rust rejects unknown fields, a missing mail scope,
+/// or an invalid attempt before the result can be queued for the active
+/// `GoogleAuthentication`. The consent UI itself never runs from a background
+/// worker: the worker only reports that reauthentication is required.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_bitshift_pige_GoogleAuthorization_nativeResult(
+    mut env: JNIEnv,
+    _this: JObject,
+    payload: JString,
+) {
+    init_logging();
+    let payload: String = env.get_string(&payload).map(Into::into).unwrap_or_default();
+    #[cfg(feature = "provider-google")]
+    {
+        match pige_core::providers::google::deliver_native_result(&payload) {
+            Ok(attempt) => log::info!(
+                "google authorization result accepted for attempt {}",
+                attempt.as_str()
+            ),
+            Err(error) => log::warn!(
+                "google authorization result rejected: {}",
+                error.safe_message
+            ),
+        }
+    }
+    #[cfg(not(feature = "provider-google"))]
+    {
+        let _ = payload;
+        log::warn!("google authorization result ignored: provider-google is disabled");
+    }
+}
+
 /// A notification tap, forwarded once by `MainActivity.onNewIntent`/`onCreate`.
 /// Best-effort: select the account's Inbox when it is cached, then open the
 /// notified conversation. Failures are logged and never cross back into Java.

@@ -83,5 +83,9 @@ kotlin {
 dependencies {
     implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.work:work-runtime:2.11.2")
+    // S2 §9.4: the only Google-supported Android authorization API is Google
+    // Identity Services `AuthorizationClient`, which ships in Play services.
+    // No WebView, App Links, loopback, OOB, or desktop-client fallback is used.
+    implementation("com.google.android.gms:play-services-auth:21.3.0")
     testImplementation("junit:junit:4.13.2")
 }
