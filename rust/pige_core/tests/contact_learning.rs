@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use pige_core::Store;
+use pige_core::StoreError;
 use pige_core::account::{Account, AccountId, Security, ServerConfig};
 use pige_core::contacts::{
     AddressKey, HeaderRole, LearningOrigin, ObservationTrust, normalize_address, observe_message,
@@ -16,11 +17,13 @@ use pige_core::contacts::{
 };
 use pige_core::mail::{
     Address, Flags, FolderKind, MessageHeader, MessageId, StoredMessage, ThreadId,
+    parse_header_block,
 };
 use pige_core::providers::fake::{FakeProviderFactory, FakeProviderSession};
 use pige_core::providers::{
     ChangePage, CollectionRecord, HistoryCoverage, HistoryPage, JobKey, JobKind, MailChange,
-    MessageRecord, OperationContext, ProviderCursor, RemoteCollectionId, RemoteMessageId,
+    MessageRecord, OperationContext, PreparedSubmission, ProviderCursor, ProviderId,
+    RemoteCollectionId, RemoteMessageId,
 };
 use pige_core::providers::{ProviderFactory, SentCopyPolicy};
 use pige_core::send::flush_provider_outbox;
@@ -233,8 +236,12 @@ fn duplicate_page_is_idempotent() {
         "checkpoint-1",
     );
 
-    store.apply_history_page(&context, &page).unwrap();
-    store.apply_history_page(&context, &page).unwrap();
+    store.apply_history_page(&context, None, &page).unwrap();
+    // A replayed page is applied against the checkpoint it produced, so the
+    // idempotent replay is still accepted and leaves the cursor in place.
+    store
+        .apply_history_page(&context, Some(&page.checkpoint), &page)
+        .unwrap();
 
     assert_eq!(evidence_count(&store, &account.id, "alice@example.com"), 1);
     assert_eq!(
@@ -272,7 +279,9 @@ fn labels_count_one_message() {
         "labels",
     );
 
-    store.apply_history_page(&ctx(&account.id), &page).unwrap();
+    store
+        .apply_history_page(&ctx(&account.id), None, &page)
+        .unwrap();
 
     assert_eq!(
         evidence_count(&store, &account.id, "alice@example.com"),
@@ -292,6 +301,7 @@ fn uid_reset_fingerprint_keeps_frequency_bounded() {
     store
         .apply_history_page(
             &context,
+            None,
             &page(
                 vec![record(
                     "epoch-1-uid-10",
@@ -308,6 +318,7 @@ fn uid_reset_fingerprint_keeps_frequency_bounded() {
     store
         .apply_history_page(
             &context,
+            Some(&ProviderCursor::new(1, "epoch-1")),
             &page(
                 vec![record(
                     "epoch-2-uid-10",
@@ -373,7 +384,9 @@ fn invalid_address_is_skipped_without_losing_page() {
         )],
         "invalid",
     );
-    store.apply_history_page(&ctx(&account.id), &page).unwrap();
+    store
+        .apply_history_page(&ctx(&account.id), None, &page)
+        .unwrap();
 
     assert_eq!(
         store
@@ -490,6 +503,159 @@ fn existing_cache_backfill_resumes_from_durable_cursor() {
 
     assert_eq!(evidence_count(&store, &account.id, "alice@example.com"), 1);
     assert_eq!(evidence_count(&store, &account.id, "bob@example.com"), 1);
+}
+
+#[test]
+fn existing_cache_and_history_converge_reply_to_and_bcc() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+
+    // The local cache cannot persist Reply-To/Bcc, so ExistingCache reads them
+    // empty while History sees the original header. The same physical message
+    // must still produce exactly one evidence row, not two.
+    let mut reply_header = base_header();
+    reply_header.message_id = Some("<reply-to@example.com>".to_string());
+    reply_header.subject = "Reply-To path".to_string();
+    reply_header.to = vec![address("alice@example.com")];
+    reply_header.reply_to = vec![address("reply@example.com")];
+
+    let mut bcc_header = base_header();
+    bcc_header.message_id = Some("<bcc@example.com>".to_string());
+    bcc_header.subject = "Bcc path".to_string();
+    bcc_header.to = vec![address("bob@example.com")];
+    bcc_header.bcc = vec![address("dave@example.com")];
+
+    for (id, header) in [
+        ("cached-reply-to", reply_header.clone()),
+        ("cached-bcc", bcc_header.clone()),
+    ] {
+        store
+            .upsert_message(&StoredMessage {
+                id: MessageId(id.to_string()),
+                account_id: account.id.clone(),
+                folder_id: None,
+                uid: None,
+                uidvalidity: None,
+                header,
+                flags: Flags::default(),
+                thread_id: ThreadId(format!("thread-{id}")),
+                snippet: String::new(),
+                has_attachments: false,
+            })
+            .unwrap();
+    }
+
+    let backfill = store.learn_existing_cache_page(&context, 10).unwrap();
+    assert_eq!(backfill.scanned, 2);
+    assert_eq!(evidence_count(&store, &account.id, "alice@example.com"), 1);
+    assert_eq!(evidence_count(&store, &account.id, "bob@example.com"), 1);
+
+    // Provider history sees the same messages with Reply-To/Bcc populated.
+    let history = page(
+        vec![
+            record(
+                "history-reply-to",
+                reply_header,
+                Flags::default(),
+                &["INBOX"],
+            ),
+            record("history-bcc", bcc_header, Flags::default(), &["INBOX"]),
+        ],
+        "history-after-cache",
+    );
+    store.apply_history_page(&context, None, &history).unwrap();
+
+    assert_eq!(
+        evidence_count(&store, &account.id, "alice@example.com"),
+        1,
+        "ExistingCache and History must converge on one evidence row"
+    );
+    assert_eq!(
+        evidence_count(&store, &account.id, "bob@example.com"),
+        1,
+        "a Bcc that the cache cannot see must not fork the evidence"
+    );
+    assert_eq!(
+        evidence_count(&store, &account.id, "dave@example.com"),
+        1,
+        "History still learns the Bcc role from the observed header"
+    );
+    assert_eq!(
+        store
+            .learned_roles(&account.id, &key("dave@example.com"))
+            .unwrap(),
+        vec![HeaderRole::Bcc]
+    );
+}
+
+#[test]
+fn stale_history_page_is_rejected_without_regressing_checkpoint() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+
+    let first = page(
+        vec![record(
+            "history-first",
+            base_header(),
+            Flags::default(),
+            &["INBOX"],
+        )],
+        "cp-1",
+    );
+    store.apply_history_page(&context, None, &first).unwrap();
+
+    let mut second_header = base_header();
+    second_header.message_id = Some("<second@example.com>".to_string());
+    let second = page(
+        vec![record(
+            "history-second",
+            second_header,
+            Flags::default(),
+            &["INBOX"],
+        )],
+        "cp-2",
+    );
+    store
+        .apply_history_page(&context, Some(&ProviderCursor::new(1, "cp-1")), &second)
+        .unwrap();
+
+    // A late page produced against cp-1 is now stale: another page already
+    // advanced the checkpoint to cp-2. It must be rejected as a whole.
+    let mut stale_header = base_header();
+    stale_header.message_id = Some("<stale@example.com>".to_string());
+    stale_header.to = vec![address("stale@example.com")];
+    let stale = page(
+        vec![record(
+            "history-stale",
+            stale_header,
+            Flags::default(),
+            &["INBOX"],
+        )],
+        "cp-1",
+    );
+    let error = store
+        .apply_history_page(&context, Some(&ProviderCursor::new(1, "cp-1")), &stale)
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::StalePage),
+        "expected StalePage, got {error:?}"
+    );
+
+    assert_eq!(
+        store
+            .job_checkpoint(&history_job(&account.id))
+            .unwrap()
+            .map(|cursor| cursor.payload),
+        Some("cp-2".to_string()),
+        "a rejected page must not regress the checkpoint"
+    );
+    assert_eq!(
+        evidence_count(&store, &account.id, "stale@example.com"),
+        0,
+        "a rejected page must not apply its observations"
+    );
 }
 
 #[test]
@@ -623,5 +789,102 @@ async fn accepted_send_and_receipt_reconcile_once() {
             .unwrap()
             .trust,
         ObservationTrust::Deliberate
+    );
+}
+
+#[tokio::test]
+async fn accepted_send_and_sent_copy_do_not_double_count() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+    let message = OutgoingMessage {
+        account_id: account.id.clone(),
+        to: vec![address("alice@example.com")],
+        cc: vec![address("bob@example.com")],
+        bcc: vec![address("dave@example.com")],
+        subject: "Accepted".to_string(),
+        body: "Body".to_string(),
+        in_reply_to: None,
+        references: Vec::new(),
+    };
+
+    // The exact prepared bytes a provider might accept. They carry the Bcc
+    // header; the provider's later Sent copy may strip it.
+    let raw = concat!(
+        "From: R1 Test <r1@example.com>\r\n",
+        "To: alice@example.com\r\n",
+        "Cc: bob@example.com\r\n",
+        "Bcc: dave@example.com\r\n",
+        "Subject: Accepted\r\n",
+        "Date: Tue, 07 Nov 2023 22:13:20 +0000\r\n",
+        "Message-ID: <accepted@example.com>\r\n",
+        "\r\n",
+        "Body\r\n",
+    )
+    .as_bytes()
+    .to_vec();
+    let sent_header = parse_header_block(&raw).unwrap();
+    assert_eq!(
+        sent_header.bcc,
+        vec![address("dave@example.com")],
+        "fixture prepared bytes must exercise the Bcc mismatch"
+    );
+
+    let prepared = PreparedSubmission {
+        version: 1,
+        backend: ProviderId::from("fake"),
+        raw: Some(raw),
+        reference: None,
+    };
+    queue_submission(&store, message, Vec::new()).unwrap();
+    let factory = FakeProviderFactory::submission_only().session(
+        FakeProviderSession::new()
+            .sent_copy_policy(SentCopyPolicy::ServerManaged)
+            .prepared(prepared),
+    );
+    let mut session = factory.open(&account, &context).await.unwrap();
+    let report = flush_provider_outbox(
+        &store,
+        &account,
+        session.submission.as_mut().unwrap().as_mut(),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.sent, 1);
+    assert_eq!(evidence_count(&store, &account.id, "alice@example.com"), 1);
+    assert_eq!(evidence_count(&store, &account.id, "bob@example.com"), 1);
+    assert_eq!(evidence_count(&store, &account.id, "dave@example.com"), 1);
+
+    // A later History/Sent copy of the same logical message: the server strips
+    // Bcc, so the header is otherwise identical but not byte-for-byte equal.
+    let mut copy_header = sent_header;
+    copy_header.bcc = Vec::new();
+    let sent_copy = record(
+        "sent-copy-message",
+        copy_header,
+        Flags::default(),
+        &["Sent"],
+    );
+    store
+        .apply_history_page(&context, None, &page(vec![sent_copy], "sent-copy"))
+        .unwrap();
+
+    assert_eq!(
+        evidence_count(&store, &account.id, "alice@example.com"),
+        1,
+        "the Sent copy must reconcile onto the accepted-send evidence"
+    );
+    assert_eq!(evidence_count(&store, &account.id, "bob@example.com"), 1);
+    assert_eq!(
+        evidence_count(&store, &account.id, "dave@example.com"),
+        1,
+        "the stripped Bcc must not add or erase the accepted Bcc evidence"
+    );
+    assert_eq!(
+        store
+            .learned_roles(&account.id, &key("dave@example.com"))
+            .unwrap(),
+        vec![HeaderRole::Bcc]
     );
 }

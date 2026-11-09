@@ -93,7 +93,6 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
          CREATE TABLE IF NOT EXISTS contact_learning_state (
              account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
              existing_cache_cursor TEXT,
-             history_checkpoint TEXT,
              updated_at INTEGER NOT NULL DEFAULT 0
          );",
     )?;

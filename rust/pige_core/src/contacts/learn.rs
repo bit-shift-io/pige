@@ -98,13 +98,23 @@ pub fn observe_cached_message(
     observations
 }
 
-/// A deterministic, normalized fingerprint of every header field that can
-/// identify a message's correspondent set.
+/// A deterministic, normalized fingerprint of the header fields that identify a
+/// message across sources.
 ///
 /// This is a *secondary* dedup hint only: native message/operation identity is
-/// primary. It exists so an IMAP UID reset, a label copy, or a Sent-copy replay
-/// with a different native id does not multiply observed frequency. It
-/// deliberately excludes provider ids, collections, mailbox names, and size.
+/// primary. It exists so an IMAP UID reset, a label copy, an ExistingCache
+/// backfill, or a Sent-copy replay with a different native id does not multiply
+/// observed frequency. It deliberately excludes provider ids, collections,
+/// mailbox names, and size.
+///
+/// It also excludes `Reply-To` and `Bcc`, because not every source can observe
+/// them: the local cache does not persist those columns (so `ExistingCache`
+/// reads them empty), a server may strip `Bcc` from its Sent copy, and only the
+/// prepared submit bytes may carry it. Including them would give the *same*
+/// message two different fingerprints on those paths and double-count it.
+/// Roles still come from the header that was actually observed; excluding them
+/// here can only undercount genuinely distinct messages that differ solely by
+/// `Reply-To`/`Bcc`, which the plan explicitly prefers.
 pub(crate) fn header_fingerprint(header: &MessageHeader) -> String {
     #[derive(Serialize)]
     struct FingerprintParts {
@@ -113,10 +123,8 @@ pub(crate) fn header_fingerprint(header: &MessageHeader) -> String {
         references: Vec<String>,
         subject: String,
         from: Vec<String>,
-        reply_to: Vec<String>,
         to: Vec<String>,
         cc: Vec<String>,
-        bcc: Vec<String>,
         date: i64,
     }
 
@@ -126,10 +134,8 @@ pub(crate) fn header_fingerprint(header: &MessageHeader) -> String {
         references: header.references.clone(),
         subject: header.subject.clone(),
         from: fingerprint_addresses(&header.from),
-        reply_to: fingerprint_addresses(&header.reply_to),
         to: fingerprint_addresses(&header.to),
         cc: fingerprint_addresses(&header.cc),
-        bcc: fingerprint_addresses(&header.bcc),
         date: header.date,
     };
     serde_json::to_string(&parts).unwrap_or_default()

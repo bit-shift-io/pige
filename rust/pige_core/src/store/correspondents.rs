@@ -20,9 +20,9 @@ use crate::contacts::types::{
     AddressKey, EvidenceId, HeaderRole, LearningOrigin, Observation, ObservationTrust,
 };
 use crate::mail::{Address, MessageId};
-use crate::providers::{HistoryPage, JobKey, JobKind, OperationContext};
+use crate::providers::{HistoryPage, JobKey, JobKind, OperationContext, ProviderCursor};
 
-use super::jobs::{check_generation_in, set_checkpoint_in};
+use super::jobs::{check_checkpoint_in, check_generation_in, set_checkpoint_in};
 use super::messages::cached_messages_after_on;
 use super::{Store, StoreError};
 
@@ -72,17 +72,30 @@ impl Store {
     /// `evidence` is the caller's stable native identity (provider message id,
     /// outbox operation id, or local cache id). Repeating the same identity is
     /// idempotent. Invalid addresses are skipped without failing the write.
+    ///
+    /// `fingerprint` is the optional normalized header hint (see
+    /// [`crate::contacts::learn::header_fingerprint`]) that lets a different
+    /// native id for the same logical message converge on existing evidence.
+    /// Passing `None` keeps dedup to the native identity alone.
     pub fn record_observations(
         &self,
         ctx: &OperationContext,
         evidence: &EvidenceId,
         origin: LearningOrigin,
+        fingerprint: Option<&str>,
         observations: &[Observation],
     ) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         check_generation_in(&tx, &ctx.account, ctx.generation)?;
-        record_observations_in(&tx, &ctx.account, evidence, origin, None, observations)?;
+        record_observations_in(
+            &tx,
+            &ctx.account,
+            evidence,
+            origin,
+            fingerprint,
+            observations,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -90,14 +103,24 @@ impl Store {
     /// Persist a history page's observations and advance the history checkpoint
     /// in one transaction. History messages are learned, not inserted into the
     /// visible cache.
+    ///
+    /// `expected_previous` is the checkpoint the page was produced against (the
+    /// same cursor the caller last read). The write is a compare-and-set: a
+    /// replayed or out-of-order older page whose expected cursor no longer
+    /// matches the durable checkpoint is rejected with [`StoreError::StalePage`]
+    /// and neither its observations nor its checkpoint are applied. Pass `None`
+    /// for the very first page.
     pub fn apply_history_page(
         &self,
         ctx: &OperationContext,
+        expected_previous: Option<&ProviderCursor>,
         page: &HistoryPage,
     ) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        let key = history_job(&ctx.account);
+        check_checkpoint_in(&tx, &key, expected_previous)?;
 
         for message in &page.messages {
             let observations =
@@ -114,17 +137,10 @@ impl Store {
             )?;
         }
 
-        let key = history_job(&ctx.account);
+        // The history job checkpoint (above, via `job_checkpoints`) is the single
+        // durable history cursor. `contact_learning_state` only tracks the local
+        // ExistingCache backfill; there is no second, unread history copy.
         set_checkpoint_in(&tx, &key, ctx.generation, &page.checkpoint)?;
-        let checkpoint_json = serde_json::to_string(&page.checkpoint)?;
-        tx.execute(
-            "INSERT INTO contact_learning_state (account_id, history_checkpoint, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id) DO UPDATE SET
-                 history_checkpoint = excluded.history_checkpoint,
-                 updated_at = excluded.updated_at",
-            params![ctx.account.0, checkpoint_json, now_unix()],
-        )?;
         tx.commit()?;
         Ok(())
     }
