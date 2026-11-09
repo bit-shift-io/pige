@@ -253,11 +253,17 @@ impl ComposeState {
     /// changed even if a caller did not advance the generation explicitly.
     fn recipient_key_matches_text(&self, key: &RecipientRequestKey) -> bool {
         let text = self.field_value(key.field);
-        key.token_start <= key.token_end
+        let span_intact = key.token_start <= key.token_end
             && key.token_end <= text.len()
             && text.is_char_boundary(key.token_start)
             && text.is_char_boundary(key.token_end)
-            && text[key.token_start..key.token_end] == key.query
+            && text[key.token_start..key.token_end] == key.query;
+        // The stored span must still be the whole active token. Comparing only
+        // the query bytes misses drift that extends the token (`gra` -> `grac`),
+        // so re-scan from the token end and require identical boundaries.
+        span_intact
+            && active_recipient_token(text, key.token_end)
+                == Some((key.token_start, key.token_end))
     }
 
     /// Accept a local result page. Returns `false` for any stale or empty
@@ -324,6 +330,30 @@ impl ComposeState {
         }
         self.invalidate_recipient_suggestions();
         true
+    }
+
+    /// Focus moved away from every recipient field (e.g. into the message
+    /// body). Drop the list and mark that no recipient field is active so a
+    /// stale panel neither lingers nor intercepts later navigation. The
+    /// generation bump rejects in-flight responses too.
+    pub fn recipient_focus_lost(&mut self) {
+        self.recipient_field = None;
+        self.invalidate_recipient_suggestions();
+    }
+
+    /// Resolve a choice message against the list that is current *now*.
+    /// Touch supplies the tapped row; keyboard Enter supplies `None` and gets
+    /// the currently highlighted row, so an ArrowDown and Enter batched from
+    /// one view do not accept the stale row the view was built with.
+    pub fn choose_suggestion(
+        &mut self,
+        key: &RecipientRequestKey,
+        index: Option<usize>,
+    ) -> Result<Address, String> {
+        let index = index
+            .or_else(|| self.selected_suggestion_index())
+            .ok_or_else(|| "No recipient suggestions are available.".to_string())?;
+        self.accept_suggestion(key, index)
     }
 
     /// Replace only the active token with the explicitly chosen address. No
@@ -686,9 +716,11 @@ fn recipient_field_with_suggestions<'a>(
                     key: list.key.clone(),
                     index: (selected + 1).min(list.items.len() - 1),
                 },
+                // Enter resolves the highlighted row in `update`, so arrows
+                // batched with Enter still choose the row the user sees.
                 choose: Message::RecipientSuggestionChosen {
                     key: list.key.clone(),
-                    index: selected,
+                    index: None,
                 },
                 dismiss: Message::RecipientSuggestionDismissed(list.key.clone()),
             }
@@ -719,7 +751,7 @@ fn suggestion_panel_for<'a>(
         &compose.account_id,
         move |index| Message::RecipientSuggestionChosen {
             key: key.clone(),
-            index,
+            index: Some(index),
         },
     ))
 }
@@ -994,6 +1026,86 @@ mod tests {
             "grace@example.com"
         );
         assert!(compose.take_pending_selection().is_none());
+    }
+
+    #[test]
+    fn tapping_a_suggestion_survives_pointer_events_outside_the_field() {
+        use crate::components::recipient_suggestions::should_publish_caret;
+
+        let (mut compose, key) = compose_with(ComposeField::To, "gra");
+        assert!(compose.apply_suggestions(
+            key.clone(),
+            vec![suggestion("Grace Hopper", "grace@example.com")]
+        ));
+
+        // Iced delivers the press/release that lands on the suggestion row to
+        // the field wrapper too. Because the pointer is outside the field's
+        // bounds, the wrapper must not publish a caret (which would call
+        // `begin_recipient_query` and invalidate the row's captured key).
+        assert!(!should_publish_caret(true, false));
+
+        let accepted = compose
+            .accept_suggestion(&key, 0)
+            .expect("the tapped row still matches the active request");
+        assert_eq!(accepted.email, "grace@example.com");
+        assert_eq!(compose.recipient_generation, key.generation.wrapping_add(1));
+    }
+
+    #[test]
+    fn token_text_drift_is_rejected_without_a_generation_bump() {
+        let (mut compose, key) = compose_with(ComposeField::To, "gra");
+        assert!(compose.apply_suggestions(
+            key.clone(),
+            vec![suggestion("Grace Hopper", "grace@example.com")]
+        ));
+
+        // A paste/edit that changes the token must be rejected even if the
+        // caller forgot to advance the generation; staleness also checks the
+        // byte span's current text.
+        compose.set_field_value(ComposeField::To, "grac".to_string());
+        assert_eq!(compose.recipient_generation, key.generation);
+        assert!(!compose.is_current_recipient_request(&key));
+        assert!(!compose.apply_suggestions(
+            key.clone(),
+            vec![suggestion("Grace Hopper", "grace@example.com")]
+        ));
+        assert!(compose.accept_suggestion(&key, 0).is_err());
+    }
+
+    #[test]
+    fn focus_loss_dismisses_a_visible_list() {
+        let (mut compose, key) = compose_with(ComposeField::To, "gra");
+        assert!(compose.apply_suggestions(
+            key.clone(),
+            vec![suggestion("Grace Hopper", "grace@example.com")]
+        ));
+        assert!(compose.active_suggestion_key().is_some());
+
+        compose.recipient_focus_lost();
+
+        assert!(compose.active_suggestion_key().is_none());
+        assert_eq!(compose.recipient_field, None);
+        assert!(compose.accept_suggestion(&key, 0).is_err());
+    }
+
+    #[test]
+    fn keyboard_choice_uses_the_highlighted_row() {
+        let (mut compose, key) = compose_with(ComposeField::To, "a");
+        assert!(compose.apply_suggestions(
+            key.clone(),
+            vec![
+                suggestion("Ada Lovelace", "ada@example.com"),
+                suggestion("Grace Hopper", "grace@example.com"),
+            ]
+        ));
+        // ArrowDown and Enter can arrive in the same batch. The keyboard
+        // message carries `None`, so the choice resolves the current highlight
+        // after the move was applied instead of a stale view-time index.
+        assert!(compose.highlight_suggestion(&key, 1));
+        let accepted = compose
+            .choose_suggestion(&key, None)
+            .expect("keyboard accept");
+        assert_eq!(accepted.email, "grace@example.com");
     }
 
     #[test]

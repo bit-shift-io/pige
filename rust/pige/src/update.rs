@@ -633,7 +633,10 @@ impl App {
                 let Some(compose) = self.compose.as_mut() else {
                     return Task::none();
                 };
-                match compose.accept_suggestion(&key, index) {
+                // Touch carries the tapped row; keyboard Enter carries `None`
+                // and resolves the row highlighted by now (after any arrows in
+                // the same batch) instead of the view-time snapshot.
+                match compose.choose_suggestion(&key, index) {
                     Ok(_) => {
                         // Only this explicit choice records evidence. Typing
                         // and merely viewing results never do.
@@ -652,6 +655,10 @@ impl App {
             }
             Message::ComposeBody(action) => {
                 if let Some(compose) = self.compose.as_mut() {
+                    // Clicking or typing in the body moves focus out of every
+                    // recipient field; dismiss a visible list so it cannot
+                    // linger or keep handling keys meant for the message.
+                    compose.recipient_focus_lost();
                     compose.body.perform(action);
                 }
             }

@@ -35,6 +35,24 @@ pub struct SuggestionNavigation {
     pub dismiss: Message,
 }
 
+/// Whether a pointer event may claim (or reassert) this field's caret.
+///
+/// Iced delivers every pointer event to every widget in the tree, not just the
+/// one under the cursor. A press or release over a sibling suggestion row (or
+/// another field) must therefore publish nothing here: the row's captured
+/// request key has to stay current so its release can still accept. Only a
+/// pointer inside this field's own bounds may switch the active field.
+pub fn should_publish_caret(is_pointer: bool, pointer_over_bounds: bool) -> bool {
+    !is_pointer || pointer_over_bounds
+}
+
+/// Whether this field should consume Arrow/Enter/Escape keys. Navigation is
+/// only meaningful while this exact text input owns keyboard focus; otherwise a
+/// visible list would swallow Enter typed into the message body.
+pub fn should_intercept_key(focused: bool) -> bool {
+    focused
+}
+
 /// The recipient field plus the caret adapter.
 pub fn recipient_field<'a>(
     label: &str,
@@ -187,10 +205,14 @@ fn source_hint(suggestion: &RecipientSuggestion, account: &AccountId) -> Option<
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-/// Persistent wrapper state: the last byte offset published to the app.
+/// Persistent wrapper state: the last byte offset published to the app and
+/// whether this field's text input owned focus on the previous event. Focus is
+/// read back from the child state after each event so key interception is
+/// scoped to the field the user is actually typing in.
 #[derive(Debug, Default)]
 struct CaretState {
     last_caret: Option<usize>,
+    focused: bool,
 }
 
 struct RecipientField<'a> {
@@ -202,10 +224,18 @@ struct RecipientField<'a> {
 }
 
 impl RecipientField<'_> {
-    fn intercept_navigation(&self, event: &iced::Event, shell: &mut Shell<'_, Message>) -> bool {
+    fn intercept_navigation(
+        &self,
+        event: &iced::Event,
+        focused: bool,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
         let Some(navigation) = &self.navigation else {
             return false;
         };
+        if !should_intercept_key(focused) {
+            return false;
+        }
         let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event else {
             return false;
         };
@@ -290,9 +320,10 @@ impl Widget<Message, iced::Theme, iced::Renderer> for RecipientField<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        // While a list is visible, arrows/Enter/Escape belong to the chooser
-        // instead of the text input's cursor and focus handling.
-        if self.intercept_navigation(event, shell) {
+        // Interception is scoped to this field's own text input: a list that is
+        // still visible while the user types in the body must not steal Enter.
+        let focused = tree.state.downcast_ref::<CaretState>().focused;
+        if self.intercept_navigation(event, focused, shell) {
             return;
         }
 
@@ -307,21 +338,23 @@ impl Widget<Message, iced::Theme, iced::Renderer> for RecipientField<'_> {
             viewport,
         );
 
-        let changed = self.latest_input.borrow_mut().take();
+        // Keep the last edited text across batched events; the view's `value`
+        // may still be the pre-batch copy.
+        let changed = self.latest_input.borrow().clone();
         let text = changed.as_deref().unwrap_or(self.value).to_string();
-        let caret = {
+        let (caret, now_focused) = {
             let state = tree.children[0].state.downcast_ref::<InputState>();
             let cursor = state.cursor();
             let grapheme = match cursor.state(&text_input::Value::new(&text)) {
                 iced::widget::text_input::cursor::State::Index(index) => index,
                 iced::widget::text_input::cursor::State::Selection { start, end } => start.max(end),
             };
-            grapheme_caret_to_byte(&text, grapheme)
+            (
+                grapheme_caret_to_byte(&text, grapheme),
+                state.is_focused(),
+            )
         };
-        let state = tree.state.downcast_mut::<CaretState>();
-        // Pointer events republish even an unchanged offset so clicking from
-        // one recipient field to another always switches the active field.
-        let pointer = matches!(
+        let is_pointer = matches!(
             event,
             iced::Event::Mouse(
                 iced::mouse::Event::ButtonPressed(_) | iced::mouse::Event::ButtonReleased(_)
@@ -329,7 +362,19 @@ impl Widget<Message, iced::Theme, iced::Renderer> for RecipientField<'_> {
                 iced::touch::Event::FingerPressed { .. } | iced::touch::Event::FingerLifted { .. }
             )
         );
-        if changed.is_some() || pointer || state.last_caret != Some(caret) {
+        let pointer_over_bounds = cursor.position_over(layout.bounds()).is_some();
+        let pointer_publish = is_pointer && pointer_over_bounds;
+
+        let state = tree.state.downcast_mut::<CaretState>();
+        state.focused = now_focused;
+        // Keyboard edits report their new caret; a pointer only re-activates a
+        // field when it lands on that field (and republishes even an unchanged
+        // offset so clicking To→Cc switches the active field). A press or
+        // release over a suggestion row publishes nothing, keeping the row's
+        // captured key and generation valid for acceptance.
+        if should_publish_caret(is_pointer, pointer_over_bounds)
+            && (changed.is_some() || pointer_publish || state.last_caret != Some(caret))
+        {
             state.last_caret = Some(caret);
             shell.publish((self.on_caret)(caret));
         }
@@ -419,6 +464,26 @@ mod tests {
             assert!(text.is_char_boundary(byte), "grapheme {grapheme} split");
             assert!(byte <= text.len());
         }
+    }
+
+    #[test]
+    fn pointer_outside_field_never_publishes_caret() {
+        // A tap on a sibling suggestion row or another field must not emit a
+        // caret message for this field; that is what used to bump the
+        // generation and invalidate the row's captured key.
+        assert!(!should_publish_caret(true, false));
+        assert!(should_publish_caret(true, true));
+
+        // Keyboard/input events still flow through even though the mouse is
+        // not over the field.
+        assert!(should_publish_caret(false, false));
+        assert!(should_publish_caret(false, true));
+    }
+
+    #[test]
+    fn keyboard_interception_requires_field_focus() {
+        assert!(!should_intercept_key(false));
+        assert!(should_intercept_key(true));
     }
 
     #[test]

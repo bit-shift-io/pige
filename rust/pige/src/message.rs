@@ -154,10 +154,12 @@ pub enum Message {
         key: RecipientRequestKey,
         result: Result<Vec<RecipientSuggestion>, String>,
     },
-    /// The user explicitly accepted one row (keyboard or touch).
+    /// The user explicitly accepted one row (keyboard or touch). `None` means
+    /// "whatever row is highlighted now" (keyboard Enter), so a batched
+    /// ArrowDown cannot leave a stale view-time index behind.
     RecipientSuggestionChosen {
         key: RecipientRequestKey,
-        index: usize,
+        index: Option<usize>,
     },
     /// Arrow keys moved the highlighted row.
     RecipientSuggestionMoved {
