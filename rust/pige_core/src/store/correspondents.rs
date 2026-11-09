@@ -63,6 +63,23 @@ pub struct LearningState {
     pub updated_at: i64,
 }
 
+/// Restart-safe progress of the provider header-history crawl.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistoryProgress {
+    pub scanned: u64,
+    pub total_hint: Option<u64>,
+    pub complete: bool,
+    pub paused: bool,
+}
+
+/// Durable history progress plus any pending rate-limit delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistoryState {
+    pub progress: HistoryProgress,
+    /// Epoch milliseconds before which no provider request may be made.
+    pub retry_after_ms: i64,
+}
+
 /// Result of one bounded ExistingCache backfill page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExistingCachePage {
@@ -158,19 +175,27 @@ impl Store {
         let key = history_job(&ctx.account);
         check_checkpoint_in(&tx, &key, expected_previous)?;
 
+        // Recompute each affected address once *after* the whole page's
+        // evidence is inserted. Recomputing inside the per-message loop makes a
+        // page quadratic in the number of accumulated observations, which a
+        // full-history crawl would feel as steadily slower pages.
+        let mut affected = HashSet::new();
         for message in &page.messages {
             let observations =
                 learn::observe_message(&ctx.account, message, LearningOrigin::History);
             let fingerprint = learn::header_fingerprint(&message.header);
             let evidence = EvidenceId::for_message(&message.remote_id);
-            record_observations_in(
+            affected.extend(record_observations_collect_in(
                 &tx,
                 &ctx.account,
                 &evidence,
                 LearningOrigin::History,
                 Some(&fingerprint),
                 &observations,
-            )?;
+            )?);
+        }
+        for key in affected {
+            recompute_contact_address_in(&tx, &ctx.account, &key)?;
         }
 
         // The history job checkpoint (above, via `job_checkpoints`) is the single
@@ -266,6 +291,113 @@ impl Store {
             },
             None => LearningState::default(),
         })
+    }
+
+    /// Durable header-history progress for one account, without network work.
+    pub fn history_state(&self, account: &AccountId) -> Result<HistoryState, StoreError> {
+        let row: Option<(i64, Option<i64>, i64, i64, i64)> = self
+            .connection()
+            .query_row(
+                "SELECT history_scanned, history_total_hint, history_complete,
+                        history_paused, history_retry_after
+                 FROM contact_learning_state WHERE account_id = ?1",
+                [&account.0],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match row {
+            Some((scanned, total_hint, complete, paused, retry_after)) => HistoryState {
+                progress: HistoryProgress {
+                    scanned: scanned.max(0) as u64,
+                    total_hint: total_hint.map(|value| value.max(0) as u64),
+                    complete: complete != 0,
+                    paused: paused != 0,
+                },
+                retry_after_ms: retry_after,
+            },
+            None => HistoryState::default(),
+        })
+    }
+
+    /// Persist one slice's progress under the account's generation fence.
+    /// A history retry delay is independent of this write and is preserved.
+    pub fn record_history_progress(
+        &self,
+        ctx: &OperationContext,
+        progress: HistoryProgress,
+    ) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        tx.execute(
+            "INSERT INTO contact_learning_state
+                 (account_id, existing_cache_cursor, updated_at, history_scanned,
+                  history_total_hint, history_complete, history_paused)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 updated_at = excluded.updated_at,
+                 history_scanned = excluded.history_scanned,
+                 history_total_hint = excluded.history_total_hint,
+                 history_complete = excluded.history_complete,
+                 history_paused = excluded.history_paused",
+            params![
+                ctx.account.0,
+                now_unix(),
+                progress.scanned.min(i64::MAX as u64) as i64,
+                progress
+                    .total_hint
+                    .map(|value| value.min(i64::MAX as u64) as i64),
+                bool_int(progress.complete),
+                bool_int(progress.paused),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist a rate-limit delay so a restart does not immediately retry.
+    pub fn record_history_retry_after(
+        &self,
+        ctx: &OperationContext,
+        until_ms: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        tx.execute(
+            "INSERT INTO contact_learning_state
+                 (account_id, existing_cache_cursor, updated_at, history_retry_after)
+             VALUES (?1, NULL, ?2, ?3)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 updated_at = excluded.updated_at,
+                 history_retry_after = excluded.history_retry_after",
+            params![ctx.account.0, now_unix(), until_ms],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clear any pending rate-limit delay.
+    pub fn clear_history_retry_after(&self, ctx: &OperationContext) -> Result<(), StoreError> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        tx.execute(
+            "UPDATE contact_learning_state
+             SET history_retry_after = 0, updated_at = ?2
+             WHERE account_id = ?1",
+            params![ctx.account.0, now_unix()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// All aggregated correspondent suggestions for one account, newest first.
@@ -871,6 +1003,24 @@ pub(crate) fn record_observations_in(
     fingerprint: Option<&str>,
     observations: &[Observation],
 ) -> Result<(), StoreError> {
+    let affected =
+        record_observations_collect_in(tx, account, evidence, origin, fingerprint, observations)?;
+    for key in affected {
+        recompute_contact_address_in(tx, account, &key)?;
+    }
+    Ok(())
+}
+
+/// Insert evidence without refreshing the aggregated projection. Returns the
+/// affected address keys so a multi-message page can recompute each once.
+fn record_observations_collect_in(
+    tx: &rusqlite::Connection,
+    account: &AccountId,
+    evidence: &EvidenceId,
+    origin: LearningOrigin,
+    fingerprint: Option<&str>,
+    observations: &[Observation],
+) -> Result<Vec<AddressKey>, StoreError> {
     // Re-normalize and deduplicate one more time so a caller cannot bypass the
     // pure extractor and smuggle duplicate or invalid rows into the ledger.
     let mut accepted = Vec::new();
@@ -887,7 +1037,7 @@ pub(crate) fn record_observations_in(
         accepted.push(observation);
     }
     if accepted.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let canonical = canonical_evidence_id(tx, account, evidence, fingerprint)?;
@@ -1028,10 +1178,7 @@ pub(crate) fn record_observations_in(
         }
     }
 
-    for key in affected {
-        recompute_contact_address_in(tx, account, &key)?;
-    }
-    Ok(())
+    Ok(affected)
 }
 
 fn canonical_evidence_id(

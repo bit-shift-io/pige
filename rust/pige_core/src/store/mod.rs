@@ -35,7 +35,8 @@ pub use attachments::StoredAttachment;
 pub use bodies::Body;
 pub use contacts::CachedContactEmail;
 pub use correspondents::{
-    ExistingCachePage, HISTORY_SOURCE, LearnedAddress, LearningState, history_job,
+    ExistingCachePage, HISTORY_SOURCE, HistoryProgress, HistoryState, LearnedAddress, LearningState,
+    history_job,
 };
 pub(crate) use correspondents::record_observations_in;
 pub(crate) use jobs::check_generation_in;

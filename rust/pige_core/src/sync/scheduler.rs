@@ -33,6 +33,13 @@ pub enum SchedulerError {
     Deadline,
 }
 
+/// A background gate held for one bounded page of work. It is released as soon
+/// as the page commits, so an interactive operation can take the account gate
+/// between pages instead of waiting for a whole background slice.
+pub struct BackgroundGate {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
 /// Per-account gates that serialize sync and mutation work.
 #[derive(Default)]
 pub struct AccountScheduler {
@@ -75,6 +82,27 @@ impl AccountScheduler {
             _ = tokio::time::sleep_until(ctx.deadline) => return Err(SchedulerError::Deadline),
         };
         Ok(op.await)
+    }
+
+    /// Try to take the account's gate for one background page. Never waits: a
+    /// busy gate returns `Ok(None)`. The returned guard releases the gate when
+    /// dropped, and Tokio's fair mutex hands a released gate to an already
+    /// queued interactive operation instead of letting background work re-take
+    /// it. This is what lets a high-priority send preempt between pages.
+    pub fn try_background(
+        &self,
+        ctx: &OperationContext,
+    ) -> Result<Option<BackgroundGate>, SchedulerError> {
+        if ctx.cancellation.is_cancelled() {
+            return Err(SchedulerError::Cancelled);
+        }
+        if tokio::time::Instant::now() >= ctx.deadline {
+            return Err(SchedulerError::Deadline);
+        }
+        match self.gate(&ctx.account).try_lock_owned() {
+            Ok(guard) => Ok(Some(BackgroundGate { _guard: guard })),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Run `op` while holding the account's gate, but never wait for a busy

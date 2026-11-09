@@ -5,7 +5,10 @@
 //! orchestrator, and [`scheduler`] serializes per-account work.
 
 pub mod engine;
+pub mod history;
 pub mod provider;
 pub mod scheduler;
+
+pub use history::LearningProgress;
 
 pub use engine::{NewMailSummary, SyncError, SyncReport, sync_account};

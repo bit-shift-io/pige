@@ -57,6 +57,7 @@ use mailbox::{INTERACTIVE_TIMEOUT, SYNC_TIMEOUT, open_session, scheduler_message
 const SYNC_PAGES: u32 = 8;
 
 pub use crate::contacts::{RecipientQuery, RecipientSuggestion, SuggestionSource};
+pub use crate::sync::history::LearningProgress;
 pub use crate::settings::{Settings, ThemeMode};
 pub use accounts::{
     answer_auth, begin_auth, can_switch_backend, cancel_auth, finish_auth, switch_backend,
@@ -782,6 +783,25 @@ pub fn take_startup_warning() -> Option<String> {
     guard
         .as_mut()
         .and_then(|state| state.startup_warning.take())
+}
+
+/// Durable local-learning progress for one account. This is read-only and never
+/// opens a provider, so the UI can show how much history is still to learn.
+pub fn learning_progress(account: &AccountId) -> Result<LearningProgress, String> {
+    let guard = lock_state();
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    if !state
+        .config_doc
+        .accounts
+        .iter()
+        .any(|configured| &configured.id == account)
+    {
+        return Err(format!("unknown account {account}"));
+    }
+    crate::sync::history::learning_progress(&state.store, account)
+        .map_err(|error| format!("read learning progress: {error}"))
 }
 
 /// The persisted user settings, from the configuration document.
@@ -3160,12 +3180,46 @@ async fn sync_one(
                 }
             }
 
-            Ok::<_, String>((report, capabilities, outbox_errors))
+            Ok::<_, String>((report, capabilities, outbox_errors, session))
         })
         .await
         .map_err(scheduler_message)?;
-    let (report, capabilities, outbox_errors) =
+    let (report, capabilities, outbox_errors, mut session) =
         inner.map_err(|error| format!("{}: {error}", account.label))?;
+
+    // After the visible-window sync, learn one bounded slice of header history
+    // using the session that is already open, so background learning never
+    // amplifies provider connections. The interactive gate is released now;
+    // the paged history path re-takes it per page and yields between pages.
+    // History never inserts headers into the visible mailbox cache or notifies,
+    // and a history failure must not fail the user-visible sync.
+    if capabilities.mailbox
+        && let Some(mailbox) = session.mailbox.as_mut()
+        && let Ok(history_ctx) =
+            sessions.context(&account.id, crate::sync::history::HISTORY_SLICE_TIMEOUT)
+    {
+        match crate::sync::history::learn_background_slice(
+            store,
+            mailbox.as_mut(),
+            &history_ctx,
+            crate::sync::history::background_budget(),
+            scheduler,
+        )
+        .await
+        {
+            Ok(progress) => log::debug!(
+                "history learning for {}: scanned {} complete {}",
+                account.label,
+                progress.scanned,
+                progress.complete
+            ),
+            Err(error) => log::debug!(
+                "history learning for {}: {}",
+                account.label,
+                error.safe_message
+            ),
+        }
+    }
 
     // The provider page reports each collection's server total but not its
     // unread rollup, so recompute `unread` locally from the cached flags. This
