@@ -109,8 +109,11 @@ impl ProtonSubmission {
             .unwrap_or(self.account.email.as_str())
     }
 
-    fn sender_keys(&self) -> Result<proton_core::crypto::keys::AddressKeys, ProviderError> {
-        let email = self.sender_email().trim().to_string();
+    fn sender_keys_for(
+        &self,
+        email: &str,
+    ) -> Result<proton_core::crypto::keys::AddressKeys, ProviderError> {
+        let email = email.trim().to_string();
         if email.is_empty() {
             return Err(ProviderError::forbidden(
                 "the Proton sender address is empty",
@@ -128,7 +131,11 @@ impl ProtonSubmission {
         })?
     }
 
-    fn evidence(&self, request: &SubmissionRequest, sender: &str) -> Option<PreparedEvidence> {
+    /// Decode and authenticate the prepared artifact. The chosen sender alias is
+    /// part of the durable evidence, so a restart that does not re-apply
+    /// [`Self::with_sender_alias`] still verifies the digest and continues the
+    /// same submission instead of wedging on a sender mismatch.
+    fn evidence(&self, request: &SubmissionRequest) -> Option<PreparedEvidence> {
         let prepared = request.prepared.as_ref()?;
         if prepared.version != PROTON_SUBMISSION_VERSION
             || prepared.backend.as_str() != PROTON_PROVIDER
@@ -138,22 +145,22 @@ impl ProtonSubmission {
         let evidence = PreparedEvidence::decode(prepared.reference.as_deref()?)?;
         if evidence.v != PROTON_SUBMISSION_VERSION
             || evidence.operation != request.operation.as_str()
-            || !evidence.sender.eq_ignore_ascii_case(sender)
-            || evidence.digest != self.digest(request).ok()?
+            || evidence.sender.trim().is_empty()
+            || evidence.digest != self.digest(request, &evidence.sender).ok()?
         {
             return None;
         }
         Some(evidence)
     }
 
-    fn reusable(&self, request: &SubmissionRequest, sender: &str) -> Option<PreparedSubmission> {
-        self.evidence(request, sender)?;
+    fn reusable(&self, request: &SubmissionRequest) -> Option<PreparedSubmission> {
+        self.evidence(request)?;
         request.prepared.clone()
     }
 
-    fn digest(&self, request: &SubmissionRequest) -> Result<String, ProviderError> {
+    fn digest(&self, request: &SubmissionRequest, sender: &str) -> Result<String, ProviderError> {
         let mut hasher = Sha256::new();
-        feed(&mut hasher, self.sender_email().as_bytes());
+        feed(&mut hasher, sender.as_bytes());
         for address in request
             .message
             .to
@@ -336,10 +343,11 @@ impl ProtonSubmission {
         request: &SubmissionRequest,
         ctx: &OperationContext,
     ) -> Result<HashMap<String, super::policy::RecipientMaterial>, ProviderError> {
-        // Reuse this account's adapter-private contact cache so a completed
-        // address-book snapshot and submission see the same material. The
-        // resolver still re-fetches before delivery: stale policy must never
-        // authorize a send after a contact added a mandatory requirement.
+        // The adapter-private store is shared with the address book so raw card
+        // material survives a snapshot, but delivery policy is deliberately not
+        // read from it: `resolve` performs a complete fresh enumeration on every
+        // submit. Cached material must never authorize a send after a contact
+        // added a mandatory requirement.
         let deliveries = self.policy.resolve(&request.message, ctx).await?;
         let mut materials = HashMap::new();
         for delivery in deliveries {
@@ -445,16 +453,24 @@ impl SubmissionService for ProtonSubmission {
         ctx: &OperationContext,
     ) -> Result<PreparedSubmission, ProviderError> {
         ctx.ensure_active()?;
-        let sender = self.sender_keys()?;
         if request.message.recipients().is_empty() {
             return Err(ProviderError::forbidden("the message has no recipients"));
         }
+        // A durable prepared artifact is authoritative for the chosen sender
+        // alias after a restart; otherwise fall back to the configured alias or
+        // the account address.
+        let sender_email = match self.evidence(request) {
+            Some(evidence) => evidence.sender,
+            None => self.sender_email().trim().to_string(),
+        };
+        let sender = self.sender_keys_for(&sender_email)?;
+        self.policy.set_sender_alias(sender_email);
         // Resolve policy before any draft request. A failure preserves the
         // unsent operation and never creates a remote draft.
         self.policy.resolve(&request.message, ctx).await?;
         ctx.ensure_active()?;
 
-        if let Some(prepared) = self.reusable(request, &sender.email) {
+        if let Some(prepared) = self.reusable(request) {
             return Ok(prepared);
         }
 
@@ -473,7 +489,7 @@ impl SubmissionService for ProtonSubmission {
             draft_id,
             external_id,
             sender: sender.email.clone(),
-            digest: self.digest(request)?,
+            digest: self.digest(request, &sender.email)?,
         };
         let reference = serde_json::to_string(&evidence).map_err(|error| {
             ProviderError::transient("could not encode the Proton submission evidence")
@@ -494,13 +510,15 @@ impl SubmissionService for ProtonSubmission {
         ctx: &OperationContext,
     ) -> Result<SubmissionOutcome, ProviderError> {
         ctx.ensure_active()?;
-        let sender = self.sender_keys()?;
-        let Some(evidence) = self.evidence(request, &sender.email) else {
+        let Some(evidence) = self.evidence(request) else {
             return Ok(SubmissionOutcome::Rejected(ProviderError::forbidden(
                 "the prepared Proton submission is invalid for this operation",
             )));
         };
-
+        // The prepared evidence carries the sender alias, so a restart without
+        // `with_sender_alias` still uses and validates the original address.
+        let sender = self.sender_keys_for(&evidence.sender)?;
+        self.policy.set_sender_alias(evidence.sender.clone());
         // Policy is resolved again immediately before delivery; a changed or
         // unreadable policy blocks now rather than using stale preparation.
         let materials = self.resolve_materials(request, ctx).await?;
@@ -609,8 +627,7 @@ impl SubmissionService for ProtonSubmission {
         ctx: &OperationContext,
     ) -> Result<ReconcileOutcome, ProviderError> {
         ctx.ensure_active()?;
-        let sender = self.sender_email().to_string();
-        let evidence = self.evidence(request, &sender);
+        let evidence = self.evidence(request);
         if request.prepared.is_some() && evidence.is_none() {
             // A prepared artifact we cannot authenticate is not proof either
             // way. Stay conservative.

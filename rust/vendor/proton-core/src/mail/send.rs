@@ -367,7 +367,9 @@ impl Client {
             let rk = api::keys::get_all_public_keys(self.http(), email).await?;
             // Internal = Proton-verified keys present → Type 1 (E2E).
             // External with a published PGP/WKD key → Type 8 (PGP-inline).
-            // Otherwise → Type 4 (cleartext, with a warning).
+            // A recipient with no usable key and no explicitly requested
+            // encrypted-outside password fails closed; this path never emits
+            // Type 4 cleartext.
             if let Some(key) = api::keys::pick_encryption_key(&rk.keys) {
                 tracing::debug!(target: "proton_core::send", recipient = %email, "internal recipient — E2E package (Type 1)");
                 internal_addrs.insert(email.clone(), entry_for(&key.public_key, package_type::PM)?);

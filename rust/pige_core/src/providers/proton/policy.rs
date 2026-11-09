@@ -18,6 +18,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use secrecy::ExposeSecret;
+
 use crate::mail::Address;
 use crate::providers::{ErrorKind, OperationContext, ProviderError};
 use crate::send::OutgoingMessage;
@@ -27,6 +29,7 @@ use proton_core::api::contacts::{Contact, ContactCard, ContactEmail};
 use proton_core::api::keys::{ApiPublicKey, RecipientKeys, pick_encryption_key};
 use proton_core::crypto::keys::AddressKeys;
 use proton_core::model::enums::{key_flag, recipient_type};
+use proton_crypto::crypto::{DataEncoding, PGPProviderSync, Verifier, VerifierSync};
 
 use super::client::ProtonClient;
 
@@ -118,11 +121,12 @@ impl ContactPolicyStore {
         // with them a mandatory policy).
     }
 
-    pub(crate) fn replace(&self, materials: Vec<ContactMaterial>) {
+    /// Record a complete snapshot fetched outside the incremental address-book
+    /// sweep. A sweep that is still accumulating is left untouched so this
+    /// write cannot erase pages (and mandatory policy) it has already seen.
+    pub(crate) fn replace_completed(&self, materials: Vec<ContactMaterial>) {
         let mut state = self.lock();
         state.materials = materials;
-        state.snapshot.clear();
-        state.snapshot_active = false;
         state.complete = true;
     }
 
@@ -216,7 +220,7 @@ impl ProtonRecipientPolicy {
         // A failed contact snapshot means we cannot affirm ordinary external
         // delivery, so it blocks the operation rather than degrading.
         let materials = self.fetch_contact_materials(ctx).await?;
-        self.contacts.replace(materials.clone());
+        self.contacts.replace_completed(materials.clone());
 
         let mut seen = HashSet::new();
         let mut deliveries = Vec::new();
@@ -303,6 +307,17 @@ impl ProtonRecipientPolicy {
     }
 }
 
+/// A public key pinned by a contact card plus the provenance of the card that
+/// supplied it. Only a card with a detached signature verified against one of
+/// the account's own keys is authenticated; an unsigned or invalid card can
+/// still provide a key for optional encryption but never satisfies a mandatory
+/// verification requirement.
+#[derive(Debug, Clone, Default)]
+struct ContactKey {
+    armored: String,
+    authenticated: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ContactPolicy {
     /// `Some(true)` means encryption is mandatory; `Some(false)` is an explicit
@@ -310,7 +325,7 @@ struct ContactPolicy {
     encrypt: Option<bool>,
     sign: Option<bool>,
     verify: Option<bool>,
-    keys: Vec<String>,
+    keys: Vec<ContactKey>,
 }
 
 impl ContactPolicy {
@@ -319,7 +334,14 @@ impl ContactPolicy {
         self.sign = merge_required(self.sign, other.sign);
         self.verify = merge_required(self.verify, other.verify);
         for key in other.keys {
-            if !key.trim().is_empty() && !self.keys.iter().any(|existing| existing == &key) {
+            if key.armored.trim().is_empty() {
+                continue;
+            }
+            if let Some(existing) = self.keys.iter_mut().find(|k| k.armored == key.armored) {
+                // The same key pinned by an authenticated card is authenticated
+                // even if another card that mentions it was not.
+                existing.authenticated |= key.authenticated;
+            } else {
                 self.keys.push(key);
             }
         }
@@ -362,7 +384,8 @@ fn contact_policy(
         matched = true;
         for card in &material.cards {
             let text = card_text(client, card)?;
-            let parsed = parse_card_text(&text);
+            let authenticated = card_signature_verified(client, card);
+            let parsed = parse_card_text(&text, authenticated);
             // Global card properties apply to every email in this contact.
             let mut policy = parsed.global;
             for (card_email, per_email) in parsed.per_email {
@@ -417,6 +440,68 @@ fn card_text(client: &ProtonClient, card: &ContactCard) -> Result<String, Provid
     ))
 }
 
+/// Verify the card's detached signature against the account's own user/address
+/// keys. A missing, unreadable, or invalid signature is unauthenticated
+/// provenance, not a transient failure: the card can still describe optional
+/// policy, but cannot satisfy a mandatory key-verification requirement.
+fn card_signature_verified(client: &ProtonClient, card: &ContactCard) -> bool {
+    let signature = card.signature.trim();
+    if signature.is_empty() || card.data.trim().is_empty() {
+        return false;
+    }
+    let provider = proton_core::crypto::provider();
+    let data = card.data.as_bytes();
+    // A card signature may be armored or raw binary. Proton stores armored
+    // detached signatures; accepting base64-wrapped binary as a fallback keeps
+    // this robust without guessing which key signed it.
+    let binary = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        signature.as_bytes(),
+    )
+    .ok();
+    client
+        .unlocked_keys()
+        .with_keys(|keys| {
+            let mut public_keys = Vec::new();
+            for stored in keys
+                .user_keys
+                .iter()
+                .chain(keys.addresses.iter().flat_map(|address| address.keys.iter()))
+            {
+                let Ok(private) = provider.private_key_import(
+                    stored.armored.as_bytes(),
+                    stored.passphrase.expose_secret().as_bytes(),
+                    DataEncoding::Armor,
+                ) else {
+                    continue;
+                };
+                if let Ok(public) = provider.private_key_to_public_key(&private) {
+                    public_keys.push(public);
+                }
+            }
+            if public_keys.is_empty() {
+                return false;
+            }
+            let armored = provider
+                .new_verifier()
+                .with_verification_keys(public_keys.iter())
+                .verify_detached(data, signature.as_bytes(), DataEncoding::Armor)
+                .is_ok();
+            if armored {
+                return true;
+            }
+            match binary {
+                Some(binary) => provider
+                    .new_verifier()
+                    .with_verification_keys(public_keys.iter())
+                    .verify_detached(data, binary, DataEncoding::Bytes)
+                    .is_ok(),
+                None => false,
+            }
+        })
+        .unwrap_or(false)
+}
+
 fn decrypt_card(client: &ProtonClient, data: &str) -> Result<String, ProviderError> {
     let provider = proton_core::crypto::provider();
     client.unlocked_keys().with_keys(|keys| {
@@ -464,7 +549,7 @@ struct ParsedCard {
     per_email: Vec<(String, ContactPolicy)>,
 }
 
-fn parse_card_text(text: &str) -> ParsedCard {
+fn parse_card_text(text: &str, authenticated: bool) -> ParsedCard {
     let mut parsed = ParsedCard::default();
     // A bare public key card carries no vCard policy, but its key is usable.
     if text
@@ -472,7 +557,10 @@ fn parse_card_text(text: &str) -> ParsedCard {
         .starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----")
     {
         if let Some(key) = extract_key(text) {
-            parsed.global.keys.push(key);
+            parsed.global.keys.push(ContactKey {
+                armored: key,
+                authenticated,
+            });
         }
         return parsed;
     }
@@ -530,7 +618,10 @@ fn parse_card_text(text: &str) -> ParsedCard {
             }
             "KEY" | "X-PM-PUBLIC-KEY" | "X-PM-PGP-KEY" | "X-PM-ENCRYPT-KEY" => {
                 if let Some(key) = extract_key(value) {
-                    parsed.global.keys.push(key);
+                    parsed.global.keys.push(ContactKey {
+                        armored: key,
+                        authenticated,
+                    });
                 }
             }
             _ => {}
@@ -604,13 +695,15 @@ fn classify(
         ));
     }
 
-    let contact_key = contact.and_then(|policy| {
-        policy
-            .keys
-            .iter()
-            .find(|key| !key.trim().is_empty())
-            .cloned()
-    });
+    let contact_keys = contact.map(|policy| policy.keys.as_slice()).unwrap_or(&[]);
+    let contact_key = contact_keys
+        .iter()
+        .find(|key| !key.armored.trim().is_empty())
+        .map(|key| key.armored.clone());
+    let authenticated_contact_key = contact_keys
+        .iter()
+        .find(|key| key.authenticated && !key.armored.trim().is_empty())
+        .map(|key| key.armored.clone());
     let api_key = keys
         .unverified
         .iter()
@@ -618,13 +711,24 @@ fn classify(
         .map(|key| key.public_key.clone());
 
     let encryption_required = contact.and_then(|policy| policy.encrypt) == Some(true);
-    let verification_required =
-        contact.and_then(|policy| policy.verify.or(policy.sign)) == Some(true);
+    // `X-PM-SIGN` asks for message signing, not proof that the pinned key was
+    // authenticated by the contact-card signature. Only `X-PM-VERIFY` imposes
+    // verified-key provenance; folding sign into it over-blocked sign-only
+    // contacts.
+    let verification_required = contact.and_then(|policy| policy.verify) == Some(true);
 
-    if verification_required && contact_key.is_none() {
-        return Err(policy_error(
-            "this recipient requires verified OpenPGP key material that is not available",
-        ));
+    if verification_required {
+        // A mandatory verification requirement may only be satisfied by a key
+        // from a card whose detached signature verifies against an account key.
+        // A published API key or a key from an unsigned card is unauthenticated
+        // provenance and must block the whole submission, even though the key
+        // could technically encrypt.
+        let key = authenticated_contact_key.ok_or_else(|| {
+            policy_error(
+                "this recipient requires verified OpenPGP key material from an authenticated contact card",
+            )
+        })?;
+        return Ok((DeliverySecurity::ExternalOpenPgp, Some(key)));
     }
 
     if encryption_required {
@@ -653,6 +757,7 @@ fn usable_internal_key(key: &ApiPublicKey) -> bool {
 
 fn usable_external_key(key: &ApiPublicKey) -> bool {
     key_flag::can_encrypt(key.flags)
+        && key.flags & key_flag::NOT_COMPROMISED != 0
         && key.flags & key_flag::EMAIL_NO_ENCRYPT == 0
         && !key.public_key.trim().is_empty()
 }
@@ -685,6 +790,7 @@ mod tests {
     fn parses_encrypt_and_sign_properties() {
         let parsed = parse_card_text(
             "BEGIN:VCARD\nVERSION:4.0\nEMAIL:alice@example.com\nX-PM-ENCRYPT:true\nX-PM-SIGN:false\nEND:VCARD",
+            false,
         );
         assert_eq!(parsed.emails, vec!["alice@example.com"]);
         assert_eq!(parsed.global.encrypt, Some(true));
@@ -708,7 +814,7 @@ mod tests {
                 extra: Default::default(),
             }],
         };
-        store.replace(vec![previous.clone()]);
+        store.replace_completed(vec![previous.clone()]);
         store.begin_snapshot();
         store.push_snapshot(previous);
         store.finish_snapshot(false);
@@ -723,6 +829,69 @@ mod tests {
         store.begin_snapshot();
         store.finish_snapshot(true);
         assert!(store.lock().materials.is_empty());
+    }
+
+    #[test]
+    fn sign_only_policy_does_not_demand_verified_keys() {
+        let policy = ContactPolicy {
+            sign: Some(true),
+            ..ContactPolicy::default()
+        };
+        let keys = RecipientKeys {
+            recipient_type: recipient_type::EXTERNAL,
+            keys: Vec::new(),
+            unverified: Vec::new(),
+        };
+        let (security, key) = classify(&keys, Some(&policy)).expect("sign-only is not verification");
+        assert_eq!(security, DeliverySecurity::ExternalOrdinary);
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn verification_requires_authenticated_contact_key_provenance() {
+        let keys = RecipientKeys {
+            recipient_type: recipient_type::EXTERNAL,
+            keys: Vec::new(),
+            unverified: Vec::new(),
+        };
+        let unauthenticated = ContactPolicy {
+            verify: Some(true),
+            keys: vec![ContactKey {
+                armored: "-----BEGIN PGP PUBLIC KEY BLOCK-----\nkey\n-----END PGP PUBLIC KEY BLOCK-----".into(),
+                authenticated: false,
+            }],
+            ..ContactPolicy::default()
+        };
+        assert!(classify(&keys, Some(&unauthenticated)).is_err());
+
+        let authenticated = ContactPolicy {
+            verify: Some(true),
+            keys: vec![ContactKey {
+                armored: "-----BEGIN PGP PUBLIC KEY BLOCK-----\nkey\n-----END PGP PUBLIC KEY BLOCK-----".into(),
+                authenticated: true,
+            }],
+            ..ContactPolicy::default()
+        };
+        let (security, key) =
+            classify(&keys, Some(&authenticated)).expect("authenticated provenance");
+        assert_eq!(security, DeliverySecurity::ExternalOpenPgp);
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn external_key_usability_honors_not_compromised() {
+        let base = ApiPublicKey {
+            public_key: "key".into(),
+            flags: key_flag::NOT_OBSOLETE | key_flag::NOT_COMPROMISED,
+            primary: 1,
+            source: 0,
+        };
+        assert!(usable_external_key(&base));
+        let compromised = ApiPublicKey {
+            flags: key_flag::NOT_OBSOLETE,
+            ..base
+        };
+        assert!(!usable_external_key(&compromised));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -46,7 +46,7 @@ use pige_core::send::{
 use proton_core::crypto::keys::{AddressKeys, KeyStore, StoredKey};
 use proton_crypto::crypto::{
     DataEncoding, Encryptor, EncryptorSync, KeyGenerator, KeyGeneratorAlgorithm, KeyGeneratorSync,
-    PGPMessage, PGPProviderSync,
+    PGPMessage, PGPProviderSync, Signer, SignerSync,
 };
 use tempfile::TempDir;
 
@@ -499,6 +499,32 @@ fn encrypted_card(vcard: &str, me: &GeneratedKey) -> Value {
         "Data": encrypt_to(&me.public, vcard),
         "Signature": "",
     })
+}
+
+fn sign_card(data: &str, signer: &GeneratedKey) -> String {
+    let provider = provider();
+    let private = provider
+        .private_key_import(
+            signer.stored.armored.as_bytes(),
+            signer.stored.passphrase.expose_secret().as_bytes(),
+            DataEncoding::Armor,
+        )
+        .expect("import signing key");
+    let signature = provider
+        .new_signer()
+        .with_signing_key(&private)
+        .sign_detached(data.as_bytes(), DataEncoding::Armor)
+        .expect("sign card");
+    String::from_utf8(signature).expect("armored signature")
+}
+
+fn pinned_key_policy_card(key: &str, signer: Option<&GeneratedKey>) -> Value {
+    let vcard = format!(
+        "BEGIN:VCARD\nVERSION:4.0\nEMAIL:verify@example.com\nX-PM-ENCRYPT:true\nX-PM-VERIFY:true\nKEY;ENCODING=b:base64,{}\nEND:VCARD",
+        STANDARD.encode(key.as_bytes())
+    );
+    let signature = signer.map(|signer| sign_card(&vcard, signer)).unwrap_or_default();
+    json!({"Type": "CLEAR", "Data": vcard, "Signature": signature})
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,6 +1321,123 @@ async fn required_key_verification_is_distinctly_blocked() {
     assert_eq!(error.kind, ErrorKind::Unsupported);
     assert!(error.safe_message.contains("verified"));
     assert_eq!(mock.snapshot(|state| state.draft_create_count), 0);
+}
+
+#[tokio::test]
+async fn mandatory_verification_rejects_unsigned_card_key() {
+    let me = generate_key(SENDER);
+    let external = generate_key("verify@example.com");
+    let keys = key_store(vec![address_keys("address-1", SENDER, &[&me])]);
+    let mut state = MockState::default();
+    state.contacts = vec![contact(
+        "contact-unsigned",
+        "verify@example.com",
+        vec![pinned_key_policy_card(&external.public, None)],
+    )];
+    state.recipient_keys.insert(
+        "verify@example.com".to_string(),
+        external_keys("verify@example.com", &[]),
+    );
+    let mock = ProtonMock::start(state).await;
+    let mut submission = ProtonSubmission::new(mock.client(keys), account());
+    let req = request(message(vec!["verify@example.com"], vec![], vec![]));
+
+    let error = submission
+        .prepare(&req, &context())
+        .await
+        .expect_err("an unsigned card must not satisfy mandatory verification");
+    assert_eq!(error.kind, ErrorKind::Unsupported);
+    assert!(
+        error.safe_message.contains("authenticated"),
+        "the safe error should name authenticated provenance: {error:?}"
+    );
+    assert_eq!(mock.snapshot(|state| state.draft_create_count), 0);
+    assert_eq!(mock.snapshot(|state| state.send_count), 0);
+}
+
+#[tokio::test]
+async fn mandatory_verification_accepts_authenticated_card_provenance() {
+    let me = generate_key(SENDER);
+    let external = generate_key("verify@example.com");
+    let keys = key_store(vec![address_keys("address-1", SENDER, &[&me])]);
+    let mut state = MockState::default();
+    state.contacts = vec![contact(
+        "contact-signed",
+        "verify@example.com",
+        vec![pinned_key_policy_card(&external.public, Some(&me))],
+    )];
+    state.recipient_keys.insert(
+        "verify@example.com".to_string(),
+        external_keys("verify@example.com", &[]),
+    );
+    let mock = ProtonMock::start(state).await;
+    let mut submission = ProtonSubmission::new(mock.client(keys), account());
+    let mut req = request(message(vec!["verify@example.com"], vec![], vec![]));
+    req.prepared = Some(submission.prepare(&req, &context()).await.expect("prepare"));
+    let outcome = submission.submit(&req, &context()).await.expect("submit");
+    assert!(matches!(outcome, SubmissionOutcome::Accepted(_)));
+
+    let packages = mock.snapshot(MockState::send_packages);
+    let pgp = package_of_type(&packages, 8);
+    assert!(pgp["Addresses"].get("verify@example.com").is_some());
+}
+
+#[tokio::test]
+async fn recipient_key_lookup_failure_blocks_submission() {
+    let me = generate_key(SENDER);
+    let keys = key_store(vec![address_keys("address-1", SENDER, &[&me])]);
+    let mut state = MockState::default();
+    // A successful contact lookup with no policy is not enough if the
+    // recipient-key lookup fails: that must never degrade to cleartext.
+    state.fail_keys = Some(503);
+    let mock = ProtonMock::start(state).await;
+    let mut submission = ProtonSubmission::new(mock.client(keys), account());
+    let req = request(message(vec!["external@example.com"], vec![], vec![]));
+
+    let error = submission
+        .prepare(&req, &context())
+        .await
+        .expect_err("a failed recipient-key lookup must block submission");
+    assert!(matches!(
+        error.kind,
+        ErrorKind::Transient | ErrorKind::Offline | ErrorKind::RateLimited
+    ));
+    assert_eq!(mock.snapshot(|state| state.draft_create_count), 0);
+    assert!(
+        mock.snapshot(MockState::send_packages).is_empty(),
+        "no package may be built after a failed key lookup"
+    );
+}
+
+#[tokio::test]
+async fn prepared_alias_survives_restart() {
+    let me = generate_key(SENDER);
+    let alias = "alias@example.com";
+    let alias_key = generate_key(alias);
+    let bob = generate_key("bob@proton.example");
+    let keys = key_store(vec![
+        address_keys("address-1", SENDER, &[&me]),
+        address_keys("address-2", alias, &[&alias_key]),
+    ]);
+    let mut state = MockState::default();
+    state.recipient_keys.insert(
+        "bob@proton.example".to_string(),
+        internal_keys("bob@proton.example", &[(&bob.public, 3)]),
+    );
+    let mock = ProtonMock::start(state).await;
+    let mut req = request(message(vec!["bob@proton.example"], vec![], vec![]));
+    let mut first = ProtonSubmission::new(mock.client(keys.clone()), account())
+        .with_sender_alias(alias);
+    req.prepared = Some(first.prepare(&req, &context()).await.expect("prepare"));
+
+    // A restarted service has no `with_sender_alias`; the prepared evidence is
+    // the durable record of the chosen alias and must still submit.
+    let mut restarted = ProtonSubmission::new(mock.client(keys), account());
+    let outcome = restarted.submit(&req, &context()).await.expect("submit");
+    assert!(matches!(outcome, SubmissionOutcome::Accepted(_)));
+    let drafts = mock.snapshot(MockState::draft_bodies);
+    assert_eq!(drafts[0]["Message"]["Sender"]["Address"], json!(alias));
+    assert_eq!(mock.snapshot(|state| state.send_count), 1);
 }
 
 #[derive(Default)]
