@@ -10,10 +10,12 @@
 //! `SecretRepository` is the only credential writer.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use secrecy::SecretString;
+use serde::de::DeserializeOwned;
 
 use crate::auth::TokenSource;
 use crate::providers::{ErrorKind, OperationContext, ProviderError};
@@ -159,6 +161,126 @@ impl ProtonClient {
         http.set_tokens(uid, access, SecretString::from(String::new()))
             .await;
         Ok(http)
+    }
+
+    /// Build the P2 request runner: a vendor transport that retries once
+    /// through Pige's [`TokenSource`] on 401 instead of letting the vendored
+    /// client rotate (and drop) the refresh token in memory.
+    pub(crate) async fn request_http(
+        &self,
+        ctx: &OperationContext,
+    ) -> Result<ProtonHttp, ProviderError> {
+        ctx.ensure_active()?;
+        let access = self.access_token(ctx).await?;
+        ctx.ensure_active()?;
+        let uid = self.keys.session_uid().ok_or_else(|| {
+            ProviderError::reauthenticate("unlock the Proton mailbox to continue")
+        })?;
+        let http =
+            proton_core::transport::HttpClient::new(self.endpoints.as_str(), PROTON_APP_VERSION);
+        http.set_tokens(uid.clone(), access, SecretString::from(String::new()))
+            .await;
+        Ok(ProtonHttp {
+            http,
+            tokens: self.tokens.clone(),
+            uid,
+            ctx: ctx.clone(),
+            failure: Mutex::new(None),
+        })
+    }
+}
+
+/// One adapter request runner over the vendored HTTP transport.
+///
+/// The vendored transport's own 401 path would refresh and rotate the token in
+/// memory; Pige deliberately installed a blank refresh token so that path
+/// fails closed. This wrapper marks every request `skip_refresh`, and on 401
+/// invalidates the shared [`TokenSource`] cache, asks Pige's single-flight
+/// refresher for a new access token (which persists any rotated refresh token
+/// before returning), and retries exactly once.
+pub(crate) struct ProtonHttp {
+    http: proton_core::transport::HttpClient,
+    tokens: Arc<dyn TokenSource>,
+    uid: String,
+    ctx: OperationContext,
+    /// A typed failure from the Pige-side refresh step. The vendored `Doer`
+    /// trait can only return vendor errors, so adapters read this slot when a
+    /// call fails and prefer it over the generic wire mapping.
+    failure: Mutex<Option<ProviderError>>,
+}
+
+impl ProtonHttp {
+    /// Map a vendored call result onto the provider-neutral surface, preferring
+    /// a typed token-refresh failure recorded during a 401 retry.
+    pub(crate) fn finish<T>(
+        &self,
+        result: Result<T, proton_core::Error>,
+    ) -> Result<T, ProviderError> {
+        result.map_err(|error| {
+            let recorded = self
+                .failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            recorded.unwrap_or_else(|| map_proton_error(error))
+        })
+    }
+
+    fn record_failure(&self, error: ProviderError) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+    }
+
+    async fn refresh_after_unauthorized(&self) -> Result<(), proton_core::Error> {
+        if let Err(error) = self.ctx.ensure_active() {
+            self.record_failure(error);
+            return Err(proton_core::Error::Unauthorized);
+        }
+        self.tokens.invalidate().await;
+        let access = match self.tokens.access_token(&self.ctx).await {
+            Ok(access) => access,
+            Err(error) => {
+                self.record_failure(error);
+                return Err(proton_core::Error::Unauthorized);
+            }
+        };
+        if let Err(error) = self.ctx.ensure_active() {
+            self.record_failure(error);
+            return Err(proton_core::Error::Unauthorized);
+        }
+        self.http
+            .set_tokens(self.uid.clone(), access, SecretString::from(String::new()))
+            .await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl proton_core::transport::Doer for ProtonHttp {
+    async fn do_raw(
+        &self,
+        request: proton_core::transport::Request,
+    ) -> Result<proton_core::transport::Response, proton_core::Error> {
+        // Never let the vendored client attempt its own rotating refresh.
+        let mut request = request;
+        request.skip_refresh = true;
+        match self.http.do_raw(request.clone()).await {
+            Err(proton_core::Error::Unauthorized) => {
+                self.refresh_after_unauthorized().await?;
+                self.http.do_raw(request).await
+            }
+            other => other,
+        }
+    }
+
+    async fn decode<T: DeserializeOwned>(
+        &self,
+        request: proton_core::transport::Request,
+    ) -> Result<T, proton_core::Error> {
+        let response = self.do_raw(request).await?;
+        serde_json::from_slice(&response.body).map_err(proton_core::Error::Json)
     }
 }
 

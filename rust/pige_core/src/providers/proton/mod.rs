@@ -12,6 +12,9 @@
 pub mod auth;
 pub mod client;
 pub mod keys;
+mod mailbox;
+mod normalize;
+mod sync;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -33,6 +36,8 @@ use crate::providers::{
 pub use auth::ProtonAuthentication;
 pub use client::{PROTON_APP_VERSION, ProtonClient, ProtonEndpoints};
 pub use keys::{ProtonAddressKeys, ProtonKeyStores, UnlockedKeyStore};
+pub use mailbox::ProtonMailbox;
+pub use sync::{ProtonMutations, ProtonSync, cursor_stage};
 
 // Re-exported for adapter code and synthetic tests. These are still private to
 // `providers::proton` from the application's point of view.
@@ -152,11 +157,23 @@ impl ProviderFactory for ProtonProviderFactory {
             return Err(ProviderError::unsupported("Proton for this account"));
         }
         // Build the shared client eagerly so every capability opened for this
-        // account uses the same token source and key store. P2-P4 attach their
-        // services to this session; P1 advertises no capability it cannot serve.
-        let _client = self.client(&account.id);
-        Ok(ProviderSession::new(ProviderCapabilities::default())
-            .with_provider(ProviderId::from(PROTON_PROVIDER)))
+        // account uses the same token source and key store.
+        let client = self.client(&account.id);
+        let mutations = ProtonMutations::new(client.clone()).capabilities();
+        let mut session = ProviderSession::new(ProviderCapabilities {
+            mailbox: true,
+            sync: true,
+            mutations,
+            // P3/P4 attach body reading, submission and contacts.
+            submission: false,
+            contacts: Default::default(),
+            server_search: false,
+        })
+        .with_provider(ProviderId::from(PROTON_PROVIDER));
+        session.mailbox = Some(Box::new(ProtonMailbox::new(client.clone())));
+        session.sync = Some(Box::new(ProtonSync::new(client.clone())));
+        session.mutations = Some(Box::new(ProtonMutations::new(client)));
+        Ok(session)
     }
 }
 

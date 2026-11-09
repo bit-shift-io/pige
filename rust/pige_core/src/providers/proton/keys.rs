@@ -65,6 +65,16 @@ impl UnlockedKeyStore {
         self.lock_state().keys.is_some()
     }
 
+    /// Install only the non-secret session UID for a synthetic metadata test.
+    ///
+    /// Metadata listing needs the `x-pm-uid` header but no private key. This
+    /// hook is compiled only for this crate's tests and the test-support
+    /// feature; product builds cannot install a session without unlocking keys.
+    #[cfg(any(test, feature = "provider-proton-test-support"))]
+    pub fn install_test_session(&self, session_uid: impl Into<String>) {
+        self.lock_state().session_uid = Some(session_uid.into());
+    }
+
     /// The non-secret Proton session UID, if a session is installed.
     pub fn session_uid(&self) -> Option<String> {
         self.lock_state().session_uid.clone()

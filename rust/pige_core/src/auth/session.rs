@@ -175,6 +175,12 @@ impl AccountSessionManager {
 #[async_trait]
 pub trait TokenSource: Send + Sync {
     async fn access_token(&self, ctx: &OperationContext) -> Result<SecretString, ProviderError>;
+
+    /// Drop any cached access token so the next [`Self::access_token`] call
+    /// performs a refresh. A provider adapter calls this exactly once after a
+    /// request was rejected with 401; the default is a no-op for stateless
+    /// sources that already return a current token on every call.
+    async fn invalidate(&self) {}
 }
 
 /// Performs one token refresh. Implemented by an adapter (or the fake) so the
@@ -247,5 +253,9 @@ impl<R: TokenRefresher> TokenSource for CachedTokenSource<R> {
             expires_at: Instant::now() + self.ttl,
         });
         Ok(token)
+    }
+
+    async fn invalidate(&self) {
+        *self.cache.lock().await = None;
     }
 }
