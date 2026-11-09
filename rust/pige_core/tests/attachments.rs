@@ -218,6 +218,7 @@ async fn harness(thread: &str) -> Harness {
         opener: opener.clone(),
         transport: factory.clone(),
         backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
+        auth: None,
     })
     .expect("init api");
 

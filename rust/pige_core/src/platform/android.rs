@@ -329,6 +329,17 @@ impl CredentialStore for AndroidCredentials {
         }
     }
 
+    fn get_persistent(&self, id: &AccountId) -> Result<Option<String>> {
+        match call_string_arg("getPassword", &id.0) {
+            Ok(Some(secret)) => {
+                self.persistent().insert(id.clone());
+                Ok(Some(secret))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(unavailable(error)),
+        }
+    }
+
     fn set(&self, id: &AccountId, secret: &str) -> Result<()> {
         call_void("setPassword", &[&id.0, secret]).map_err(unavailable)?;
         // A persistent write supersedes any session fallback for this account.

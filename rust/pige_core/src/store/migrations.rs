@@ -2,6 +2,7 @@
 //! the version in `meta` so later tasks can add steps without guessing the
 //! shape of an existing database.
 
+mod v10;
 mod v2;
 mod v3;
 mod v4;
@@ -60,7 +61,8 @@ impl Store {
     /// collection membership; v8 records the provider signature status and the
     /// remote attachment id on the cached message and attachment; v9 generalizes
     /// the outbox into a provider-neutral durable submission with structured
-    /// parts, operation identity, prepared artifacts, and receipts.
+    /// parts, operation identity, prepared artifacts, and receipts; v10 adds the
+    /// recoverable backend-switch intent.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -142,6 +144,10 @@ impl Store {
         if version < 9 && target >= 9 {
             v9::apply(&tx)?;
             version = 9;
+        }
+        if version < 10 && target >= 10 {
+            v10::apply(&tx)?;
+            version = 10;
         }
 
         // The rebuild must not leave a dangling reference behind; check before

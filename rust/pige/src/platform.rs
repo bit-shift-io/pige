@@ -35,6 +35,7 @@ pub(crate) fn config() -> api::Config {
         providers,
         transport,
         backups: Arc::new(LinuxBackupStore::new()),
+        auth: None,
     }
 }
 
@@ -78,6 +79,7 @@ pub(crate) fn config() -> api::Config {
         providers,
         transport,
         backups: Arc::new(AndroidBackupStore::new()),
+        auth: None,
     }
 }
 
@@ -106,6 +108,7 @@ pub(crate) fn config() -> api::Config {
         providers,
         transport,
         backups: Arc::new(FakeBackupStore::new()),
+        auth: None,
     }
 }
 

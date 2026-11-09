@@ -286,6 +286,14 @@ impl StagedSecretRef {
 /// that lost its session can never persist a rotated secret.
 pub trait SecretRepository: Send + Sync {
     fn load(&self, account: &AccountId) -> Result<Option<SecretEnvelope>, ProviderError>;
+
+    /// Load only the persistent half of the account credential. `None` means
+    /// there is no OS-store entry even if a session-only fallback exists. The
+    /// backend-switch recovery path uses this to restore a credential with the
+    /// same persistence it had before the switch.
+    fn load_persistent(&self, account: &AccountId)
+    -> Result<Option<SecretEnvelope>, ProviderError>;
+
     fn save(&self, ctx: &OperationContext, secret: &SecretEnvelope) -> Result<(), ProviderError>;
     fn save_session(
         &self,
@@ -305,6 +313,22 @@ pub trait SecretRepository: Send + Sync {
         &self,
         reference: &StagedSecretRef,
     ) -> Result<Option<SecretEnvelope>, ProviderError>;
+
+    /// Write a secret under a non-account lifecycle reference (for example a
+    /// backend switch's rollback backup). The reference is a secure-store key,
+    /// never the secret itself. `persistent` selects the OS store; otherwise
+    /// the value lives in process memory only.
+    fn write_reference(
+        &self,
+        reference: &StagedSecretRef,
+        secret: &SecretEnvelope,
+        persistent: bool,
+    ) -> Result<(), ProviderError>;
+
+    /// Remove both the persistent and session-only halves of a lifecycle
+    /// reference. Used when a switch completes or rolls back.
+    fn discard_reference(&self, reference: &StagedSecretRef) -> Result<(), ProviderError>;
+
     /// Remove a staged entry. Always called when an attempt completes, is
     /// cancelled, or expires.
     fn discard_staged(&self, reference: &StagedSecretRef) -> Result<(), ProviderError>;
@@ -450,6 +474,17 @@ impl SecretRepository for CredentialSecretRepository {
         self.read(account)
     }
 
+    fn load_persistent(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<SecretEnvelope>, ProviderError> {
+        self.credentials
+            .get_persistent(account)
+            .map_err(credential_error)?
+            .map(|stored| SecretEnvelope::from_stored_string(&stored))
+            .transpose()
+    }
+
     fn save(&self, ctx: &OperationContext, secret: &SecretEnvelope) -> Result<(), ProviderError> {
         self.write(ctx, secret, false)
     }
@@ -497,6 +532,40 @@ impl SecretRepository for CredentialSecretRepository {
         reference: &StagedSecretRef,
     ) -> Result<Option<SecretEnvelope>, ProviderError> {
         self.read(&AccountId(reference.as_str().to_string()))
+    }
+
+    fn write_reference(
+        &self,
+        reference: &StagedSecretRef,
+        secret: &SecretEnvelope,
+        persistent: bool,
+    ) -> Result<(), ProviderError> {
+        let key = AccountId(reference.as_str().to_string());
+        let stored = secret.to_stored_string()?;
+        if persistent {
+            self.credentials
+                .set(&key, &stored)
+                .map_err(credential_error)
+        } else {
+            self.credentials
+                .set_session(&key, &stored)
+                .map_err(credential_error)
+        }
+    }
+
+    fn discard_reference(&self, reference: &StagedSecretRef) -> Result<(), ProviderError> {
+        let key = AccountId(reference.as_str().to_string());
+        // A backup written while the OS store was unavailable may only exist as
+        // a session entry; a persistent backup may exist beside it. Both are
+        // removed, and an unavailable store must not prevent the session cleanup.
+        let persistent_error = self.credentials.delete(&key).err();
+        self.credentials
+            .delete_session(&key)
+            .map_err(credential_error)?;
+        match persistent_error {
+            Some(error) if !credentials_unavailable(&error) => Err(credential_error(error)),
+            _ => Ok(()),
+        }
     }
 
     fn discard_staged(&self, reference: &StagedSecretRef) -> Result<(), ProviderError> {

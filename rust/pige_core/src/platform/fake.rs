@@ -103,6 +103,13 @@ impl CredentialStore for FakeCredentials {
         Ok(self.session.lock().unwrap().get(id).cloned())
     }
 
+    fn get_persistent(&self, id: &AccountId) -> Result<Option<String>> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(Self::unavailable_error());
+        }
+        Ok(self.secrets.lock().unwrap().get(id).cloned())
+    }
+
     fn set(&self, id: &AccountId, secret: &str) -> Result<()> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(Self::unavailable_error());

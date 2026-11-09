@@ -56,6 +56,10 @@ impl ProviderRegistry {
 
 #[async_trait]
 impl ProviderFactory for ProviderRegistry {
+    fn supports(&self, id: &ProviderId) -> bool {
+        self.factories.contains_key(id)
+    }
+
     async fn open(
         &self,
         account: &Account,

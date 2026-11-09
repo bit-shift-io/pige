@@ -107,6 +107,26 @@ impl CredentialStore for LinuxCredentials {
         }
     }
 
+    fn get_persistent(&self, id: &AccountId) -> Result<Option<String>> {
+        match self.entry(id) {
+            Ok(entry) => match entry.get_password() {
+                Ok(secret) => {
+                    self.persistent().insert(id.clone());
+                    Ok(Some(secret))
+                }
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(keyring::Error::NoStorageAccess(cause)) => {
+                    Err(CredentialsUnavailable(cause.to_string()).into_message())
+                }
+                Err(error) => Err(format!("read password from keyring: {error}")),
+            },
+            Err(keyring::Error::NoStorageAccess(cause)) => {
+                Err(CredentialsUnavailable(cause.to_string()).into_message())
+            }
+            Err(error) => Err(format!("open keyring entry: {error}")),
+        }
+    }
+
     fn set(&self, id: &AccountId, secret: &str) -> Result<()> {
         let entry = self
             .entry(id)

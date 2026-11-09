@@ -76,6 +76,14 @@ pub fn is_valid_credential_key(key: &str) -> bool {
 /// when pige exits. It must never be written to SQLite.
 pub trait CredentialStore: Send + Sync {
     fn get(&self, id: &AccountId) -> Result<Option<String>>;
+
+    /// Read only the persistent entry, ignoring any session-only fallback. A
+    /// lifecycle recovery path uses this to restore a credential with the same
+    /// persistence it had before a switch.
+    fn get_persistent(&self, id: &AccountId) -> Result<Option<String>> {
+        self.get(id)
+    }
+
     fn set(&self, id: &AccountId, secret: &str) -> Result<()>;
     fn delete(&self, id: &AccountId) -> Result<()>;
 

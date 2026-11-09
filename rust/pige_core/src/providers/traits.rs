@@ -210,6 +210,14 @@ impl fmt::Debug for ProviderSession {
 /// worker tasks.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
+    /// Whether this build/registry can serve `id` at all. The lifecycle gate
+    /// uses this to keep native account actions disabled until their adapter is
+    /// registered, without opening a network session to find out.
+    fn supports(&self, id: &ProviderId) -> bool {
+        let _ = id;
+        true
+    }
+
     async fn open(
         &self,
         account: &Account,

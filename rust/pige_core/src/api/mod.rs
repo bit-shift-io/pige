@@ -6,6 +6,7 @@
 //! after the lock is released, and sync uses its own connection so a snapshot
 //! never blocks behind a slow server.
 
+pub mod accounts;
 pub mod body;
 pub mod events;
 pub mod mailbox;
@@ -55,6 +56,13 @@ use mailbox::{INTERACTIVE_TIMEOUT, SYNC_TIMEOUT, open_session, scheduler_message
 const SYNC_PAGES: u32 = 8;
 
 pub use crate::settings::{Settings, ThemeMode};
+pub use accounts::{
+    answer_auth, begin_auth, can_switch_backend, cancel_auth, finish_auth, switch_backend,
+};
+#[doc(hidden)]
+pub use accounts::{
+    clear_switch_crash, inject_switch_crash_after_config, inject_switch_crash_after_secret,
+};
 pub use events::{CoreEvent, back_pressed, subscribe};
 pub use mutations::{
     RECONNECT_ERROR, archive_available, archive_thread, delete_permanently, move_thread, set_read,
@@ -129,6 +137,10 @@ pub struct Config {
     pub transport: Arc<dyn TransportFactory>,
     /// Reads and writes configuration backups in the platform's Downloads.
     pub backups: Arc<dyn BackupStore>,
+    /// Interactive authentication for providers whose adapters are registered.
+    /// `None` until a native adapter is wired; the IMAP/SMTP onboarding form
+    /// still uses its explicit password field.
+    pub auth: Option<Arc<AsyncMutex<Box<dyn crate::auth::AuthenticationService>>>>,
 }
 
 /// User-supplied fields when adding an account. The id and sort order are
@@ -555,8 +567,46 @@ pub fn init(config: Config) -> Result<(), String> {
     }
 
     let config_path = config::document_path(&config.config_dir);
-    let (config_doc, startup_warning, writes_blocked) =
+    let (mut config_doc, startup_warning, writes_blocked) =
         load_or_migrate_document(&store, &config_path);
+
+    // Finish or roll back any backend switch interrupted by a crash. This runs
+    // after the document is loaded and before the state is installed, so the
+    // configuration and the protected credential are always a consistent pair
+    // when the first snapshot is built.
+    let mut startup_warning = startup_warning;
+    if !writes_blocked {
+        match accounts::recover_switch_intents(
+            &store,
+            &config.credentials,
+            &config_path,
+            &mut config_doc,
+        ) {
+            Ok(warnings) => {
+                if !warnings.is_empty() {
+                    let text = warnings.join(" ");
+                    startup_warning = Some(match startup_warning {
+                        Some(existing) => format!("{existing} {text}"),
+                        None => text,
+                    });
+                }
+            }
+            Err(error) => {
+                log::warn!("recover interrupted backend switch: {error}");
+                let text = format!("An interrupted account switch could not be completed: {error}");
+                startup_warning = Some(match startup_warning {
+                    Some(existing) => format!("{existing} {text}"),
+                    None => text,
+                });
+            }
+        }
+    } else if store
+        .switch_intents()
+        .map(|intents| !intents.is_empty())
+        .unwrap_or(false)
+    {
+        log::warn!("an interrupted backend switch is pending but configuration writes are blocked");
+    }
 
     let sender = events::sender().clone();
     let mut state = AppState {
@@ -818,6 +868,20 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         log::warn!("keep pre-restore copy: {error}");
     }
 
+    // A restore supersedes any interrupted switch, and every current account
+    // generation is stale once the document is replaced. Cancel live work and
+    // discard switch remnants *before* rebuilding the mirror so a late worker
+    // cannot write into the restored configuration.
+    accounts::discard_pending_switches(&state.store, &state.config.credentials)?;
+    for account in &previous.accounts {
+        if let Err(error) = state.sessions.invalidate(&account.id) {
+            log::warn!(
+                "invalidate session before restore for {}: {error}",
+                account.id
+            );
+        }
+    }
+
     let dropped: Vec<AccountId> = previous
         .accounts
         .iter()
@@ -829,6 +893,8 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         })
         .map(|account| account.id.clone())
         .collect();
+
+    accounts::revoke_sessions_best_effort(state.config.auth.clone(), dropped.clone());
 
     state.config_doc = restored;
     if let Err(error) = config::save(&state.config_path, &state.config_doc) {
@@ -847,11 +913,10 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
     // clean restore and keep the old password.
     let mut warnings = Vec::new();
     for id in &dropped {
-        // Bump the generation (and fence out any in-flight writer) *before*
-        // deleting so a refresh already past its fence cannot re-persist a
-        // rotated credential after the delete.
-        if let Err(error) = state.sessions.invalidate(id) {
-            log::warn!("invalidate session for restored-away account {id}: {error}");
+        // The generation was already advanced before the mirror rebuild. Clean
+        // the dropped account's durable jobs and cached provider state now.
+        if let Err(error) = state.store.clear_account_jobs(id) {
+            log::warn!("clear jobs for restored-away account {id}: {error}");
         }
         if let Err(error) = state.config.credentials.delete(id) {
             log::warn!("delete password for restored-away account {id}: {error}");
@@ -899,6 +964,18 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
         .map(|account| account.id.clone())
         .collect();
 
+    // Cancel every live generation and discard switch remnants before the
+    // destructive write. A worker that started earlier must not repopulate a
+    // credential or cache row after the reset. Provider-session revocation is
+    // best effort and never delays the local cleanup.
+    accounts::revoke_sessions_best_effort(state.config.auth.clone(), ids.clone());
+    accounts::discard_pending_switches(&state.store, &state.config.credentials)?;
+    for id in &ids {
+        if let Err(error) = state.sessions.invalidate(id) {
+            log::warn!("invalidate session during factory reset for {id}: {error}");
+        }
+    }
+
     state.config_doc = ConfigDocument::default();
     if let Err(error) = config::save(&state.config_path, &state.config_doc) {
         state.config_doc = previous;
@@ -912,11 +989,6 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
 
     let mut warnings = Vec::new();
     for id in &ids {
-        // Invalidate (bump generation, fence writers) before deleting so a
-        // refresh already past its fence cannot repopulate the credential.
-        if let Err(error) = state.sessions.invalidate(id) {
-            log::warn!("invalidate session during factory reset for {id}: {error}");
-        }
         if let Err(error) = state.config.credentials.delete(id) {
             log::warn!("delete password during factory reset for {id}: {error}");
             warnings.push(format!("A stored password could not be cleared: {error}"));
@@ -924,6 +996,14 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password during factory reset for {id}: {error}");
         }
+    }
+
+    // No job, lease, pending-auth reference, or switch intent survives a reset.
+    if let Err(error) = state.store.clear_all_jobs() {
+        log::warn!("clear durable jobs during factory reset: {error}");
+        warnings.push(format!(
+            "Some background job state could not be cleared: {error}"
+        ));
     }
 
     // Cached bodies and attachments live as files outside SQLite; clear them so
@@ -1156,12 +1236,26 @@ async fn update_account_inner(
         } else {
             None
         };
+
+        // An account edit changes the configuration that in-flight work was
+        // based on. Cancel every old context and durably advance the generation
+        // before writing the replacement credential, so a refresh or sync that
+        // started earlier can neither continue nor persist its result.
+        state
+            .sessions
+            .invalidate(id)
+            .map_err(|error| format!("invalidate account session: {error}"))?;
+
         if wrote_secret {
             set_secret(state, id, &input.password, target)
                 .map_err(|error| format!("store password: {error}"))?;
         }
 
         let mut account = input.into_account(id.clone(), existing.sort_order);
+        // The legacy editor has no contact-source controls yet; an ordinary
+        // endpoint/password edit must not silently disable the account's
+        // configured sources.
+        account.contact_sources = existing.contact_sources.clone();
         // Editing connection details must not silently reset a colour the user
         // picked. Only fall back to the default when the old account had none.
         account.color = existing
@@ -1306,6 +1400,25 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
             .find(|account| &account.id == id)
             .ok_or_else(|| format!("unknown account {id}"))?;
 
+        // Revoke the provider session in the background; local cleanup never
+        // waits for a remote provider and still proceeds if it fails.
+        accounts::revoke_sessions_best_effort(state.config.auth.clone(), vec![id.clone()]);
+
+        // An explicit removal supersedes any unfinished switch. Discard its
+        // temporary credential references before deleting the account secret.
+        if let Err(error) =
+            accounts::discard_switch_intent(&state.store, &state.config.credentials, id)
+        {
+            log::warn!("discard interrupted switch for removed account {id}: {error}");
+        }
+
+        // Cancel live work and advance the generation *before* touching the
+        // secret, so a refresh already past its old fence cannot re-persist a
+        // rotated credential for an account the user can no longer see.
+        if let Err(error) = state.sessions.invalidate(id) {
+            log::warn!("invalidate session for removed account {id}: {error}");
+        }
+
         let previous_secret = state.config.credentials.get(id).ok().flatten();
         state
             .config
@@ -1336,11 +1449,9 @@ pub async fn remove_account(id: &AccountId) -> Result<ModelSnapshot, String> {
             return Err(error);
         }
 
-        // Cancel any live work for the removed account and durably advance its
-        // generation, so a refresh that is still in flight can never persist a
-        // rotated credential for an account the user can no longer see.
-        if let Err(error) = state.sessions.invalidate(id) {
-            log::warn!("invalidate session for removed account {id}: {error}");
+        // No durable job or pending-auth reference may outlive the account.
+        if let Err(error) = state.store.clear_account_jobs(id) {
+            log::warn!("clear jobs for removed account {id}: {error}");
         }
         // A refresh already past its fence when the generation was bumped could
         // have re-written a rotated credential; delete once more so nothing

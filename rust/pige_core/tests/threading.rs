@@ -602,6 +602,7 @@ async fn open_conversation_returns_every_message_in_the_thread() {
         opener,
         transport: factory.clone(),
         backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
+        auth: None,
     })
     .expect("init api");
 

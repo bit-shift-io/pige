@@ -56,6 +56,7 @@ impl Harness {
             )),
             transport: factory.clone(),
             backups: backups.clone(),
+            auth: None,
         })
         .expect("init api");
 
@@ -2401,6 +2402,7 @@ fn test_config(dir: &TempDir) -> Config {
         )),
         transport,
         backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
+        auth: None,
     }
 }
 

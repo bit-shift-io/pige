@@ -224,6 +224,7 @@ async fn restore_v1_has_no_contacts_or_tokens() {
         opener: Arc::new(FakeOpener::default()),
         transport,
         backups: backups.clone(),
+        auth: None,
     })
     .expect("init api");
 

@@ -680,6 +680,7 @@ async fn api_search_mail_returns_hits_and_updates_the_snapshot() {
         opener: Arc::new(FakeOpener::new()),
         transport,
         backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
+        auth: None,
     })
     .expect("init api");
 

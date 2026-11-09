@@ -54,6 +54,7 @@ impl Harness {
             opener: Arc::new(FakeOpener::default()),
             transport,
             backups: Arc::new(pige_core::platform::fake::FakeBackupStore::new()),
+            auth: None,
         })
         .expect("init api");
 

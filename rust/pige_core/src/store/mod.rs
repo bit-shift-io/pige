@@ -6,6 +6,7 @@ mod attachments;
 mod bodies;
 mod folders;
 mod jobs;
+mod lifecycle;
 mod memberships;
 mod messages;
 mod migrations;
@@ -31,6 +32,7 @@ use messages::{conversations_on, message_count_on, unified_conversations_on};
 pub use attachments::StoredAttachment;
 pub use bodies::Body;
 pub use jobs::{AccountLease, INITIAL_GENERATION, PendingAuthRecord};
+pub use lifecycle::SwitchIntent;
 pub use messages::PrefetchCandidate;
 pub use remote_ids::{IMAP_SMTP_BACKEND_KEY, ImapCoords, MessageLocation};
 
