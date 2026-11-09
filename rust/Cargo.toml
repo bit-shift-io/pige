@@ -4,6 +4,10 @@
 [workspace]
 resolver = "2"
 members = ["pige_core", "pige"]
+# The vendored Proton library is a path dependency of `pige_core` only when
+# `provider-proton` is enabled. Excluding it keeps it out of the default
+# workspace build and out of the shared package version/lints.
+exclude = ["vendor/proton-core"]
 
 [workspace.package]
 version = "2026.11.5"
