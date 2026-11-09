@@ -12,15 +12,14 @@
 //! deletion metadata. Other contacts do not support `organizations`, so that
 //! field is never requested, even for saved contacts.
 //!
-//! The R6 snapshot path owns the destructive sweep. A full listing is emitted
-//! page by page and only its final page reports `has_more == false`, after which
-//! R6 retires contacts absent from the completed generation. Incremental People
-//! pages report the people deleted since the previous token as `Delete` changes;
-//! an expired token restarts a full sweep instead of surfacing a permanent
-//! cursor error. Because the shared [`ContactPage`] contract cannot distinguish
-//! "delta complete" from "full snapshot complete", an adapter-level delta is
-//! followed by one verification snapshot before completion is reported. This is
-//! conservative: it never sweeps on a partial delta.
+//! The R6 path owns the destructive sweep. A full listing is emitted page by
+//! page and only its final page completes a snapshot, after which R6 retires
+//! contacts absent from the completed generation. Incremental People pages
+//! report the people changed or deleted since the previous token as `Delta`
+//! pages; a completed delta advances the retained checkpoint without sweeping.
+//! An expired token restarts a full snapshot instead of surfacing a permanent
+//! cursor error. The completed cursor keeps the People `nextSyncToken`, so the
+//! next maintenance cycle performs a real incremental request.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -28,8 +27,8 @@ use url::Url;
 
 use crate::mail::Address;
 use crate::providers::{
-    AddressBookService, ContactChange, ContactPage, ContactRecord, ContactSourceId, ErrorKind,
-    OperationContext, ProviderCursor, ProviderError, RemoteContactId,
+    AddressBookService, ContactChange, ContactPage, ContactPageKind, ContactRecord,
+    ContactSourceId, ErrorKind, OperationContext, ProviderCursor, ProviderError, RemoteContactId,
 };
 
 use super::client::{GoogleClient, with_query};
@@ -75,9 +74,6 @@ enum Stage {
     Snapshot,
     /// Apply incremental changes from a previous `nextSyncToken`.
     Delta,
-    /// The delta completed. Run one full snapshot before reporting completion,
-    /// so R6 never sweeps against a partial delta.
-    Verify,
 }
 
 /// One source's opaque checkpoint. It carries everything the next request must
@@ -216,13 +212,17 @@ impl GoogleAddressBook {
         if let Some(page_token) = &cursor.page_token {
             query.push(("pageToken", page_token.clone()));
         }
+        // `pageToken` continues an enumeration; only the first request of a
+        // delta carries the previous cycle's `syncToken`. Sending both would
+        // make the People API reject the page.
         if cursor.stage == Stage::Delta
+            && cursor.page_token.is_none()
             && let Some(sync_token) = &cursor.sync_token
         {
             query.push(("syncToken", sync_token.clone()));
         }
         let url = with_query(self.url(kind)?, &query);
-        self.client.get_json(ctx, url).await
+        self.client.get_people_json(ctx, url).await
     }
 
     async fn snapshot(
@@ -238,8 +238,14 @@ impl GoogleAddressBook {
             next_page_token,
             next_sync_token,
         } = response;
-        let next_sync_token = next_sync_token.or_else(|| state.sync_token.clone());
         let has_more = next_page_token.is_some();
+        // Only the final page of an enumeration carries the next sync token.
+        // Accept it there and keep any earlier token otherwise.
+        let next_sync_token = if has_more {
+            state.sync_token.clone()
+        } else {
+            next_sync_token.or_else(|| state.sync_token.clone())
+        };
         let checkpoint = PeopleCursor {
             page_token: next_page_token,
             sync_token: next_sync_token,
@@ -253,6 +259,13 @@ impl GoogleAddressBook {
             }),
             checkpoint: checkpoint.encode()?,
             has_more,
+            // The first page begins a new sweep generation; later pages
+            // continue the same one.
+            kind: if state.page_token.is_none() {
+                ContactPageKind::SnapshotStart
+            } else {
+                ContactPageKind::Snapshot
+            },
         })
     }
 
@@ -269,19 +282,16 @@ impl GoogleAddressBook {
             next_page_token,
             next_sync_token,
         } = response;
-        let next_sync_token = next_sync_token.or_else(|| state.sync_token.clone());
-        // A delta page is never "complete" for R6: completion would sweep every
-        // contact the delta did not mention. Continue delta paging, then run one
-        // verification snapshot before the final page can retire old rows.
-        let (stage, has_more) = if next_page_token.is_some() {
-            (Stage::Delta, true)
+        let has_more = next_page_token.is_some();
+        let next_sync_token = if has_more {
+            state.sync_token.clone()
         } else {
-            (Stage::Verify, true)
+            next_sync_token.or_else(|| state.sync_token.clone())
         };
         let checkpoint = PeopleCursor {
             page_token: next_page_token,
             sync_token: next_sync_token,
-            stage,
+            stage: Stage::Delta,
             ..state.clone()
         };
         Ok(ContactPage {
@@ -291,6 +301,7 @@ impl GoogleAddressBook {
             }),
             checkpoint: checkpoint.encode()?,
             has_more,
+            kind: ContactPageKind::Delta,
         })
     }
 }
@@ -315,9 +326,6 @@ impl AddressBookService for GoogleAddressBook {
             // it is an incremental request, exactly as the People API intends.
             Stage::Snapshot if state.page_token.is_none() && state.sync_token.is_some() => {
                 state.stage = Stage::Delta;
-            }
-            Stage::Verify => {
-                state = PeopleCursor::restart(kind, state.sweep.saturating_add(1));
             }
             Stage::Snapshot | Stage::Delta => {}
         }

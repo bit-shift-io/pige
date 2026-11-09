@@ -258,9 +258,36 @@ pub(crate) fn with_query(mut url: Url, query: &[(&str, String)]) -> Url {
     url
 }
 
+/// Which Google API a request belongs to. Error semantics differ: only People
+/// uses HTTP 410 / `EXPIRED_SYNC_TOKEN` to mean an expired contact cursor; a
+/// Gmail 410 must never be mistaken for expired history.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApiSurface {
+    Gmail,
+    People,
+}
+
 impl GoogleClient {
     pub(crate) async fn get_json<T: DeserializeOwned>(
         &self,
+        ctx: &OperationContext,
+        url: Url,
+    ) -> Result<T, ProviderError> {
+        self.get_json_on(ApiSurface::Gmail, ctx, url).await
+    }
+
+    /// People responses opt into People's cursor semantics (HTTP 410).
+    pub(crate) async fn get_people_json<T: DeserializeOwned>(
+        &self,
+        ctx: &OperationContext,
+        url: Url,
+    ) -> Result<T, ProviderError> {
+        self.get_json_on(ApiSurface::People, ctx, url).await
+    }
+
+    async fn get_json_on<T: DeserializeOwned>(
+        &self,
+        surface: ApiSurface,
         ctx: &OperationContext,
         url: Url,
     ) -> Result<T, ProviderError> {
@@ -268,7 +295,7 @@ impl GoogleClient {
         loop {
             ctx.ensure_active()?;
             match self
-                .send(ctx, reqwest::Method::GET, url.clone(), None)
+                .send(surface, ctx, reqwest::Method::GET, url.clone(), None)
                 .await
             {
                 Ok(bytes) => return decode_json(&bytes),
@@ -299,6 +326,7 @@ impl GoogleClient {
     ) -> Result<T, ProviderError> {
         let bytes = self
             .send(
+                ApiSurface::Gmail,
                 ctx,
                 reqwest::Method::POST,
                 url,
@@ -312,19 +340,20 @@ impl GoogleClient {
     }
 
     async fn post_empty(&self, ctx: &OperationContext, url: Url) -> Result<(), ProviderError> {
-        self.send(ctx, reqwest::Method::POST, url, None)
+        self.send(ApiSurface::Gmail, ctx, reqwest::Method::POST, url, None)
             .await
             .map(|_| ())
     }
 
     async fn delete(&self, ctx: &OperationContext, url: Url) -> Result<(), ProviderError> {
-        self.send(ctx, reqwest::Method::DELETE, url, None)
+        self.send(ApiSurface::Gmail, ctx, reqwest::Method::DELETE, url, None)
             .await
             .map(|_| ())
     }
 
     async fn send(
         &self,
+        surface: ApiSurface,
         ctx: &OperationContext,
         method: reqwest::Method,
         url: Url,
@@ -380,7 +409,7 @@ impl GoogleClient {
         if status.is_success() {
             Ok(bytes.to_vec())
         } else {
-            Err(map_status(status, retry_after, &bytes))
+            Err(map_status(surface, status, retry_after, &bytes))
         }
     }
 }
@@ -404,13 +433,15 @@ fn map_transport_error(error: reqwest::Error) -> ProviderError {
 }
 
 fn map_status(
+    surface: ApiSurface,
     status: reqwest::StatusCode,
     retry_after: Option<Duration>,
     body: &[u8],
 ) -> ProviderError {
     let detail = String::from_utf8_lossy(body).to_string();
-    let reason = serde_json::from_slice::<Value>(body)
-        .ok()
+    let value = serde_json::from_slice::<Value>(body).ok();
+    let reason = value
+        .as_ref()
         .and_then(|value| {
             value
                 .get("error")
@@ -419,16 +450,33 @@ fn map_status(
                 .and_then(|errors| errors.first())
                 .and_then(|first| first.get("reason"))
                 .and_then(Value::as_str)
-                .map(str::to_string)
         })
+        .unwrap_or_default()
+        .to_string();
+    let status_reason = value
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.get("status"))
+        .and_then(Value::as_str)
         .unwrap_or_default();
+    let lowered_reason = format!("{reason} {status_reason}").to_ascii_lowercase();
+    let normalized_reason: String = lowered_reason
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let rate_limited = normalized_reason.contains("ratelimit")
+        || normalized_reason.contains("quota")
+        || normalized_reason.contains("dailylimit")
+        || normalized_reason.contains("resourceexhausted");
 
-    // Google's People sync APIs return HTTP 410 (or an ErrorInfo reason) when a
-    // seven-day sync token has expired. Clients must restart from a full sync;
-    // this is a cursor problem, not an authentication or transport failure.
-    if status == reqwest::StatusCode::GONE
-        || reason == "EXPIRED_SYNC_TOKEN"
-        || detail.contains("EXPIRED_SYNC_TOKEN")
+    // Only the People sync API uses HTTP 410 / EXPIRED_SYNC_TOKEN to mean a
+    // seven-day sync token expired; clients must restart from a full sync.
+    // Gmail history uses 404 for an expired history cursor, so a stray Gmail
+    // 410 must not be reported as an expired contact cursor.
+    if surface == ApiSurface::People
+        && (status == reqwest::StatusCode::GONE
+            || reason == "EXPIRED_SYNC_TOKEN"
+            || detail.contains("EXPIRED_SYNC_TOKEN"))
     {
         return ProviderError::cursor_invalid("the Google sync cursor expired")
             .with_source_detail(detail);
@@ -439,7 +487,11 @@ fn map_status(
             ProviderError::reauthenticate("Google sign-in has expired")
         }
         reqwest::StatusCode::FORBIDDEN => {
-            if reason.contains("ateLimit") || reason.contains("uota") {
+            // Google returns 403 for permission denial *and* for quota/rate
+            // exhaustion. Reasons are not case-normalized (`RATE_LIMIT_EXCEEDED`
+            // is common), and a quota blip must not permanently disable a
+            // contact source as if consent had been revoked.
+            if rate_limited {
                 ProviderError::rate_limited(retry_after.unwrap_or(Duration::from_secs(1)))
             } else {
                 ProviderError::forbidden("Google did not permit this request")

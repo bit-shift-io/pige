@@ -8,10 +8,12 @@
 //! only the affected address keys, and deleting a source removes its contact
 //! signals while leaving mail-derived signals intact.
 //!
-//! R6 adds restart-safe, source-scoped full snapshots. Each page's contact
-//! changes and its checkpoint commit in one transaction. Only a completed
+//! R6 adds restart-safe, source-scoped contact cycles. Each page's contact
+//! changes and its checkpoint commit in one transaction. Only a completed full
 //! snapshot generation sweeps contacts the provider no longer reports; a
 //! failure, cancellation, or budget exit leaves the previous cache untouched.
+//! A completed cycle keeps its checkpoint, so subsequent slices can use the
+//! adapter's incremental delta path; only a snapshot page may sweep.
 
 use std::collections::HashSet;
 
@@ -23,8 +25,8 @@ use crate::contacts::rank::SAVED_CONTACT_KIND;
 use crate::contacts::types::AddressKey;
 use crate::mail::Address;
 use crate::providers::{
-    ContactChange, ContactPage, ContactSourceId, JobKey, JobKind, OperationContext, ProviderCursor,
-    RemoteContactId,
+    ContactChange, ContactPage, ContactPageKind, ContactSourceId, JobKey, JobKind,
+    OperationContext, ProviderCursor, RemoteContactId,
 };
 
 use super::correspondents::refresh_recipient_index_in;
@@ -85,6 +87,9 @@ pub struct ContactSyncStart {
 /// What one committed contact page did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContactPageOutcome {
+    /// The sweep generation this page belongs to. A `SnapshotStart` page may
+    /// allocate a new one; the caller must fence later pages against it.
+    pub generation: u64,
     pub complete: bool,
     /// Contacts swept because the completed generation did not report them.
     pub swept: usize,
@@ -314,12 +319,14 @@ impl Store {
         Ok(())
     }
 
-    /// Start or resume one source's full snapshot.
+    /// Start or resume one source's contact cycle.
     ///
-    /// No cursor means a new snapshot generation begins and progress restarts.
-    /// An existing cursor continues it exactly where the last committed page
-    /// stopped. The current generation is durable so every page can fence its
-    /// write and only the final page may sweep absent contacts.
+    /// No cursor means a new generation begins and progress restarts. An
+    /// existing cursor continues from the last committed page, including a
+    /// cursor left by a completed cycle: the adapter decides whether that
+    /// checkpoint resumes a snapshot or performs an incremental delta. The
+    /// generation is durable so every page can fence its write, and only a
+    /// completed snapshot may sweep absent contacts.
     pub fn contact_sync_start(
         &self,
         ctx: &OperationContext,
@@ -341,24 +348,23 @@ impl Store {
         }
 
         let key = contacts_job(&ctx.account, source);
-        let mut cursor = checkpoint_cursor_in(&tx, &key)?;
+        let cursor = checkpoint_cursor_in(&tx, &key)?;
         // A refresh that has already started but has not committed its first
-        // page keeps the prior snapshot's `complete` flag. Otherwise an
-        // interrupted refresh would flip a synced source to "sync paused"
-        // before any new data was written. Resume the same generation so
-        // repeated starts before the first page do not bump it again.
+        // page keeps the prior cycle's `complete` flag. Otherwise an interrupted
+        // refresh would flip a synced source to "sync paused" before any new
+        // data was written. Resume the same generation so repeated starts
+        // before the first page do not bump it again.
+        //
+        // A completed cycle has a cursor only when the adapter supplied a
+        // resumable token. Resume it; the first page's `SnapshotStart` kind
+        // allocates a new sweep generation if it turns out to be a snapshot.
         let refresh_pending = state.snapshot_active && state.complete;
-        let fresh = !refresh_pending && (cursor.is_none() || state.complete);
+        let fresh = !refresh_pending && cursor.is_none();
         let (generation, scanned, complete, active) = if fresh {
-            // A completed (or never-started) job starts a fresh generation.
-            // Retire the finished snapshot's cursor so the first page of the
-            // new generation is requested from no cursor. The previous
-            // generation's rows stay until this one completes, and its
-            // `complete` flag stays visible until the first new page commits.
-            if cursor.is_some() {
-                delete_checkpoint_in(&tx, &key)?;
-                cursor = None;
-            }
+            // No resumable checkpoint: allocate a generation and start from the
+            // beginning. The previous generation's rows stay until this one
+            // completes, and its `complete` flag stays visible until the first
+            // new page commits.
             (
                 state.snapshot_generation.saturating_add(1).max(1),
                 0,
@@ -405,10 +411,10 @@ impl Store {
     /// Commit one contact page's changes, its cursor, and its progress in one
     /// generation-fenced transaction.
     ///
-    /// `expected_previous` is the cursor the page was produced against. When
-    /// the page completes the snapshot, contacts not observed in
-    /// `expected_generation` are swept and the resumable cursor is removed so
-    /// the next slice starts a fresh generation.
+    /// `expected_previous` is the cursor the page was produced against. A
+    /// `SnapshotStart` page allocates a new sweep generation; only a completed
+    /// snapshot page retires contacts not observed in that generation. A
+    /// completed delta keeps the checkpoint and sweeps nothing.
     pub fn apply_contact_page(
         &self,
         ctx: &OperationContext,
@@ -436,6 +442,15 @@ impl Store {
              VALUES (?1, ?2, NULL, ?3)",
             params![ctx.account.0, source.as_str(), SAVED_CONTACT_KIND],
         )?;
+
+        // A fresh adapter enumeration allocates the generation that its final
+        // page will sweep. Continuing snapshot pages keep the existing one, so
+        // a new snapshot never mixes generations.
+        let generation = if page.kind == ContactPageKind::SnapshotStart {
+            state.snapshot_generation.saturating_add(1).max(1)
+        } else {
+            expected_generation
+        };
 
         let mut affected: HashSet<AddressKey> = HashSet::new();
         for change in &page.changes {
@@ -468,7 +483,7 @@ impl Store {
                             &key,
                             email,
                             display_name.as_deref(),
-                            expected_generation,
+                            generation,
                         )?;
                         new_keys.insert(key.clone());
                         affected.insert(key);
@@ -502,16 +517,23 @@ impl Store {
             }
         }
 
-        let scanned = state
-            .scanned
-            .saturating_add(page.changes.len().min(u64::MAX as usize) as u64);
+        let scanned = if page.kind.is_snapshot() {
+            state
+                .scanned
+                .saturating_add(page.changes.len().min(u64::MAX as usize) as u64)
+        } else {
+            // Deltas are not snapshot observations; keep the last snapshot's
+            // progress count for settings instead of inflating it.
+            state.scanned
+        };
         let complete = !page.has_more;
         let mut swept = 0usize;
 
-        if complete {
-            // Only end-of-enumeration may retire contacts from older
-            // generations. This is the single destructive step of a snapshot.
-            let stale = stale_keys_in(&tx, &ctx.account, source, expected_generation)?;
+        if complete && page.kind.is_snapshot() {
+            // Only end-of-enumeration of a full snapshot may retire contacts
+            // from older generations. This is the single destructive step; a
+            // completed delta must leave the cache and generation untouched.
+            let stale = stale_keys_in(&tx, &ctx.account, source, generation)?;
             swept = stale.len();
             affected.extend(stale);
             tx.execute(
@@ -520,13 +542,12 @@ impl Store {
                 params![
                     ctx.account.0,
                     source.as_str(),
-                    expected_generation.min(i64::MAX as u64) as i64
+                    generation.min(i64::MAX as u64) as i64
                 ],
             )?;
         }
-        // Keep the final page's cursor too: it names the completed sweep
-        // generation for diagnostics. `contact_sync_start` sees the completed
-        // state and retires it before the next generation.
+        // Keep the final page's cursor. A completed cycle's cursor is the
+        // adapter's resumable delta token; the next slice starts from it.
         set_checkpoint_in(&tx, &key, ctx.generation, &page.checkpoint)?;
 
         for key in &affected {
@@ -540,7 +561,7 @@ impl Store {
             true,
             ContactSourceState {
                 enabled: true,
-                snapshot_generation: expected_generation,
+                snapshot_generation: generation,
                 snapshot_active: !complete,
                 scanned,
                 complete,
@@ -548,7 +569,11 @@ impl Store {
             },
         )?;
         tx.commit()?;
-        Ok(ContactPageOutcome { complete, swept })
+        Ok(ContactPageOutcome {
+            generation,
+            complete,
+            swept,
+        })
     }
 }
 

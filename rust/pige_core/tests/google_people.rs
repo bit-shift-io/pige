@@ -26,6 +26,7 @@ use url::Url;
 
 use pige_core::Store;
 use pige_core::account::{Account, AccountId, MailBackend};
+use pige_core::api::{self, Config, DB_FILE_NAME};
 use pige_core::auth::TokenSource;
 use pige_core::contacts::rank::{
     OTHER_CONTACT_KIND, SAVED_CONTACT_KIND, query_tokens, rank_candidates,
@@ -36,15 +37,20 @@ use pige_core::contacts::{
     normalize_address,
 };
 use pige_core::mail::Address;
+use pige_core::platform::fake::{
+    FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
+};
 use pige_core::providers::google::{
     GOOGLE_OTHER_CONTACTS_SOURCE, GOOGLE_SAVED_CONTACTS_SOURCE, GmailMailbox, GoogleAddressBook,
     GoogleClient, GoogleEndpoints,
 };
 use pige_core::providers::{
-    AddressBookService, ContactSourceId, ErrorKind, MailboxService, OperationContext,
-    ProviderError, RemoteContactId,
+    AddressBookService, ContactCapabilities, ContactSourceId, ErrorKind, MailboxService,
+    OperationContext, ProviderCapabilities, ProviderCursor, ProviderError, ProviderFactory,
+    ProviderSession, RemoteContactId,
 };
 use pige_core::sync::provider::WorkBudget;
+use tokio::sync::Mutex as AsyncMutex;
 
 // ---------------------------------------------------------------------------
 // Local People + Gmail mock
@@ -78,6 +84,7 @@ struct MockState {
     other_delta: Option<(u16, Value)>,
     saved_error: Option<(u16, String)>,
     other_error: Option<(u16, String)>,
+    gmail_error: Option<(u16, String)>,
     requests: Vec<RecordedRequest>,
 }
 
@@ -184,6 +191,9 @@ fn respond(state: &mut MockState, request: &RecordedRequest) -> (u16, String) {
 
     match (request.method.as_str(), segments.as_slice()) {
         ("GET", ["gmail", "v1", "users", "me", "labels"]) => {
+            if let Some((status, body)) = &state.gmail_error {
+                return (*status, body.clone());
+            }
             (200, json!({ "labels": [] }).to_string())
         }
         ("GET", ["gmail", "v1", "users", "me", "profile"]) => {
@@ -878,4 +888,350 @@ async fn other_contacts_scope_is_not_assumed_from_contacts_scope() {
             .unwrap_or_default()
             .contains("organizations")
     );
+}
+
+fn cursor_json(cursor: &ProviderCursor) -> Value {
+    serde_json::from_str(&cursor.payload).expect("People cursor payload")
+}
+
+#[tokio::test]
+async fn incremental_delta_cycles_do_not_sweep_and_keep_the_sync_token() {
+    let (_dir, store) = open_store();
+    let id = account().id;
+    let saved = saved_source();
+    store
+        .upsert_contact_source_with_kind(&id, &saved, None, SAVED_CONTACT_KIND)
+        .unwrap();
+
+    let mut state = MockState::default().with_saved_page(saved_page(
+        vec![person("people/one", "One", "one@example.com")],
+        None,
+        Some("saved-token-1"),
+    ));
+    state.saved_delta = Some((
+        200,
+        saved_page(
+            vec![person("people/two", "Two", "two@example.com")],
+            None,
+            Some("saved-token-2"),
+        ),
+    ));
+    let server = MockServer::start(state).await;
+    let mut book = GoogleAddressBook::new(server.client(), "me");
+    let context = context();
+
+    let first = sync_slice(&store, &mut book, &saved, &context, budget(5))
+        .await
+        .unwrap();
+    assert!(first.complete);
+    assert!(has_cached(&store, &saved, "one@example.com"));
+
+    // The completed snapshot retains the People nextSyncToken, so the next
+    // maintenance cycle issues a real delta instead of another full snapshot.
+    let second = sync_slice(&store, &mut book, &saved, &context, budget(5))
+        .await
+        .unwrap();
+    assert!(second.complete);
+    assert!(
+        has_cached(&store, &saved, "one@example.com"),
+        "an incremental delta must not sweep contacts it did not mention"
+    );
+    assert!(has_cached(&store, &saved, "two@example.com"));
+    let checkpoint = store
+        .job_checkpoint(&pige_core::store::contacts_job(&id, &saved))
+        .unwrap()
+        .expect("the delta advances the retained checkpoint");
+    assert_eq!(cursor_json(&checkpoint)["sync_token"], "saved-token-2");
+    assert_eq!(cursor_json(&checkpoint)["stage"], "Delta");
+
+    // The following cycle continues from the new token.
+    sync_slice(&store, &mut book, &saved, &context, budget(5))
+        .await
+        .unwrap();
+    assert!(has_cached(&store, &saved, "one@example.com"));
+
+    let people: Vec<RecordedRequest> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/v1/people/me/connections")
+        .collect();
+    assert_eq!(people.len(), 3);
+    assert!(!people[0].has_query("syncToken"));
+    assert_eq!(people[1].query_value("syncToken"), Some("saved-token-1"));
+    assert_eq!(people[2].query_value("syncToken"), Some("saved-token-2"));
+}
+
+#[tokio::test]
+async fn next_sync_token_is_only_accepted_from_the_final_page() {
+    let (_dir, _store) = open_store();
+    let server = MockServer::start(
+        MockState::default()
+            .with_saved_page(saved_page(
+                vec![person("people/one", "One", "one@example.com")],
+                Some("saved-1"),
+                Some("early-token"),
+            ))
+            .with_saved_page(saved_page(
+                vec![person("people/two", "Two", "two@example.com")],
+                None,
+                None,
+            )),
+    )
+    .await;
+    let mut book = GoogleAddressBook::new(server.client(), "me");
+    let context = context();
+
+    let first = book
+        .next_page(&saved_source(), None, &context)
+        .await
+        .unwrap();
+    assert!(first.has_more);
+    assert_eq!(
+        cursor_json(&first.checkpoint)["sync_token"],
+        Value::Null,
+        "an intermediate page's nextSyncToken must be ignored"
+    );
+
+    let second = book
+        .next_page(&saved_source(), Some(first.checkpoint), &context)
+        .await
+        .unwrap();
+    assert!(!second.has_more);
+    assert_eq!(cursor_json(&second.checkpoint)["sync_token"], Value::Null);
+
+    // Without a final-page token the next cycle is a snapshot, never a delta
+    // built from an early token.
+    book.next_page(&saved_source(), Some(second.checkpoint), &context)
+        .await
+        .unwrap();
+    let people: Vec<RecordedRequest> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/v1/people/me/connections")
+        .collect();
+    assert!(people.iter().all(|request| !request.has_query("syncToken")));
+}
+
+#[tokio::test]
+async fn only_people_treats_http_410_as_an_expired_cursor() {
+    let server = MockServer::start(MockState {
+        gmail_error: Some((
+            410,
+            error_body(410, "EXPIRED_SYNC_TOKEN", "sync token expired"),
+        )),
+        other_error: Some((
+            410,
+            error_body(410, "EXPIRED_SYNC_TOKEN", "sync token expired"),
+        )),
+        ..MockState::default()
+    })
+    .await;
+    let client = server.client();
+
+    let mut mailbox = GmailMailbox::new(client.clone(), "me");
+    let gmail = mailbox
+        .collections(&context())
+        .await
+        .expect_err("a Gmail 410 must still be reported");
+    assert_ne!(
+        gmail.kind,
+        ErrorKind::CursorInvalid,
+        "Gmail history expiry is a 404, so a Gmail 410 must not be an expired contact cursor"
+    );
+
+    let mut book = GoogleAddressBook::new(client, "me");
+    let people = book
+        .next_page(&other_source(), None, &context())
+        .await
+        .expect_err("a People 410 is an expired sync token");
+    assert_eq!(people.kind, ErrorKind::CursorInvalid);
+}
+
+#[tokio::test]
+async fn rate_limit_403_does_not_disable_the_contact_source() {
+    let (_dir, store) = open_store();
+    let id = account().id;
+    let saved = saved_source();
+    store
+        .upsert_contact_source_with_kind(&id, &saved, None, SAVED_CONTACT_KIND)
+        .unwrap();
+
+    let server = MockServer::start(MockState {
+        saved_error: Some((
+            403,
+            error_body(403, "RATE_LIMIT_EXCEEDED", "quota exhausted for the minute"),
+        )),
+        ..MockState::default()
+    })
+    .await;
+    let mut book = GoogleAddressBook::new(server.client(), "me");
+    let error = sync_slice(&store, &mut book, &saved, &context(), budget(5))
+        .await
+        .expect_err("a quota failure is reported for retry");
+    assert_eq!(error.kind, ErrorKind::RateLimited);
+    assert!(
+        store.contact_source_state(&id, &saved).unwrap().enabled,
+        "a rate-limit 403 must not be mistaken for revoked consent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide API: source-kind plumbing and the completed snapshot sweep
+// ---------------------------------------------------------------------------
+
+static API_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+/// A provider factory that only exposes the People address book, so the
+/// maintenance pass exercises `api::set_contact_sync` kind plumbing and R6
+/// without needing a Gmail mailbox.
+struct PeopleOnlyFactory {
+    client: GoogleClient,
+}
+
+#[async_trait]
+impl ProviderFactory for PeopleOnlyFactory {
+    async fn open(
+        &self,
+        _account: &Account,
+        ctx: &OperationContext,
+    ) -> Result<ProviderSession, ProviderError> {
+        ctx.ensure_active()?;
+        let mut session = ProviderSession::new(ProviderCapabilities {
+            contacts: ContactCapabilities {
+                read: true,
+                incremental_sync: true,
+                ..ContactCapabilities::default()
+            },
+            ..ProviderCapabilities::default()
+        });
+        session.address_book = Some(Box::new(GoogleAddressBook::new(self.client.clone(), "me")));
+        Ok(session)
+    }
+}
+
+#[tokio::test]
+async fn google_other_kind_plumbing_sweeps_a_completed_people_snapshot() {
+    let _guard = API_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start(MockState::default().with_other_page(other_page(
+        vec![person(
+            "otherContacts/fresh",
+            "Fresh Person",
+            "fresh@example.com",
+        )],
+        None,
+        Some("other-sync-1"),
+    )))
+    .await;
+
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mut document = pige_core::config::ConfigDocument::default();
+    let account = Account {
+        id: AccountId("google-people-api".to_string()),
+        label: "Google".to_string(),
+        email: "api@example.com".to_string(),
+        display_name: "API".to_string(),
+        backend: MailBackend::Gmail {
+            user_id: "google-user-api".to_string(),
+        },
+        contact_sources: Vec::new(),
+        sort_order: 0,
+        color: None,
+    };
+    document.accounts.push(account.clone());
+    pige_core::config::save(
+        &pige_core::config::document_path(&config_dir),
+        &document,
+    )
+    .unwrap();
+
+    api::reset_for_tests();
+    api::init(Config {
+        data_dir: dir.path().join("data"),
+        cache_dir: dir.path().join("cache"),
+        config_dir,
+        credentials: Arc::new(FakeCredentials::default()),
+        notifier: Arc::new(FakeNotifier::default()),
+        opener: Arc::new(FakeOpener::default()),
+        providers: Arc::new(PeopleOnlyFactory {
+            client: server.client(),
+        }),
+        transport: Arc::new(FakeTransportFactory::default()),
+        backups: Arc::new(FakeBackupStore::new()),
+        auth: None,
+    })
+    .expect("init api");
+
+    let other = other_source();
+    {
+        let store = Store::open(dir.path().join("data").join(DB_FILE_NAME)).unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_contact_source_with_kind(&account.id, &other, None, OTHER_CONTACT_KIND)
+            .unwrap();
+        // A row from a previous snapshot generation must be retired by this
+        // completed People snapshot.
+        store
+            .upsert_contact_email(
+                &account.id,
+                &other,
+                &RemoteContactId::new("otherContacts/stale"),
+                &Address::new(None, "stale@example.com"),
+            )
+            .unwrap();
+    }
+
+    api::set_contact_sync(&account.id, &other, true).expect("enable Other contacts");
+    api::run_maintenance(Duration::from_secs(10))
+        .await
+        .expect("maintenance pass");
+
+    let store = Store::open(dir.path().join("data").join(DB_FILE_NAME)).unwrap();
+    assert_eq!(
+        store
+            .contact_source_kind(&account.id, &other)
+            .unwrap()
+            .as_deref(),
+        Some(OTHER_CONTACT_KIND),
+        "api::set_contact_sync must record the Other kind before the first slice"
+    );
+    let cached = cached_emails_for(&store, &account.id, &other);
+    assert_eq!(cached, vec!["fresh@example.com"]);
+    assert!(!has_cached_for(
+        &store,
+        &account.id,
+        &other,
+        "stale@example.com"
+    ));
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.path == "/v1/otherContacts"),
+        "the configured google.other source used the People Other contacts endpoint"
+    );
+
+    api::reset_for_tests();
+}
+
+fn cached_emails_for(store: &Store, account: &AccountId, source: &ContactSourceId) -> Vec<String> {
+    store
+        .contact_emails(account)
+        .unwrap()
+        .into_iter()
+        .filter(|contact| &contact.source == source)
+        .map(|contact| contact.address.email)
+        .collect()
+}
+
+fn has_cached_for(
+    store: &Store,
+    account: &AccountId,
+    source: &ContactSourceId,
+    email: &str,
+) -> bool {
+    cached_emails_for(store, account, source)
+        .iter()
+        .any(|cached| cached == email)
 }

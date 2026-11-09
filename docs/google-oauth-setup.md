@@ -43,11 +43,16 @@ saved contact while the same address still merges into one suggestion.
 People sync tokens expire seven days after the full sync. An HTTP 410 /
 `EXPIRED_SYNC_TOKEN` response restarts that source from a fresh full snapshot;
 it never uses Gmail's `historyId`. A full snapshot removes locally absent
-contacts only after its final page. A 403/permission denial disables only the
-affected contact source, leaving mail, local history, cached contacts and the
-other contact source intact. Granting contacts later is a new authorization
-operation (`AuthRequest.enable_contacts = true`), not an assumption that an
-existing Gmail grant already covers People.
+contacts only after its final page. A completed snapshot retains its
+`nextSyncToken`, so the next maintenance cycle is an incremental delta; a
+completed delta updates only the changed contacts and never removes contacts it
+did not mention. A 403/permission denial disables only the affected contact
+source, leaving mail, local history, cached contacts and the other contact
+source intact. A 403 quota/rate-limit reason (`RATE_LIMIT_EXCEEDED`,
+`quotaExceeded`, `RESOURCE_EXHAUSTED`, …) is retried instead of disabling the
+source. Granting contacts later is a new authorization operation
+(`AuthRequest.enable_contacts = true`), not an assumption that an existing Gmail
+grant already covers People.
 
 ## What the user must create in Google Cloud Console
 

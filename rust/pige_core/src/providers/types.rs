@@ -511,10 +511,43 @@ pub enum ContactChange {
     Delete(RemoteContactId),
 }
 
+/// The role of one contact page in a source's sync stream.
+///
+/// The store needs this distinction because only a completed full snapshot may
+/// retire contacts the provider no longer reports. A completed delta must leave
+/// every cached contact untouched and keep its checkpoint for the next cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContactPageKind {
+    /// A page of an ongoing full snapshot enumeration. Only a final page
+    /// (`has_more == false`) completes the snapshot generation.
+    Snapshot,
+    /// The first page of a new full snapshot enumeration. The store allocates a
+    /// fresh sweep generation so contacts absent from this snapshot are retired
+    /// even if the previous cycle ended with an incremental delta.
+    SnapshotStart,
+    /// A page of an incremental delta. A delta never sweeps; its final page only
+    /// advances the retained checkpoint.
+    Delta,
+}
+
+impl ContactPageKind {
+    /// Whether this page belongs to a full snapshot enumeration.
+    pub fn is_snapshot(self) -> bool {
+        matches!(self, Self::Snapshot | Self::SnapshotStart)
+    }
+}
+
 /// One page of contact changes plus its resumable checkpoint.
+///
+/// `kind` distinguishes a full snapshot from an incremental delta. Only a
+/// snapshot page with `has_more == false` completes a snapshot generation and
+/// lets the store retire contacts the provider no longer reports. A completed
+/// delta never sweeps; it only updates the retained checkpoint so the next
+/// cycle can continue incrementally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactPage {
     pub changes: Vec<ContactChange>,
     pub checkpoint: ProviderCursor,
     pub has_more: bool,
+    pub kind: ContactPageKind,
 }

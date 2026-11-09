@@ -90,7 +90,7 @@ async fn sync(
 
     let deadline = budget.deadline.min(ctx.deadline);
     let max_pages = budget.max_pages.max(1);
-    let generation = start.generation;
+    let mut generation = start.generation;
     let mut cursor = start.cursor;
     let mut scanned = start.scanned;
     let mut pages = 0u32;
@@ -184,7 +184,10 @@ async fn sync(
             Ok(outcome) => {
                 pages += 1;
                 pending_reset = false;
-                scanned = scanned.saturating_add(page.changes.len() as u64);
+                generation = outcome.generation;
+                if page.kind.is_snapshot() {
+                    scanned = scanned.saturating_add(page.changes.len() as u64);
+                }
                 if outcome.complete {
                     drop(gate);
                     return Ok(LearningProgress {

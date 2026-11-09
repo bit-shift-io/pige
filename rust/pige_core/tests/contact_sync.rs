@@ -23,10 +23,10 @@ use pige_core::platform::fake::{
 use pige_core::providers::fake::{FakeProviderFactory, FakeProviderSession, FakeServices};
 use pige_core::providers::{
     BodyContent, ChangePage, CollectionRecord, ContactCapabilities, ContactChange, ContactPage,
-    ContactRecord, ContactSourceId, ErrorKind, HistoryCoverage, HistoryPage, HistoryRequest,
-    MailboxService, MessageRecord, OperationContext, ProviderCapabilities, ProviderCursor,
-    ProviderError, ProviderFactory, ProviderSession, RemoteAttachmentId, RemoteContactId,
-    RemoteMessageId, SyncRequest, SyncService,
+    ContactPageKind, ContactRecord, ContactSourceId, ErrorKind, HistoryCoverage, HistoryPage,
+    HistoryRequest, MailboxService, MessageRecord, OperationContext, ProviderCapabilities,
+    ProviderCursor, ProviderError, ProviderFactory, ProviderSession, RemoteAttachmentId,
+    RemoteContactId, RemoteMessageId, SyncRequest, SyncService,
 };
 use pige_core::store::contacts_job;
 use pige_core::sync::provider::WorkBudget;
@@ -103,6 +103,29 @@ fn page(changes: Vec<ContactChange>, checkpoint: &str, has_more: bool) -> Contac
         changes,
         checkpoint: ProviderCursor::new(1, checkpoint),
         has_more,
+        kind: ContactPageKind::Snapshot,
+    }
+}
+
+fn snapshot_start_page(
+    changes: Vec<ContactChange>,
+    checkpoint: &str,
+    has_more: bool,
+) -> ContactPage {
+    ContactPage {
+        changes,
+        checkpoint: ProviderCursor::new(1, checkpoint),
+        has_more,
+        kind: ContactPageKind::SnapshotStart,
+    }
+}
+
+fn delta_page(changes: Vec<ContactChange>, checkpoint: &str, has_more: bool) -> ContactPage {
+    ContactPage {
+        changes,
+        checkpoint: ProviderCursor::new(1, checkpoint),
+        has_more,
+        kind: ContactPageKind::Delta,
     }
 }
 
@@ -352,9 +375,14 @@ async fn contact_full_sync_sweeps_only_after_last_page() {
     assert!(state.complete);
     assert!(!state.snapshot_active);
 
-    // The next slice is a new generation and must not resume the completed
-    // cursor; its first request is from no cursor.
-    let mut next = ScriptedContacts::new(vec![page(Vec::new(), "p3", false)]);
+    // The completed cycle retains its cursor so the adapter can continue
+    // incrementally. A completed delta must not sweep contacts it did not
+    // mention, and it leaves its own cursor for the following cycle.
+    let mut next = ScriptedContacts::new(vec![delta_page(
+        vec![contact_change("later", None, &["later@example.com"])],
+        "d1",
+        false,
+    )]);
     let next_log = next.log();
     let progress = sync_slice(
         &store,
@@ -367,9 +395,125 @@ async fn contact_full_sync_sweeps_only_after_last_page() {
     .unwrap();
     assert!(progress.complete);
     assert_eq!(
-        next_log.lock().unwrap().requests[0].1,
-        None,
-        "a completed snapshot must start a fresh generation, not resume its final cursor"
+        next_log.lock().unwrap().requests[0].1.as_ref(),
+        Some(&final_cursor),
+        "a completed cycle retains its checkpoint for the next delta request"
+    );
+    assert!(has_contact(
+        &store,
+        &account.id,
+        &source,
+        "keep@example.com"
+    ));
+    assert!(has_contact(&store, &account.id, &source, "new@example.com"));
+    assert!(has_contact(
+        &store,
+        &account.id,
+        &source,
+        "later@example.com"
+    ));
+    assert_eq!(
+        store
+            .job_checkpoint(&contacts_job(&account.id, &source))
+            .unwrap()
+            .expect("the completed delta keeps its checkpoint")
+            .payload,
+        "d1"
+    );
+}
+
+#[tokio::test]
+async fn a_new_snapshot_after_a_delta_sweeps_the_delta_generation() {
+    let (_dir, store) = open_store();
+    let account = account();
+    let context = ctx(&account.id);
+    let source = source("saved");
+
+    store
+        .upsert_contact_source(&account.id, &source, Some("Address book"))
+        .unwrap();
+    store
+        .upsert_contact_email(
+            &account.id,
+            &source,
+            &RemoteContactId::new("stale"),
+            &Address::new(None, "stale@example.com"),
+        )
+        .unwrap();
+
+    // First full snapshot retires the pre-sync row.
+    let mut first = ScriptedContacts::new(vec![page(
+        vec![contact_change(
+            "keep",
+            Some("Keep"),
+            &["keep@example.com"],
+        )],
+        "s1",
+        false,
+    )]);
+    sync_slice(
+        &store,
+        &mut first,
+        &source,
+        &context,
+        WorkBudget::with_timeout(100, 5, Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert!(!has_contact(&store, &account.id, &source, "stale@example.com"));
+
+    // An incremental delta adds a contact but must not sweep.
+    let mut delta = ScriptedContacts::new(vec![delta_page(
+        vec![contact_change(
+            "delta-new",
+            None,
+            &["delta-new@example.com"],
+        )],
+        "d1",
+        false,
+    )]);
+    sync_slice(
+        &store,
+        &mut delta,
+        &source,
+        &context,
+        WorkBudget::with_timeout(100, 5, Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert!(has_contact(&store, &account.id, &source, "keep@example.com"));
+    assert!(has_contact(
+        &store,
+        &account.id,
+        &source,
+        "delta-new@example.com"
+    ));
+
+    // An expired sync token restarts a full snapshot. Its first page allocates
+    // a new generation, so the contact missing from the new listing -- which
+    // was previously cached by the delta generation -- is retired.
+    let mut restart = ScriptedContacts::new(vec![snapshot_start_page(
+        vec![contact_change(
+            "keep",
+            Some("Keep"),
+            &["keep@example.com"],
+        )],
+        "s2",
+        false,
+    )]);
+    sync_slice(
+        &store,
+        &mut restart,
+        &source,
+        &context,
+        WorkBudget::with_timeout(100, 5, Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert!(has_contact(&store, &account.id, &source, "keep@example.com"));
+    assert!(
+        !has_contact(&store, &account.id, &source, "delta-new@example.com"),
+        "a snapshot that starts after a delta must sweep the delta generation"
     );
 }
 

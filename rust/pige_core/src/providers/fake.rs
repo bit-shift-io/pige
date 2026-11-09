@@ -826,6 +826,7 @@ impl AddressBookService for FakeAddressBook {
             changes: Vec::new(),
             checkpoint: cursor.unwrap_or_else(|| ProviderCursor::new(1, "contacts-start")),
             has_more: false,
+            kind: crate::providers::ContactPageKind::Snapshot,
         }))
     }
 }
