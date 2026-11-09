@@ -7,14 +7,14 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::account::{Account, AccountId};
+use crate::account::{Account, AccountId, ContactSourceConfig};
 use crate::contacts::normalize::{normalize_address, normalize_email};
 use crate::contacts::rank::{
     bound_query_text, bounded_limit, folded_query, query_tokens, rank_candidates,
 };
 use crate::contacts::types::{AddressKey, RecipientQuery, RecipientSuggestion};
 use crate::mail::Address;
-use crate::providers::OperationContext;
+use crate::providers::{ContactSourceId, OperationContext};
 
 use super::lock_state;
 
@@ -144,6 +144,65 @@ pub fn rebuild_learned_recipients(account: &AccountId) -> Result<(), String> {
         .store
         .rebuild_learned_recipients(account)
         .map_err(|error| format!("rebuild learned recipients: {error}"))
+}
+
+/// Enable or disable synchronization for one contact source.
+///
+/// Disabling cancels the source's resumable job and leaves every cached contact
+/// in place; only an explicit source/account removal deletes local contact rows.
+/// Learned mail-derived evidence is never affected.
+pub fn set_contact_sync(
+    account: &AccountId,
+    source: &ContactSourceId,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut guard = lock_state();
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "pige api is not initialized".to_string())?;
+    state.ensure_writable()?;
+    let current = state
+        .config_doc
+        .accounts
+        .iter()
+        .find(|configured| &configured.id == account)
+        .cloned()
+        .ok_or_else(|| format!("unknown account {account}"))?;
+
+    let mut updated = current.clone();
+    match updated
+        .contact_sources
+        .iter_mut()
+        .find(|configured| &configured.id == source)
+    {
+        Some(existing) => existing.enabled = enabled,
+        None => updated.contact_sources.push(ContactSourceConfig {
+            id: source.clone(),
+            provider: current.provider_id(),
+            kind: "saved".to_string(),
+            enabled,
+        }),
+    }
+    let mut accounts = state.config_doc.accounts.clone();
+    if let Some(slot) = accounts
+        .iter_mut()
+        .find(|configured| &configured.id == account)
+    {
+        *slot = updated;
+    }
+    state.replace_accounts(accounts)?;
+
+    // The configuration document is authoritative for user intent. The store's
+    // state is the durable execution fence; a failure is reported rather than
+    // silently leaving a source believing it is still enabled.
+    state
+        .store
+        .set_contact_source_enabled(account, source, enabled)
+        .map_err(|error| format!("update contact source state: {error}"))?;
+    let sender = state.events.clone();
+    drop(guard);
+    let _ = sender.send(super::CoreEvent::SnapshotChanged);
+    Ok(())
 }
 
 fn ensure_configured_account(state: &super::AppState, account: &AccountId) -> Result<(), String> {

@@ -783,6 +783,7 @@ mod tests {
                 unread: 0,
                 color: "#00897b".into(),
                 learning_paused: false,
+                contact_sources: Vec::new(),
             }],
             ..ModelSnapshot::default()
         };

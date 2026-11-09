@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use futures::StreamExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use crate::account::{
     Account, AccountId, AuthKind, MailBackend, ServerConfig, default_account_color,
@@ -68,7 +69,7 @@ pub use accounts::{
 };
 pub use contacts::{
     clear_learned_recipients, pause_learning, rebuild_learned_recipients,
-    record_recipient_selection, suggest_recipients,
+    record_recipient_selection, set_contact_sync, suggest_recipients,
 };
 pub use events::{CoreEvent, back_pressed, subscribe};
 pub use mutations::{
@@ -76,8 +77,8 @@ pub use mutations::{
     trash_thread,
 };
 pub use snapshot::{
-    AccountSection, AccountSummary, ConversationDetail, ConversationSummary, FolderSummary,
-    MessageBody, MessageSummary, ModelSnapshot, SyncStatus,
+    AccountSection, AccountSummary, ContactSyncSummary, ConversationDetail, ConversationSummary,
+    FolderSummary, MessageBody, MessageSummary, ModelSnapshot, SyncStatus,
 };
 
 /// Database filename inside [`Config::data_dir`].
@@ -436,6 +437,33 @@ impl AppState {
                 });
             }
 
+            let mut contact_sources = self
+                .store
+                .contact_source_states(&section.account.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(source, state)| ContactSyncSummary {
+                    source,
+                    enabled: state.enabled,
+                    scanned: state.scanned,
+                    complete: state.complete,
+                })
+                .collect::<Vec<_>>();
+            for configured in &section.account.contact_sources {
+                if !contact_sources
+                    .iter()
+                    .any(|summary| summary.source == configured.id)
+                {
+                    contact_sources.push(ContactSyncSummary {
+                        source: configured.id.clone(),
+                        enabled: configured.enabled,
+                        scanned: 0,
+                        complete: false,
+                    });
+                }
+            }
+            contact_sources.sort_by(|left, right| left.source.cmp(&right.source));
+
             accounts.push(AccountSummary {
                 id: section.account.id.clone(),
                 label: section.account.label.clone(),
@@ -451,6 +479,7 @@ impl AppState {
                     .learning_state(&section.account.id)
                     .map(|state| state.paused)
                     .unwrap_or(false),
+                contact_sources,
             });
             sections.push(AccountSection {
                 account_id: section.account.id.clone(),
@@ -857,6 +886,236 @@ pub async fn learn_history_now(account: &AccountId) -> Result<LearningProgress, 
     )
     .await
     .map_err(|error| format!("{}: {}", account.label, error.safe_message))
+}
+
+/// The cancellation token of the currently running native maintenance slice.
+/// WorkManager's `onStopped` cancels this through [`cancel_maintenance`].
+static MAINTENANCE_CANCEL: Mutex<Option<Arc<CancellationToken>>> = Mutex::new(None);
+
+/// Stop the current [`run_maintenance`] slice.
+///
+/// Cancellation is observed between contact pages and during a provider call,
+/// so the last committed page and its checkpoint survive. This is the bridge
+/// used by Android when WorkManager stops the worker; it is safe to call with
+/// no maintenance running.
+pub fn cancel_maintenance() {
+    let guard = MAINTENANCE_CANCEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(token) = guard.as_ref() {
+        token.cancel();
+    }
+}
+
+/// Run one bounded native maintenance pass without an activity.
+///
+/// Mail and outbox delivery run first, so interactive work and already-queued
+/// mail keep priority. Any remaining budget is shared between one header-history
+/// slice and one contact-source snapshot slice per account. Nothing here
+/// promises continuous background sync: WorkManager's periodic minimum is 15
+/// minutes and a stopped worker leaves durable checkpoints for the next pass.
+pub async fn run_maintenance(budget: std::time::Duration) -> Result<(), String> {
+    if !is_initialized() {
+        return Err("pige api is not initialized".to_string());
+    }
+    let token = Arc::new(CancellationToken::new());
+    {
+        let mut guard = MAINTENANCE_CANCEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = guard.replace(token.clone()) {
+            // A newer maintenance pass supersedes an older one; the older
+            // slice exits with its last committed checkpoint.
+            previous.cancel();
+        }
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    let result = run_maintenance_inner(deadline, token.clone()).await;
+    // Release the listener tasks and make a late cancel a no-op.
+    token.cancel();
+    {
+        let mut guard = MAINTENANCE_CANCEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &token))
+        {
+            *guard = None;
+        }
+    }
+    result
+}
+
+async fn run_maintenance_inner(
+    deadline: tokio::time::Instant,
+    cancel: Arc<CancellationToken>,
+) -> Result<(), String> {
+    // Interactive mail and outbox delivery keep priority over local learning.
+    // Their own account deadlines still bound a stopped worker.
+    if !cancel.is_cancelled()
+        && let Err(error) = sync_all().await
+    {
+        log::warn!("maintenance mail sync: {error}");
+    }
+
+    if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+
+    let (config, store, sessions, scheduler, accounts, sender) = {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| "pige api is not initialized".to_string())?;
+        (
+            state.config.clone(),
+            state.store.clone(),
+            state.sessions.clone(),
+            state.scheduler.clone(),
+            state
+                .store
+                .accounts()
+                .map_err(|error| format!("read accounts: {error}"))?,
+            state.events.clone(),
+        )
+    };
+
+    // One bounded history slice per account, then one contact slice per enabled
+    // source. Both resume from their durable cursors on the next pass.
+    for account in &accounts {
+        if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok(ctx) = sessions.context(&account.id, remaining) else {
+            continue;
+        };
+        let (ctx, listener) = with_maintenance_cancel(ctx, &cancel);
+        let budget = WorkBudget::new(
+            crate::sync::history::HISTORY_PAGE_SIZE,
+            crate::sync::history::HISTORY_MAX_PAGES,
+            deadline,
+        );
+        match crate::sync::history::learn_account_slice(
+            &store,
+            &config.providers,
+            account,
+            &ctx,
+            budget,
+            &scheduler,
+        )
+        .await
+        {
+            Ok(progress) => log::debug!(
+                "maintenance history for {}: scanned {} complete {}",
+                account.label,
+                progress.scanned,
+                progress.complete
+            ),
+            Err(error) => log::debug!(
+                "maintenance history for {}: {}",
+                account.label,
+                error.safe_message
+            ),
+        }
+        listener.cancel();
+    }
+
+    for account in &accounts {
+        for configured in &account.contact_sources {
+            if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            if !configured.enabled {
+                continue;
+            }
+            let source = &configured.id;
+            let Ok(state) = store.contact_source_state(&account.id, source) else {
+                continue;
+            };
+            if !state.enabled {
+                continue;
+            }
+            let remaining = deadline - tokio::time::Instant::now();
+            let Ok(ctx) = sessions.context(&account.id, remaining) else {
+                continue;
+            };
+            let (ctx, listener) = with_maintenance_cancel(ctx, &cancel);
+            let mut session = match config.providers.open(account, &ctx).await {
+                Ok(session) => session,
+                Err(error) => {
+                    log::debug!(
+                        "maintenance contacts for {}: {}",
+                        account.label,
+                        error.safe_message
+                    );
+                    listener.cancel();
+                    continue;
+                }
+            };
+            let Ok(service) = session.address_book_service() else {
+                listener.cancel();
+                continue;
+            };
+            let budget = WorkBudget::new(
+                crate::contacts::sync::CONTACTS_PAGE_SIZE,
+                crate::contacts::sync::CONTACTS_MAX_PAGES,
+                deadline,
+            );
+            match crate::contacts::sync::sync_slice_paged(
+                &store,
+                service.as_mut(),
+                source,
+                &ctx,
+                budget,
+                &scheduler,
+            )
+            .await
+            {
+                Ok(progress) => {
+                    let _ = sender.send(CoreEvent::ContactSyncProgress {
+                        account: account.id.clone(),
+                        source: source.clone(),
+                        scanned: progress.scanned,
+                        complete: progress.complete,
+                    });
+                }
+                Err(error) => log::debug!(
+                    "maintenance contacts for {} / {source}: {}",
+                    account.label,
+                    error.safe_message
+                ),
+            }
+            listener.cancel();
+        }
+    }
+
+    let _ = sender.send(CoreEvent::SnapshotChanged);
+    Ok(())
+}
+
+/// Combine the account's cancellation (generation invalidation) with the
+/// maintenance stop token. The returned token cancels the listener task.
+fn with_maintenance_cancel(
+    mut ctx: OperationContext,
+    maintenance: &Arc<CancellationToken>,
+) -> (OperationContext, CancellationToken) {
+    let combined = CancellationToken::new();
+    let account = ctx.cancellation.clone();
+    let maintenance = maintenance.clone();
+    let out = combined.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = account.cancelled() => out.cancel(),
+            _ = maintenance.cancelled() => out.cancel(),
+            // The slice finished and its combined token was dropped/cancelled;
+            // let this listener exit instead of lingering until process end.
+            _ = out.cancelled() => {}
+        }
+    });
+    ctx.cancellation = combined.clone();
+    (ctx, combined)
 }
 
 /// The persisted user settings, from the configuration document.

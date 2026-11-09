@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use tokio::sync::broadcast;
 
 use crate::account::AccountId;
+use crate::providers::ContactSourceId;
 use crate::sync::NewMailSummary;
 
 /// Capacity covers a first-sync burst (the initial window is 300 messages per
@@ -29,6 +30,13 @@ pub enum CoreEvent {
         new_mail: usize,
     },
     NewMail(NewMailSummary),
+    /// One contact source made durable progress during bounded maintenance.
+    ContactSyncProgress {
+        account: AccountId,
+        source: ContactSourceId,
+        scanned: u64,
+        complete: bool,
+    },
     /// The platform's Back gesture/button asked the UI to move back.
     BackPressed,
     /// A recoverable failure, already formatted for display.

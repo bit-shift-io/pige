@@ -9,6 +9,7 @@
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use jni::objects::{JObject, JString};
 use jni::sys::{JNI_VERSION_1_6, jint};
@@ -28,6 +29,12 @@ fn init_logging() {
 }
 
 static API_INIT: Mutex<()> = Mutex::new(());
+
+/// Wall-clock budget for one WorkManager maintenance run. WorkManager may stop
+/// the worker earlier; cancellation then leaves the last committed page and
+/// checkpoint durable. This is deliberately a bounded burst, not continuous
+/// background synchronization.
+const NATIVE_MAINTENANCE_BUDGET: Duration = Duration::from_secs(25);
 
 fn initialize_api(origin: &str) -> bool {
     // The activity and a WorkManager worker can race on a cold start. Keep the
@@ -107,7 +114,9 @@ pub extern "system" fn Java_bitshift_pige_MainActivity_nativeInit(_env: JNIEnv, 
 
 /// Called by `SyncWorker` on a background thread. If WorkManager started this
 /// process there is no activity and no iced loop, so initialise the core here
-/// first. Returns 0 on success and 1 when the worker should retry.
+/// first. Runs one bounded maintenance pass (mail/outbox priority, then contact
+/// and history slices) without requiring an activity. Returns 0 on success and
+/// 1 when the worker should retry.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_bitshift_pige_SyncWorker_nativeSyncAll(
     _env: JNIEnv,
@@ -124,19 +133,29 @@ pub extern "system" fn Java_bitshift_pige_SyncWorker_nativeSyncAll(
             return 1;
         }
     };
-    match runtime.block_on(api::sync_all()) {
-        Ok(snapshot) => {
-            log::info!(
-                "nativeSyncAll: synced {} account(s)",
-                snapshot.accounts.len()
-            );
+    match runtime.block_on(api::run_maintenance(NATIVE_MAINTENANCE_BUDGET)) {
+        Ok(()) => {
+            log::info!("nativeSyncAll: maintenance pass finished");
             0
         }
         Err(error) => {
-            log::warn!("nativeSyncAll: sync failed: {error}");
+            log::warn!("nativeSyncAll: maintenance failed: {error}");
             1
         }
     }
+}
+
+/// Called by `PigeBridge.cancelMaintenance` from `SyncWorker.onStopped`.
+/// WorkManager stopping the worker is a normal slice exit: the current page is
+/// either committed with its checkpoint or left for the next pass.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_bitshift_pige_PigeBridge_nativeCancelMaintenance(
+    _env: JNIEnv,
+    _this: JObject,
+) {
+    init_logging();
+    api::cancel_maintenance();
+    log::info!("nativeCancelMaintenance: maintenance cancellation requested");
 }
 
 /// The Back button/gesture. Both this and the older

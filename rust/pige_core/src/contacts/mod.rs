@@ -7,6 +7,7 @@
 pub mod learn;
 pub mod normalize;
 pub mod rank;
+pub mod sync;
 pub mod types;
 
 pub use learn::{observe_cached_message, observe_message, observe_outgoing};

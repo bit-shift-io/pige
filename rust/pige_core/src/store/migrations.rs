@@ -8,6 +8,7 @@ mod v12;
 mod v13;
 mod v14;
 mod v15;
+mod v16;
 mod v2;
 mod v3;
 mod v4;
@@ -72,7 +73,8 @@ impl Store {
     /// search projection and contact-source kind; v13 adds the rank index that
     /// bounds short-prefix lookups to an indexed top-N; v14 adds durable
     /// header-history learning progress and the rate-limit retry time; v15
-    /// adds durable learning pause/epoch/clear controls.
+    /// adds durable learning pause/epoch/clear controls; v16 adds source-scoped
+    /// contact snapshot generations and their durable progress.
     pub fn migrate(&self) -> Result<(), StoreError> {
         self.migrate_to(SCHEMA_VERSION)
     }
@@ -178,6 +180,10 @@ impl Store {
         if version < 15 && target >= 15 {
             v15::apply(&tx)?;
             version = 15;
+        }
+        if version < 16 && target >= 16 {
+            v16::apply(&tx)?;
+            version = 16;
         }
 
         // The rebuild must not leave a dangling reference behind; check before

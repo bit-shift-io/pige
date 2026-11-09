@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use rusqlite::{OptionalExtension, params};
 
 use crate::account::{Account, AccountId};
-use crate::providers::{JobKey, JobKind};
+use crate::providers::JobKey;
 use crate::send::SubmissionState;
 
 use super::{Store, StoreError};
@@ -286,34 +286,23 @@ impl Store {
         Ok(files)
     }
 
-    /// Clear only the cache/checkpoint of one replaced contact source. Mail and
-    /// other sources are untouched. There is no contact-row projection in this
-    /// foundation yet; the checkpoint is the durable evidence that must not be
-    /// replayed against a replacement source.
+    /// Clear the cached contacts, snapshot state, and checkpoint of one
+    /// replaced contact source. Mail, learned evidence, and other sources are
+    /// untouched. A replacement source must not resume a cursor that belonged
+    /// to its predecessor.
     pub fn clear_contact_source_cache(
         &self,
         account: &AccountId,
         source: &str,
     ) -> Result<(), StoreError> {
         let conn = self.connection();
-        let mut keys = Vec::new();
-        {
-            let mut statement = conn.prepare("SELECT job_key FROM job_checkpoints")?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                let raw: String = row.get(0)?;
-                if let Some(key) = parse_job_key(&raw)
-                    && key.account == *account
-                    && key.kind == JobKind::Contacts
-                    && key.source == source
-                {
-                    keys.push(raw);
-                }
-            }
-        }
-        for key in keys {
-            conn.execute("DELETE FROM job_checkpoints WHERE job_key = ?1", [key])?;
-        }
+        let tx = conn.unchecked_transaction()?;
+        super::contacts::clear_contact_source_data_in(
+            &tx,
+            account,
+            &crate::providers::ContactSourceId::new(source),
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

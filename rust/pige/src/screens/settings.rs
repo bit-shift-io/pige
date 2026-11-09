@@ -244,49 +244,70 @@ fn recipient_suggestions_section<'a>(app: &'a App) -> Element<'a, Message> {
         } else {
             "On"
         };
-        list = list.push(
-            column![
-                row![
-                    styled(
-                        account.email.clone(),
-                        TextRole::LabelMedium,
-                        palette.on_surface_variant,
-                    ),
-                    styled(
-                        format!("Learning {status}"),
-                        TextRole::LabelMedium,
-                        palette.on_surface,
-                    ),
-                ]
-                .spacing(palette.space.sm)
-                .align_y(Alignment::Center),
-                row![
-                    components::button(
-                        if account.learning_paused {
-                            "Resume learning"
-                        } else {
-                            "Pause learning"
-                        },
-                        ButtonVariant::Text,
-                        Message::LearningPause(account.id.clone(), !account.learning_paused),
-                    ),
-                    components::button(
-                        "Clear...",
-                        ButtonVariant::Danger,
-                        Message::LearningClear(account.id.clone()),
-                    ),
-                    components::button(
-                        "Rebuild...",
-                        ButtonVariant::Outlined,
-                        Message::LearningRebuild(account.id.clone()),
-                    ),
-                ]
-                .spacing(palette.space.sm)
-                .align_y(Alignment::Center),
+        let mut account_details = column![
+            row![
+                styled(
+                    account.email.clone(),
+                    TextRole::LabelMedium,
+                    palette.on_surface_variant,
+                ),
+                styled(
+                    format!("Learning {status}"),
+                    TextRole::LabelMedium,
+                    palette.on_surface,
+                ),
             ]
             .spacing(palette.space.sm)
-            .width(Fill),
-        );
+            .align_y(Alignment::Center),
+            row![
+                components::button(
+                    if account.learning_paused {
+                        "Resume learning"
+                    } else {
+                        "Pause learning"
+                    },
+                    ButtonVariant::Text,
+                    Message::LearningPause(account.id.clone(), !account.learning_paused),
+                ),
+                components::button(
+                    "Clear...",
+                    ButtonVariant::Danger,
+                    Message::LearningClear(account.id.clone()),
+                ),
+                components::button(
+                    "Rebuild...",
+                    ButtonVariant::Outlined,
+                    Message::LearningRebuild(account.id.clone()),
+                ),
+            ]
+            .spacing(palette.space.sm)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(palette.space.sm)
+        .width(Fill);
+
+        // Address-book progress is durable and read locally; it never implies
+        // continuous background sync. Contacts remain usable offline.
+        for contact in &account.contact_sources {
+            let state = if !contact.enabled {
+                "off"
+            } else if contact.complete {
+                "synced"
+            } else if contact.scanned > 0 {
+                "sync paused"
+            } else {
+                "not synced yet"
+            };
+            account_details = account_details.push(styled(
+                format!(
+                    "Contacts {}: {state} ({} contacts cached)",
+                    contact.source, contact.scanned
+                ),
+                TextRole::LabelMedium,
+                palette.on_surface_variant,
+            ));
+        }
+        list = list.push(account_details);
     }
 
     section("Recipient suggestions", list.into())

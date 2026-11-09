@@ -128,6 +128,37 @@ pub(crate) fn set_checkpoint_in(
     Ok(())
 }
 
+/// Read one job cursor inside a caller-owned transaction.
+pub(crate) fn checkpoint_cursor_in(
+    conn: &rusqlite::Connection,
+    key: &JobKey,
+) -> Result<Option<ProviderCursor>, StoreError> {
+    let job_key = serde_json::to_string(key)?;
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT cursor FROM job_checkpoints WHERE job_key = ?1",
+            [&job_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    stored
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(StoreError::from)
+}
+
+/// Delete one job's checkpoint inside a caller-owned transaction. Used when a
+/// full contact snapshot completes: the next slice must start a fresh
+/// generation instead of paging past the end of the old one.
+pub(crate) fn delete_checkpoint_in(
+    conn: &rusqlite::Connection,
+    key: &JobKey,
+) -> Result<(), StoreError> {
+    let job_key = serde_json::to_string(key)?;
+    conn.execute("DELETE FROM job_checkpoints WHERE job_key = ?1", [job_key])?;
+    Ok(())
+}
+
 /// Compare-and-swap guard executed *inside* a page's SQLite transaction: the
 /// store's cursor for `key` must still equal `expected` (including both being
 /// absent) or the page was produced against a checkpoint another writer has

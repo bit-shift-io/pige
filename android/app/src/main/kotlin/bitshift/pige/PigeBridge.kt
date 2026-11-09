@@ -235,4 +235,15 @@ object PigeBridge {
     fun cancelSync() {
         WorkManager.getInstance(getAppContext()).cancelUniqueWork(WORK_NAME)
     }
+
+    /// Ask the Rust maintenance slice to stop at its next page boundary. The
+    /// last committed contact/history checkpoint stays durable, so a stopped
+    /// worker never corrupts local state and the next run resumes.
+    @JvmStatic
+    fun cancelMaintenance() {
+        nativeCancelMaintenance()
+    }
+
+    @JvmStatic
+    private external fun nativeCancelMaintenance()
 }

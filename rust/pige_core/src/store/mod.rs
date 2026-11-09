@@ -33,10 +33,12 @@ use messages::{conversations_on, message_count_on, unified_conversations_on};
 
 pub use attachments::StoredAttachment;
 pub use bodies::Body;
-pub use contacts::CachedContactEmail;
+pub use contacts::{
+    CachedContactEmail, ContactPageOutcome, ContactSourceState, ContactSyncStart, contacts_job,
+};
 pub use correspondents::{
-    ExistingCachePage, HISTORY_SOURCE, HistoryProgress, HistoryState, LearnedAddress, LearningState,
-    history_job,
+    ExistingCachePage, HISTORY_SOURCE, HistoryProgress, HistoryState, LearnedAddress,
+    LearningState, history_job,
 };
 pub(crate) use correspondents::record_observations_in;
 pub(crate) use jobs::check_generation_in;
@@ -122,6 +124,10 @@ pub enum StoreError {
     /// explicit rebuild re-enables it.
     #[error("automatic recipient learning is disabled")]
     LearningDisabled,
+    /// The user or a provider permission failure disabled this contact source.
+    /// Its cached contacts are preserved, but no page may commit for it.
+    #[error("contact source is disabled")]
+    ContactSourceDisabled,
     /// Another process holds the account's cross-process lease.
     #[error("account is busy with another operation")]
     LeaseHeld,

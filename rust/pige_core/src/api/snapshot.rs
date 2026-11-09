@@ -4,7 +4,7 @@
 use crate::account::AccountId;
 use crate::html::MailDocument;
 use crate::mail::{AttachmentPart, Flags, FolderId, FolderKind, MessageId, ThreadId};
-use crate::providers::ProviderCapabilities;
+use crate::providers::{ContactSourceId, ProviderCapabilities};
 use crate::search::{SearchHit, SearchScope};
 use crate::send::OutboxEntry;
 
@@ -21,6 +21,18 @@ pub struct AccountSummary {
     /// Whether the user paused recipient learning for this account. Existing
     /// suggestions remain visible while paused.
     pub learning_paused: bool,
+    /// Durable progress for this account's configured contact sources.
+    pub contact_sources: Vec<ContactSyncSummary>,
+}
+
+/// Read-only contact-source progress for settings and account rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactSyncSummary {
+    pub source: ContactSourceId,
+    pub enabled: bool,
+    /// Contact records observed in the current/last full snapshot.
+    pub scanned: u64,
+    pub complete: bool,
 }
 
 /// One account's expandable folder group.
