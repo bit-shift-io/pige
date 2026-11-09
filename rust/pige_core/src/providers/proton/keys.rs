@@ -75,6 +75,16 @@ impl UnlockedKeyStore {
         self.lock_state().session_uid = Some(session_uid.into());
     }
 
+    /// Install test-only unlocked keys without an interactive login.
+    ///
+    /// Compiled only for this crate's tests and the test-support feature. It
+    /// exists so crypto-path integration tests can present synthetic keys; no
+    /// product build can call it.
+    #[cfg(any(test, feature = "provider-proton-test-support"))]
+    pub fn install_test_keys(&self, session_uid: impl Into<String>, keys: KeyStore) {
+        self.install(session_uid, keys);
+    }
+
     /// The non-secret Proton session UID, if a session is installed.
     pub fn session_uid(&self) -> Option<String> {
         self.lock_state().session_uid.clone()

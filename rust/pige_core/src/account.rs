@@ -176,6 +176,21 @@ pub struct ContactSourceConfig {
 pub const GOOGLE_SAVED_CONTACTS_SOURCE_ID: &str = "google.saved";
 /// Native Google People Other contacts.
 pub const GOOGLE_OTHER_CONTACTS_SOURCE_ID: &str = "google.other";
+/// Native Proton contacts. P3 exposes a read-only full-snapshot source; the
+/// adapter advertises `incremental_sync = false`.
+pub const PROTON_CONTACTS_SOURCE_ID: &str = "proton.contacts";
+
+/// The Proton contact source a native Proton account gets when the user enables
+/// contacts. Proton exposes a full saved-contact snapshot, not an incremental
+/// delta stream.
+pub fn proton_contact_sources() -> Vec<ContactSourceConfig> {
+    vec![ContactSourceConfig {
+        id: ContactSourceId::from(PROTON_CONTACTS_SOURCE_ID),
+        provider: ProviderId::from(PROTON_PROVIDER),
+        kind: "saved".to_string(),
+        enabled: true,
+    }]
+}
 
 /// The two R6 contact sources a native Google account gets when the user
 /// enables contacts. Order is deliberate: saved contacts rank above Other.

@@ -12,6 +12,7 @@
 pub mod auth;
 pub mod client;
 pub mod keys;
+mod contacts;
 mod mailbox;
 mod normalize;
 mod sync;
@@ -35,6 +36,7 @@ use crate::providers::{
 
 pub use auth::ProtonAuthentication;
 pub use client::{PROTON_APP_VERSION, ProtonClient, ProtonEndpoints};
+pub use contacts::ProtonAddressBook;
 pub use keys::{ProtonAddressKeys, ProtonKeyStores, UnlockedKeyStore};
 pub use mailbox::ProtonMailbox;
 pub use sync::{ProtonMutations, ProtonSync, cursor_stage};
@@ -164,14 +166,22 @@ impl ProviderFactory for ProtonProviderFactory {
             mailbox: true,
             sync: true,
             mutations,
-            // P3/P4 attach body reading, submission and contacts.
+            // P4 attaches submission; P3 attaches body reading and contacts.
             submission: false,
-            contacts: Default::default(),
+            contacts: crate::providers::ContactCapabilities {
+                read: true,
+                // Proton exposes a full contact snapshot, not a delta stream.
+                incremental_sync: false,
+                remote_search: false,
+                write: false,
+                groups: false,
+            },
             server_search: false,
         })
         .with_provider(ProviderId::from(PROTON_PROVIDER));
         session.mailbox = Some(Box::new(ProtonMailbox::new(client.clone())));
         session.sync = Some(Box::new(ProtonSync::new(client.clone())));
+        session.address_book = Some(Box::new(ProtonAddressBook::new(client.clone())));
         session.mutations = Some(Box::new(ProtonMutations::new(client)));
         Ok(session)
     }

@@ -37,7 +37,7 @@ impl Recipient {
 #[serde(rename_all = "PascalCase")]
 pub struct Attachment {
     /// Attachment ID.
-    #[serde(default)]
+    #[serde(rename = "ID", default)]
     pub id: String,
     /// File name.
     #[serde(default)]
@@ -54,6 +54,9 @@ pub struct Attachment {
     /// Content disposition (`inline` or `attachment`).
     #[serde(default)]
     pub disposition: Option<String>,
+    /// Content-ID when the part is referenced from the HTML body.
+    #[serde(rename = "ContentID", default)]
+    pub content_id: Option<String>,
     /// Detached signature over the attachment, if present.
     #[serde(default)]
     pub signature: Option<String>,

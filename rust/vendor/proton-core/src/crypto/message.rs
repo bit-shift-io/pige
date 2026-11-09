@@ -73,6 +73,21 @@ pub fn decrypt_body<P: PGPProviderSync>(
     verify_pubs_armored: &[String],
     armored_body: &str,
 ) -> Result<(String, Verdict)> {
+    let (bytes, verdict) =
+        decrypt_body_bounded(provider, addr, verify_pubs_armored, armored_body, usize::MAX)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), verdict))
+}
+
+/// Decrypt a message body while refusing to return plaintext above
+/// `max_output` bytes. The caller still bounds the encrypted input; this guard
+/// stops a decompression expansion from becoming a cache/heap growth vector.
+pub fn decrypt_body_bounded<P: PGPProviderSync>(
+    provider: &P,
+    addr: &AddressKeys,
+    verify_pubs_armored: &[String],
+    armored_body: &str,
+    max_output: usize,
+) -> Result<(Vec<u8>, Verdict)> {
     let privs = import_privs(provider, addr)?;
     let pubs: Vec<P::PublicKey> = verify_pubs_armored
         .iter()
@@ -92,6 +107,11 @@ pub fn decrypt_body<P: PGPProviderSync>(
     let verified = dec
         .decrypt(armored_body.as_bytes(), DataEncoding::Armor)
         .map_err(|e| Error::Crypto(format!("body decrypt failed: {e}")))?;
+    if verified.as_bytes().len() > max_output {
+        return Err(Error::Other(format!(
+            "decrypted body exceeds the {max_output} byte limit"
+        )));
+    }
 
     let verdict = if !have_verifier {
         Verdict::Unverified
@@ -103,7 +123,7 @@ pub fn decrypt_body<P: PGPProviderSync>(
             Err(_) => Verdict::Invalid,
         }
     };
-    let body = String::from_utf8_lossy(verified.as_bytes()).into_owned();
+    let body = verified.as_bytes().to_vec();
     tracing::debug!(target: "proton_core::crypto", verdict = ?verdict, plaintext_len = body.len(), "message body decrypted");
     Ok((body, verdict))
 }
@@ -115,6 +135,17 @@ pub fn decrypt_attachment<P: PGPProviderSync>(
     addr: &AddressKeys,
     key_packets_b64: &str,
     data_packet: &[u8],
+) -> Result<Vec<u8>> {
+    decrypt_attachment_bounded(provider, addr, key_packets_b64, data_packet, usize::MAX)
+}
+
+/// Decrypt an attachment while refusing plaintext above `max_output` bytes.
+pub fn decrypt_attachment_bounded<P: PGPProviderSync>(
+    provider: &P,
+    addr: &AddressKeys,
+    key_packets_b64: &str,
+    data_packet: &[u8],
+    max_output: usize,
 ) -> Result<Vec<u8>> {
     let privs = import_privs(provider, addr)?;
     tracing::debug!(target: "proton_core::crypto", address = %addr.email, data_packet = data_packet.len(), "decrypting attachment (unwrap session key → decrypt data packet)");
@@ -131,6 +162,11 @@ pub fn decrypt_attachment<P: PGPProviderSync>(
         .with_session_key(sk)
         .decrypt(data_packet, DataEncoding::Bytes)
         .map_err(|e| Error::Crypto(format!("attachment data decrypt failed: {e}")))?;
+    if out.as_bytes().len() > max_output {
+        return Err(Error::Other(format!(
+            "decrypted attachment exceeds the {max_output} byte limit"
+        )));
+    }
     Ok(out.as_bytes().to_vec())
 }
 

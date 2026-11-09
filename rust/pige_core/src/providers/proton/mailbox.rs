@@ -14,16 +14,19 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::mail::{MAX_ATTACHMENT_BYTES, safe_attachment_filename};
 use crate::providers::{
-    BodyContent, CollectionRecord, ErrorKind, HistoryCoverage, HistoryPage, HistoryRequest,
-    MailboxService, MessageRecord, OperationContext, ProviderCursor, ProviderError,
-    RemoteAttachmentId, RemoteMessageId,
+    AttachmentDescriptor, BodyContent, CollectionRecord, ErrorKind, HistoryCoverage, HistoryPage,
+    HistoryRequest, MailboxService, MessageRecord, OperationContext, ProviderCursor, ProviderError,
+    RemoteAttachmentId, RemoteMessageId, SignatureStatus,
 };
 
 use proton_core::api;
-use proton_core::model::enums::label_type;
+use proton_core::crypto::keys::{AddressKeys, KeyStore};
+use proton_core::crypto::Verdict;
+use proton_core::model::enums::{label_type, message_flag};
 use proton_core::model::label::Label;
-use proton_core::model::message::MessageMetadata;
+use proton_core::model::message::{Attachment, Message, MessageMetadata};
 
 use super::client::{ProtonClient, ProtonHttp};
 use super::normalize;
@@ -32,6 +35,14 @@ const HISTORY_CURSOR_VERSION: u32 = 1;
 const HISTORY_MIN_PAGE: u32 = 1;
 /// Proton's listing accepts at most 150 messages per page.
 pub(crate) const PROTON_MAX_PAGE: u32 = 150;
+
+/// The existing reader body cap, applied to decrypted plaintext.
+const MAX_BODY_BYTES: usize = crate::api::MAX_BODY_BYTES as usize;
+/// Armored/base64 ciphertext expands over plaintext. This is a hard input bound,
+/// not a substitute for the decrypted-output cap.
+const MAX_ENCRYPTED_BODY_BYTES: usize = MAX_BODY_BYTES * 2;
+/// Encrypted attachment data packets carry a small packet/signature overhead.
+const MAX_ENCRYPTED_ATTACHMENT_BYTES: u64 = MAX_ATTACHMENT_BYTES + 1024 * 1024;
 
 /// Proton mailbox reads.
 pub struct ProtonMailbox {
@@ -69,25 +80,77 @@ impl MailboxService for ProtonMailbox {
 
     async fn body(
         &mut self,
-        _id: &RemoteMessageId,
-        _ctx: &OperationContext,
+        id: &RemoteMessageId,
+        ctx: &OperationContext,
     ) -> Result<BodyContent, ProviderError> {
-        // P3 owns body retrieval and OpenPGP verification. Until then this is a
-        // fail-closed gap, never ciphertext presented as display text.
-        Err(ProviderError::unsupported(
-            "reading a native Proton message body in this build",
-        ))
+        ctx.ensure_active()?;
+        let http = self.client.request_http(ctx).await?;
+        let message = http.finish(api::messages::get_message(&http, id.as_str()).await)?;
+        ctx.ensure_active()?;
+
+        let attachments = message.attachments.iter().map(descriptor).collect();
+        let kind = body_kind(&message)?;
+        let (plain_text, html, signature) = match kind {
+            BodyKind::Cleartext => {
+                if message.body.len() > MAX_BODY_BYTES {
+                    return Err(too_large("message body"));
+                }
+                let (plain, html) = split_body(&message.body, &message.mime_type);
+                (plain, html, SignatureStatus::NotApplicable)
+            }
+            BodyKind::Encrypted => {
+                if message.body.len() > MAX_ENCRYPTED_BODY_BYTES {
+                    return Err(too_large("encrypted message body"));
+                }
+                let verify = sender_verification_keys(&http, &message.meta.sender.address).await;
+                ctx.ensure_active()?;
+                let (bytes, verdict) = decrypt_body(&self.client, &message, &verify)?;
+                let (plain, html) = split_body(&String::from_utf8_lossy(&bytes), &message.mime_type);
+                (plain, html, signature_status(verdict))
+            }
+        };
+        ctx.ensure_active()?;
+        Ok(BodyContent {
+            plain_text,
+            html,
+            // Proton does not expose the original RFC822 message; never
+            // fabricate one from decrypted MIME parts.
+            raw: None,
+            attachments,
+            signature,
+        })
     }
 
     async fn attachment(
         &mut self,
-        _message: &RemoteMessageId,
-        _id: &RemoteAttachmentId,
-        _ctx: &OperationContext,
+        message: &RemoteMessageId,
+        id: &RemoteAttachmentId,
+        ctx: &OperationContext,
     ) -> Result<Vec<u8>, ProviderError> {
-        Err(ProviderError::unsupported(
-            "downloading a native Proton attachment in this build",
-        ))
+        ctx.ensure_active()?;
+        let http = self.client.request_http(ctx).await?;
+        let message = http.finish(api::messages::get_message(&http, message.as_str()).await)?;
+        let attachment = message
+            .attachments
+            .iter()
+            .find(|attachment| attachment.id == id.as_str())
+            .ok_or_else(|| ProviderError::not_found("the attachment is not in this message"))?;
+        if attachment.size > MAX_ATTACHMENT_BYTES {
+            return Err(too_large("attachment"));
+        }
+        let key_packets = attachment.key_packets.as_deref().ok_or_else(|| {
+            ProviderError::unsupported("an unencrypted native Proton attachment")
+        })?;
+        let data = http.finish(api::attachments::get_attachment(&http, id.as_str()).await)?;
+        if data.len() as u64 > MAX_ENCRYPTED_ATTACHMENT_BYTES {
+            return Err(too_large("encrypted attachment"));
+        }
+        ctx.ensure_active()?;
+        let plain = decrypt_attachment(&self.client, &message, key_packets, &data)?;
+        if plain.len() as u64 > MAX_ATTACHMENT_BYTES {
+            return Err(too_large("attachment"));
+        }
+        Ok(plain)
     }
 
     async fn history(
@@ -249,6 +312,215 @@ impl MailboxService for ProtonMailbox {
             },
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Body / attachment crypto
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyKind {
+    Cleartext,
+    Encrypted,
+}
+
+/// Classify the wire body before touching crypto. A message that claims to be
+/// encrypted but uses a format this adapter cannot decrypt fails closed; it is
+/// never rendered as cleartext.
+fn body_kind(message: &Message) -> Result<BodyKind, ProviderError> {
+    let trimmed = message.body.trim_start();
+    if trimmed.starts_with("-----BEGIN PGP MESSAGE-----") {
+        return Ok(BodyKind::Encrypted);
+    }
+    if trimmed.starts_with("-----BEGIN PGP ") {
+        return Err(ProviderError::unsupported(
+            "this native Proton OpenPGP message format",
+        ));
+    }
+    let mime = message.mime_type.trim().to_ascii_lowercase();
+    let encrypted_form = mime.contains("encrypted")
+        || mime.contains("application/pgp")
+        || message.password.is_some()
+        || message_flag::has(message.meta.flags, message_flag::E2E);
+    if encrypted_form {
+        return Err(ProviderError::unsupported(
+            "this native Proton encrypted message format",
+        ));
+    }
+    Ok(BodyKind::Cleartext)
+}
+
+/// Verified Proton sender keys only. External/WKD keys stay out of the
+/// verifier set, so an external signature is `Unverified`, never `Verified`.
+async fn sender_verification_keys(http: &ProtonHttp, email: &str) -> Vec<String> {
+    if email.trim().is_empty() {
+        return Vec::new();
+    }
+    match http
+        .finish(api::keys::get_all_public_keys(http, email).await)
+    {
+        Ok(keys) => keys
+            .keys
+            .into_iter()
+            .map(|key| key.public_key)
+            .filter(|key| !key.is_empty())
+            .collect(),
+        // A key lookup failure must not fail the body; it degrades the verdict
+        // to Unverified rather than pretending the signature is valid.
+        Err(_) => Vec::new(),
+    }
+}
+
+fn candidate_addresses<'a>(keys: &'a KeyStore, address_id: &str) -> Vec<&'a AddressKeys> {
+    let mut candidates = Vec::new();
+    if let Some(exact) = keys.address(address_id) {
+        candidates.push(exact);
+    }
+    // Only when the exact address is absent or cannot decrypt do we try the
+    // account's other address rings. This never silently substitutes the
+    // primary address for a different alias's key.
+    for address in &keys.addresses {
+        if address.address_id != address_id {
+            candidates.push(address);
+        }
+    }
+    candidates
+}
+
+fn decrypt_body(
+    client: &ProtonClient,
+    message: &Message,
+    verify: &[String],
+) -> Result<(Vec<u8>, Verdict), ProviderError> {
+    client.unlocked_keys().with_keys(|keys| {
+        let candidates = candidate_addresses(keys, &message.meta.address_id);
+        if candidates.is_empty() {
+            return Err(ProviderError::reauthenticate(
+                "unlock the Proton address keys to continue",
+            ));
+        }
+        let provider = proton_core::crypto::provider();
+        let mut last_error = None;
+        for address in candidates {
+            match proton_core::crypto::decrypt_body_bounded(
+                &provider,
+                address,
+                verify,
+                &message.body,
+                MAX_BODY_BYTES,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        Err(
+            ProviderError::new(ErrorKind::Unsupported, "decrypting this Proton message body")
+                .with_source_detail(last_error.unwrap_or_default()),
+        )
+    })?
+}
+
+fn decrypt_attachment(
+    client: &ProtonClient,
+    message: &Message,
+    key_packets: &str,
+    data_packet: &[u8],
+) -> Result<Vec<u8>, ProviderError> {
+    client.unlocked_keys().with_keys(|keys| {
+        let candidates = candidate_addresses(keys, &message.meta.address_id);
+        if candidates.is_empty() {
+            return Err(ProviderError::reauthenticate(
+                "unlock the Proton address keys to continue",
+            ));
+        }
+        let provider = proton_core::crypto::provider();
+        let mut last_error = None;
+        for address in candidates {
+            match proton_core::crypto::decrypt_attachment_bounded(
+                &provider,
+                address,
+                key_packets,
+                data_packet,
+                MAX_ATTACHMENT_BYTES as usize,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        Err(
+            ProviderError::new(ErrorKind::Unsupported, "decrypting this Proton attachment")
+                .with_source_detail(last_error.unwrap_or_default()),
+        )
+    })?
+}
+
+fn descriptor(attachment: &Attachment) -> AttachmentDescriptor {
+    let content_type = attachment
+        .mime_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let content_id = attachment
+        .content_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let inline = attachment
+        .disposition
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("inline"));
+    AttachmentDescriptor {
+        remote_id: RemoteAttachmentId::new(attachment.id.clone()),
+        part_id: attachment.id.clone(),
+        filename: safe_attachment_filename(&attachment.name, "attachment"),
+        content_type,
+        size: attachment.size,
+        content_id,
+        disposition: if inline {
+            crate::mail::AttachmentDisposition::Inline
+        } else {
+            crate::mail::AttachmentDisposition::Attachment
+        },
+    }
+}
+
+fn split_body(body: &str, mime_type: &str) -> (Option<String>, Option<String>) {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    if mime_type.starts_with("text/html") {
+        return (None, Some(body.to_string()));
+    }
+    if mime_type.starts_with("text/plain") || mime_type.is_empty() {
+        return (Some(body.to_string()), None);
+    }
+    if mime_type.starts_with("multipart/")
+        && let Some(parsed) = mail_parser::MessageParser::default().parse(body.as_bytes())
+    {
+        let html = parsed.body_html(0).map(|value| value.into_owned());
+        let plain = parsed.body_text(0).map(|value| value.into_owned());
+        if html.is_some() || plain.is_some() {
+            return (plain, html);
+        }
+    }
+    (Some(body.to_string()), None)
+}
+
+fn signature_status(verdict: Verdict) -> SignatureStatus {
+    match verdict {
+        Verdict::Verified => SignatureStatus::Verified,
+        Verdict::Unsigned => SignatureStatus::Unsigned,
+        Verdict::Unverified => SignatureStatus::Unverified,
+        Verdict::Invalid => SignatureStatus::Invalid,
+    }
+}
+
+fn too_large(what: &str) -> ProviderError {
+    ProviderError::new(
+        ErrorKind::Unsupported,
+        format!("the {what} is larger than the client accepts"),
+    )
 }
 
 // ---------------------------------------------------------------------------
