@@ -7,6 +7,43 @@ use iced::{Alignment, Element, Fill};
 use pige_core::account::AccountId;
 use pige_core::api::{self, ConversationDetail, MessageBody, MessageSummary};
 
+/// A normalized provider signature verdict rendered beside the message header.
+/// `NotApplicable` (ordinary IMAP mail) renders nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureBadge {
+    pub status: SignatureStatus,
+}
+
+impl SignatureBadge {
+    pub fn label(self) -> &'static str {
+        match self.status {
+            SignatureStatus::Verified => "Signature verified",
+            SignatureStatus::Unsigned => "No signature",
+            SignatureStatus::Unverified => "Signature unverified",
+            SignatureStatus::Invalid => "Signature invalid",
+            SignatureStatus::Unsupported => "Signature unsupported",
+            SignatureStatus::NotApplicable => "",
+        }
+    }
+
+    /// A failed or unsupported signature is a warning at reader level; a
+    /// decrypted body is never silently presented as verified.
+    pub fn is_error(self) -> bool {
+        matches!(
+            self.status,
+            SignatureStatus::Invalid | SignatureStatus::Unsupported
+        )
+    }
+
+    pub fn is_positive(self) -> bool {
+        self.status == SignatureStatus::Verified
+    }
+}
+
+pub fn signature_badge(status: SignatureStatus) -> Option<SignatureBadge> {
+    (status != SignatureStatus::NotApplicable).then_some(SignatureBadge { status })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderBody {
     Document,
@@ -27,7 +64,7 @@ pub fn reader_body_kind(message: &MessageSummary) -> ReaderBody {
 }
 
 use pige_core::mail::FolderKind;
-use pige_core::providers::ProviderCapabilities;
+use pige_core::providers::{ProviderCapabilities, SignatureStatus};
 
 use crate::app::App;
 use crate::components::{self, ButtonVariant, PaneTone};
@@ -387,6 +424,25 @@ fn conversation_body<'a>(detail: &'a ConversationDetail, app: &'a App) -> Elemen
         return components::scroller(content);
     };
 
+    if let Some(badge) = signature_badge(latest.signature) {
+        let color = if badge.is_error() {
+            palette.error
+        } else if badge.is_positive() {
+            palette.primary
+        } else {
+            palette.on_surface_variant
+        };
+        content = content.push(
+            container(components::styled_text(
+                badge.label().to_string(),
+                palette.role(TextRole::LabelMedium),
+                color,
+            ))
+            .width(Fill)
+            .padding([0.0, palette.space.lg]),
+        );
+    }
+
     // Body, or a clear state when it is unavailable. Remote images remain
     // "[image blocked]" placeholders: v1 fetches no remote bytes.
     match reader_body_kind(latest) {
@@ -667,6 +723,7 @@ mod tests {
             has_attachments: false,
             attachments: Vec::new(),
             body,
+            signature: SignatureStatus::NotApplicable,
         }
     }
 
@@ -725,6 +782,7 @@ mod tests {
                 has_attachments: false,
                 attachments: Vec::new(),
                 body: None,
+                signature: SignatureStatus::NotApplicable,
             }],
         });
         app
@@ -769,6 +827,27 @@ mod tests {
             let _ = reader_pane(&app, width);
             let _ = reader_menu(&app, width);
         }
+    }
+
+    #[test]
+    fn invalid_signature_status_is_visible() {
+        use pige_core::providers::SignatureStatus;
+
+        let badge =
+            signature_badge(SignatureStatus::Invalid).expect("an invalid signature is shown");
+        assert!(
+            badge.label().to_ascii_lowercase().contains("invalid"),
+            "the reader must name the invalid signature: {}",
+            badge.label()
+        );
+        assert!(badge.is_error());
+        assert!(
+            signature_badge(SignatureStatus::NotApplicable).is_none(),
+            "ordinary mail has no signature badge"
+        );
+        assert!(signature_badge(SignatureStatus::Verified).is_some());
+        assert!(signature_badge(SignatureStatus::Unverified).is_some());
+        assert!(signature_badge(SignatureStatus::Unsupported).is_some());
     }
 
     #[test]

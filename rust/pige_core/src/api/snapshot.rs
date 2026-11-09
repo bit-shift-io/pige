@@ -4,7 +4,9 @@
 use crate::account::AccountId;
 use crate::html::MailDocument;
 use crate::mail::{AttachmentPart, Flags, FolderId, FolderKind, MessageId, ThreadId};
-use crate::providers::{ContactSourceId, ProviderCapabilities};
+use crate::providers::{
+    ContactSourceId, DeliveryClass, DeliveryClassification, ProviderCapabilities,
+};
 use crate::search::{SearchHit, SearchScope};
 use crate::send::OutboxEntry;
 
@@ -128,6 +130,40 @@ pub struct MessageSummary {
     /// The body for the newest message; earlier messages carry `None` so a
     /// conversation's ASTs are not duplicated across every row.
     pub body: Option<MessageBody>,
+    /// Normalized provider signature trust verdict. IMAP reports
+    /// `NotApplicable`; Proton distinguishes verified, unsigned, unverified,
+    /// invalid and unsupported signatures. The reader renders this state; a
+    /// decrypted body is never implied to be verified.
+    pub signature: crate::providers::SignatureStatus,
+}
+
+/// Compose's recipient-level delivery preview. The provider resolves this
+/// before sending so the UI can say whether each copy is encrypted or ordinary
+/// external mail. A blocked policy returns an error instead of a preview.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveryPreview {
+    pub recipients: Vec<DeliveryClassification>,
+}
+
+impl DeliveryPreview {
+    /// Whether every resolved recipient receives an encrypted copy. An empty
+    /// preview (providers without a policy) is not an encryption claim.
+    pub fn all_encrypted(&self) -> bool {
+        !self.recipients.is_empty()
+            && self
+                .recipients
+                .iter()
+                .all(|recipient| recipient.class.is_encrypted())
+    }
+
+    /// Recipient addresses whose copy is ordinary external mail.
+    pub fn ordinary_external(&self) -> Vec<&crate::mail::Address> {
+        self.recipients
+            .iter()
+            .filter(|recipient| recipient.class == DeliveryClass::ExternalOrdinary)
+            .map(|recipient| &recipient.address)
+            .collect()
+    }
 }
 
 /// Background sync state exposed to the UI.

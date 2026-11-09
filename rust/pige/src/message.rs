@@ -7,6 +7,7 @@ use iced::Size;
 use pige_core::account::presets::ProviderPreset;
 use pige_core::account::{Account, AccountId, Security};
 use pige_core::api::{ConfigOutcome, ModelSnapshot, RecipientSuggestion};
+use pige_core::auth::AuthProgress;
 use pige_core::mail::{FolderId, MessageId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
@@ -265,6 +266,27 @@ pub enum Message {
     GoogleContactsToggle(AccountId, bool),
     /// A Google sign-in finished. `Ok(None)` means the user cancelled.
     GoogleAuthFinished(Result<Option<ModelSnapshot>, String>),
+    /// Start (or resume) the native Proton interactive flow.
+    ProtonAuth {
+        account: Option<AccountId>,
+        email: String,
+        enable_contacts: bool,
+        resume: bool,
+    },
+    /// One challenge step from the Proton adapter.
+    ProtonAuthProgress(Result<AuthProgress, String>),
+    /// Redacted password/code/token input for the current Proton challenge.
+    ProtonAnswerChanged(Password),
+    ProtonAuthSubmit,
+    /// A Proton sign-in finished. `Ok(None)` means it was cancelled.
+    ProtonAuthFinished(Result<Option<ModelSnapshot>, String>),
+    ProtonContactsToggled(bool),
+    ProtonContactsToggle(AccountId, bool),
+    /// A debounced delivery classification for the open compose form.
+    ComposeDeliveryChecked {
+        generation: u64,
+        result: Result<pige_core::api::DeliveryPreview, String>,
+    },
     AccountPasswordChanged(Password),
     AccountPresetChanged(ProviderPreset),
     AccountImapSecurityChanged(Security),

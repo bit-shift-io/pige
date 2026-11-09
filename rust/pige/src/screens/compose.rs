@@ -6,7 +6,7 @@
 use iced::widget::{column, container, row, text_editor};
 use iced::{Alignment, Element, Fill, Length};
 use pige_core::account::AccountId;
-use pige_core::api::RecipientSuggestion;
+use pige_core::api::{DeliveryPreview, RecipientSuggestion};
 use pige_core::mail::Address;
 use pige_core::send::{OutboxId, OutgoingMessage};
 
@@ -77,6 +77,86 @@ pub struct ComposeSeed {
     pub message: OutgoingMessage,
 }
 
+/// The recipient-level delivery classification shown beside the fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DeliveryState {
+    #[default]
+    Unknown,
+    Checking,
+    Ready(DeliveryPreview),
+    /// The provider refused the policy (missing key, unverified key, lookup
+    /// failure). The message is actionable and sending stays blocked.
+    Blocked(String),
+}
+
+/// One renderable delivery line. `encrypted` is false for ordinary external
+/// recipients so the UI can never paint an encryption badge for cleartext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryNotice {
+    pub message: String,
+    pub encrypted: bool,
+    pub warning: bool,
+}
+
+/// Describe the current delivery classification for the compose form.
+pub fn delivery_notice(state: &DeliveryState) -> Option<DeliveryNotice> {
+    match state {
+        DeliveryState::Unknown => None,
+        DeliveryState::Checking => Some(DeliveryNotice {
+            message: "Checking how each recipient will receive this message…".to_string(),
+            encrypted: false,
+            warning: false,
+        }),
+        DeliveryState::Blocked(error) => Some(DeliveryNotice {
+            message: format!("Cannot send yet: {error}"),
+            encrypted: false,
+            warning: true,
+        }),
+        DeliveryState::Ready(preview) => {
+            if preview.recipients.is_empty() {
+                return None;
+            }
+            let ordinary: Vec<&str> = preview
+                .ordinary_external()
+                .into_iter()
+                .map(|address| address.email.as_str())
+                .collect();
+            if !ordinary.is_empty() {
+                let encrypted = preview
+                    .recipients
+                    .iter()
+                    .filter(|recipient| recipient.class.is_encrypted())
+                    .count();
+                return Some(DeliveryNotice {
+                    message: if encrypted > 0 {
+                        format!(
+                            "Encrypted for {} recipient(s); {} will receive ordinary external mail, not end-to-end encrypted: {}.",
+                            encrypted,
+                            ordinary.len(),
+                            ordinary.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "Ordinary external delivery: this message is not end-to-end encrypted for {}.",
+                            ordinary.join(", ")
+                        )
+                    },
+                    encrypted: false,
+                    warning: true,
+                });
+            }
+            Some(DeliveryNotice {
+                message: format!(
+                    "End-to-end encrypted delivery for {} recipient(s).",
+                    preview.recipients.len()
+                ),
+                encrypted: true,
+                warning: false,
+            })
+        }
+    }
+}
+
 /// Everything the compose screen remembers between messages.
 pub struct ComposeState {
     /// Set when editing a saved draft, so Save replaces instead of duplicating.
@@ -106,6 +186,11 @@ pub struct ComposeState {
     /// Set only by an explicit `accept_suggestion`. The update loop records it
     /// through the core API; typing and merely showing results never do.
     pub pending_selection: Option<Address>,
+    /// Latest recipient-delivery classification. It is advisory presentation
+    /// only; the provider re-resolves policy before delivery.
+    pub delivery: DeliveryState,
+    /// Monotonic identity for debounced delivery previews.
+    pub delivery_generation: u64,
 }
 
 impl ComposeState {
@@ -127,6 +212,8 @@ impl ComposeState {
             recipient_generation: 0,
             recipient_suggestions: None,
             pending_selection: None,
+            delivery: DeliveryState::Unknown,
+            delivery_generation: 0,
         }
     }
 
@@ -148,6 +235,8 @@ impl ComposeState {
             recipient_generation: 0,
             recipient_suggestions: None,
             pending_selection: None,
+            delivery: DeliveryState::Unknown,
+            delivery_generation: 0,
         }
     }
 
@@ -168,7 +257,53 @@ impl ComposeState {
         // Any edit invalidates results for the previous text. The caret event
         // that follows the input event schedules the replacement request.
         self.invalidate_recipient_suggestions();
+        if field.is_recipient() {
+            self.delivery = DeliveryState::Unknown;
+            self.delivery_generation = self.delivery_generation.wrapping_add(1);
+        }
         self.notice = None;
+    }
+
+    /// Start one debounced delivery-preview request. Returns the generation and
+    /// message when the recipient fields parse; an incomplete address leaves the
+    /// preview hidden until the next edit.
+    pub fn begin_delivery_check(&mut self) -> Option<(u64, OutgoingMessage)> {
+        self.delivery_generation = self.delivery_generation.wrapping_add(1);
+        let generation = self.delivery_generation;
+        match self.outgoing() {
+            Ok(message) if !message.recipients().is_empty() => {
+                self.delivery = DeliveryState::Checking;
+                Some((generation, message))
+            }
+            _ => {
+                self.delivery = DeliveryState::Unknown;
+                None
+            }
+        }
+    }
+
+    /// Apply a preview only if no later edit superseded it.
+    pub fn apply_delivery(
+        &mut self,
+        generation: u64,
+        result: Result<DeliveryPreview, String>,
+    ) -> bool {
+        if generation != self.delivery_generation {
+            return false;
+        }
+        self.delivery = match result {
+            Ok(preview) => DeliveryState::Ready(preview),
+            Err(error) => DeliveryState::Blocked(error),
+        };
+        true
+    }
+
+    /// The policy error that must keep Send disabled, if any.
+    pub fn blocked_delivery(&self) -> Option<&str> {
+        match &self.delivery {
+            DeliveryState::Blocked(error) => Some(error.as_str()),
+            _ => None,
+        }
     }
 
     fn field_value(&self, field: ComposeField) -> &str {
@@ -262,8 +397,7 @@ impl ComposeState {
         // the query bytes misses drift that extends the token (`gra` -> `grac`),
         // so re-scan from the token end and require identical boundaries.
         span_intact
-            && active_recipient_token(text, key.token_end)
-                == Some((key.token_start, key.token_end))
+            && active_recipient_token(text, key.token_end) == Some((key.token_start, key.token_end))
     }
 
     /// Accept a local result page. Returns `false` for any stale or empty
@@ -663,6 +797,19 @@ fn form<'a>(compose: &'a ComposeState, body_height: Length) -> Element<'a, Messa
             fields = fields.push(panel);
         }
     }
+    if let Some(notice) = delivery_notice(&compose.delivery) {
+        fields = fields.push(components::styled_text(
+            notice.message,
+            palette.role(TextRole::BodyMedium),
+            if notice.warning {
+                palette.error
+            } else if notice.encrypted {
+                palette.primary
+            } else {
+                palette.on_surface_variant
+            },
+        ));
+    }
     fields = fields
         .push(components::text_field(
             "Subject",
@@ -792,6 +939,57 @@ fn action_buttons<'a>(compose: &'a ComposeState) -> Vec<Element<'a, Message>> {
 mod tests {
     use super::*;
     use pige_core::api::{RecipientSuggestion, SuggestionSource};
+
+    #[test]
+    fn external_ordinary_warning_is_not_encryption_badge() {
+        use pige_core::api::DeliveryClass;
+        use pige_core::mail::Address;
+
+        let preview = pige_core::api::DeliveryPreview {
+            recipients: vec![
+                pige_core::api::DeliveryClassification {
+                    address: Address::new(None, "friend@example.com"),
+                    class: DeliveryClass::ExternalOrdinary,
+                },
+                pige_core::api::DeliveryClassification {
+                    address: Address::new(None, "colleague@proton.me"),
+                    class: DeliveryClass::EndToEndEncrypted,
+                },
+            ],
+        };
+        let state = DeliveryState::Ready(preview);
+        let notice = delivery_notice(&state).expect("a mixed classification is shown");
+        assert!(
+            !notice.encrypted,
+            "an ordinary external recipient must never get an encryption badge"
+        );
+        assert!(
+            notice.message.to_ascii_lowercase().contains("not")
+                && notice.message.to_ascii_lowercase().contains("encrypt"),
+            "the warning must say the ordinary copy is not encrypted: {}",
+            notice.message
+        );
+        assert!(
+            notice.message.contains("friend@example.com"),
+            "the warning names the ordinary recipient: {}",
+            notice.message
+        );
+
+        let encrypted = DeliveryState::Ready(pige_core::api::DeliveryPreview {
+            recipients: vec![pige_core::api::DeliveryClassification {
+                address: Address::new(None, "colleague@proton.me"),
+                class: DeliveryClass::EndToEndEncrypted,
+            }],
+        });
+        let notice = delivery_notice(&encrypted).expect("encrypted classification");
+        assert!(notice.encrypted);
+        assert!(
+            !notice
+                .message
+                .to_ascii_lowercase()
+                .contains("not encrypted")
+        );
+    }
 
     fn suggestion(name: &str, email: &str) -> RecipientSuggestion {
         RecipientSuggestion {

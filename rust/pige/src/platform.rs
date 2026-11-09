@@ -220,12 +220,12 @@ mod google {
     }
 }
 
-/// Native Proton provider registration.
+/// Native Proton provider and interactive-auth registration.
 ///
-/// This wires only the provider factory. Interactive Proton authentication is
-/// still a P5 shell decision because [`api::Config::auth`] is a single provider
-/// slot; core callers compose both halves with
-/// `pige_core::providers::proton::proton_registration`.
+/// The factory and [`ProtonAuthentication`] share one token refresher and one
+/// in-memory key store, so a cold resume and a provider request cannot rotate
+/// the same refresh token twice or unlock two divergent key hierarchies. The
+/// shell composes this service with Google through [`pige_core::auth::AuthRouter`].
 #[cfg(all(
     feature = "provider-proton",
     any(target_os = "linux", target_os = "android")
@@ -234,34 +234,49 @@ mod proton {
     use std::path::Path;
     use std::sync::Arc;
 
-    use pige_core::auth::{AccountSessionManager, CredentialSecretRepository};
+    use pige_core::auth::{
+        AccountSessionManager, CredentialSecretRepository, SharedAuthenticationService,
+    };
     use pige_core::platform::CredentialStore;
     use pige_core::providers::ProviderRegistry;
     use pige_core::providers::proton::{
-        ProtonEndpoints, ProtonKeyStores, ProtonProviderFactory, register_proton,
+        ProtonAuthentication, ProtonEndpoints, ProtonKeyStores, ProtonProviderFactory,
+        proton_registration,
     };
 
-    pub(super) fn register(
-        registry: &mut ProviderRegistry,
+    pub(super) struct ProtonShell {
+        pub registry: ProviderRegistry,
+        pub auth: SharedAuthenticationService,
+    }
+
+    pub(super) fn build(
         data_dir: &Path,
         credentials: Arc<dyn CredentialStore>,
-    ) {
-        let Some(store) = super::open_store(data_dir) else {
-            return;
-        };
+    ) -> Option<ProtonShell> {
+        let store = super::open_store(data_dir)?;
         let sessions = Arc::new(AccountSessionManager::new(store.clone()));
         let secrets = Arc::new(CredentialSecretRepository::with_gate(
             credentials,
             store.clone(),
         ));
+        let endpoints = ProtonEndpoints::production();
+        let keys = Arc::new(ProtonKeyStores::new());
         let factory = ProtonProviderFactory::new(
-            sessions,
-            secrets,
-            ProtonEndpoints::production(),
-            Arc::new(ProtonKeyStores::new()),
+            sessions.clone(),
+            secrets.clone(),
+            endpoints.clone(),
+            keys.clone(),
         );
-        if let Err(error) = register_proton(registry, factory) {
-            log::warn!("register Proton provider: {}", error.safe_message);
+        let authentication = ProtonAuthentication::new(secrets, sessions, store, endpoints, keys);
+        match proton_registration(factory, authentication) {
+            Ok(registration) => Some(ProtonShell {
+                registry: registration.registry,
+                auth: registration.authentication,
+            }),
+            Err(error) => {
+                log::warn!("register Proton provider: {}", error.safe_message);
+                None
+            }
         }
     }
 
@@ -272,17 +287,16 @@ mod proton {
         use pige_core::providers::{PROTON_PROVIDER, ProviderId};
 
         #[test]
-        fn enabling_provider_proton_registers_the_factory() {
+        fn enabling_provider_proton_registers_the_factory_and_auth() {
             let data_dir = std::env::temp_dir().join(format!(
                 "pige-proton-registry-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             let credentials: Arc<dyn CredentialStore> = Arc::new(FakeCredentials::default());
-            let mut registry = ProviderRegistry::new();
-            register(&mut registry, &data_dir, credentials);
+            let shell = build(&data_dir, credentials).expect("Proton shell");
             assert!(
-                registry.contains(&ProviderId::from(PROTON_PROVIDER)),
+                shell.registry.contains(&ProviderId::from(PROTON_PROVIDER)),
                 "the provider-proton feature must register the Proton factory"
             );
             let _ = std::fs::remove_dir_all(&data_dir);
@@ -313,17 +327,38 @@ pub(crate) fn config() -> api::Config {
     )]
     let mut registry =
         pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone());
-    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
-    let mut auth = None;
+    #[cfg_attr(
+        not(any(feature = "provider-google", feature = "provider-proton")),
+        allow(unused_mut)
+    )]
+    let mut auth_services: Vec<(
+        pige_core::providers::ProviderId,
+        pige_core::auth::SharedAuthenticationService,
+    )> = Vec::new();
     #[cfg(feature = "provider-google")]
     if let Some(shell) = google::build(&data_dir, &config_dir, credentials.clone()) {
         match registry.merge(shell.registry) {
-            Ok(()) => auth = Some(shell.auth),
+            Ok(()) => auth_services.push((
+                pige_core::providers::ProviderId::from(pige_core::providers::GMAIL_PROVIDER),
+                shell.auth,
+            )),
             Err(error) => log::warn!("compose Google provider: {}", error.safe_message),
         }
     }
     #[cfg(feature = "provider-proton")]
-    proton::register(&mut registry, &data_dir, credentials.clone());
+    if let Some(shell) = proton::build(&data_dir, credentials.clone()) {
+        match registry.merge(shell.registry) {
+            Ok(()) => auth_services.push((
+                pige_core::providers::ProviderId::from(pige_core::providers::PROTON_PROVIDER),
+                shell.auth,
+            )),
+            Err(error) => log::warn!("compose Proton provider: {}", error.safe_message),
+        }
+    }
+    let auth = pige_core::auth::compose_auth_services(auth_services)
+        .map_err(|error| log::warn!("compose interactive authentication: {}", error.safe_message))
+        .ok()
+        .flatten();
     let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(registry);
     api::Config {
         data_dir,
@@ -372,17 +407,38 @@ pub(crate) fn config() -> api::Config {
     )]
     let mut registry =
         pige_core::providers::imap::imap_registry(transport.clone(), credentials.clone());
-    #[cfg_attr(not(feature = "provider-google"), allow(unused_mut))]
-    let mut auth = None;
+    #[cfg_attr(
+        not(any(feature = "provider-google", feature = "provider-proton")),
+        allow(unused_mut)
+    )]
+    let mut auth_services: Vec<(
+        pige_core::providers::ProviderId,
+        pige_core::auth::SharedAuthenticationService,
+    )> = Vec::new();
     #[cfg(feature = "provider-google")]
     if let Some(shell) = google::build(&paths.data_dir, &paths.config_dir, credentials.clone()) {
         match registry.merge(shell.registry) {
-            Ok(()) => auth = Some(shell.auth),
+            Ok(()) => auth_services.push((
+                pige_core::providers::ProviderId::from(pige_core::providers::GMAIL_PROVIDER),
+                shell.auth,
+            )),
             Err(error) => log::warn!("compose Google provider: {}", error.safe_message),
         }
     }
     #[cfg(feature = "provider-proton")]
-    proton::register(&mut registry, &paths.data_dir, credentials.clone());
+    if let Some(shell) = proton::build(&paths.data_dir, credentials.clone()) {
+        match registry.merge(shell.registry) {
+            Ok(()) => auth_services.push((
+                pige_core::providers::ProviderId::from(pige_core::providers::PROTON_PROVIDER),
+                shell.auth,
+            )),
+            Err(error) => log::warn!("compose Proton provider: {}", error.safe_message),
+        }
+    }
+    let auth = pige_core::auth::compose_auth_services(auth_services)
+        .map_err(|error| log::warn!("compose interactive authentication: {}", error.safe_message))
+        .ok()
+        .flatten();
     let providers: Arc<dyn pige_core::providers::ProviderFactory> = Arc::new(registry);
     api::Config {
         config_dir: paths.config_dir,

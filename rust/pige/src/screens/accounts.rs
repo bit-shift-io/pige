@@ -42,6 +42,7 @@ pub enum AccountField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountMethod {
     Google,
+    Proton,
     Imap,
 }
 
@@ -66,6 +67,9 @@ pub struct AccountForm {
     /// The user's optional Google People opt-in for a new or re-authenticated
     /// Google account.
     pub google_contacts: bool,
+    /// The user's Proton contact-sync opt-in. Proton contacts are read-only and
+    /// part of the account session, so no separate OAuth grant is involved.
+    pub proton_contacts: bool,
     pub label: String,
     pub email: String,
     pub display_name: String,
@@ -80,6 +84,12 @@ pub struct AccountForm {
     pub smtp_security: Security,
     pub test: TestState,
     pub busy: bool,
+    /// The live Proton challenge, if the interactive adapter is waiting for an
+    /// answer. Only provider-owned prompts are stored; raw wire JSON never is.
+    pub proton_attempt: Option<pige_core::providers::AuthAttemptId>,
+    pub proton_challenge: Option<pige_core::auth::AuthChallenge>,
+    /// Redacted password/code/token input for the current Proton challenge.
+    pub proton_answer: String,
 }
 
 impl std::fmt::Debug for AccountForm {
@@ -90,6 +100,7 @@ impl std::fmt::Debug for AccountForm {
             .field("method", &self.method)
             .field("native", &self.native)
             .field("google_contacts", &self.google_contacts)
+            .field("proton_contacts", &self.proton_contacts)
             .field("label", &self.label)
             .field("email", &self.email)
             .field("display_name", &self.display_name)
@@ -104,6 +115,9 @@ impl std::fmt::Debug for AccountForm {
             .field("smtp_security", &self.smtp_security)
             .field("test", &self.test)
             .field("busy", &self.busy)
+            .field("proton_attempt", &self.proton_attempt)
+            .field("proton_challenge", &self.proton_challenge)
+            .field("proton_answer", &"<redacted>")
             .finish()
     }
 }
@@ -118,6 +132,7 @@ impl AccountForm {
             method: AccountMethod::Imap,
             native: false,
             google_contacts: false,
+            proton_contacts: false,
             label: "Personal".to_string(),
             email: String::new(),
             display_name: String::new(),
@@ -132,7 +147,29 @@ impl AccountForm {
             smtp_security: defaults.security,
             test: TestState::Idle,
             busy: false,
+            proton_attempt: None,
+            proton_challenge: None,
+            proton_answer: String::new(),
         }
+    }
+
+    /// Start the native Proton setup pane. Proton has no IMAP/SMTP endpoints
+    /// and no OAuth browser redirect: the interactive adapter asks for the
+    /// account password, two-step code, mailbox password and human
+    /// verification only when the server requires each one.
+    pub fn proton(email: String) -> Self {
+        let mut form = Self::new();
+        form.method = AccountMethod::Proton;
+        form.email = email;
+        form.proton_contacts = false;
+        // Proton has no IMAP/SMTP endpoints; never leave the Gmail preset
+        // values looking like a promised configuration.
+        form.imap_host.clear();
+        form.imap_port.clear();
+        form.smtp_host.clear();
+        form.smtp_port.clear();
+        form.preset = ProviderPreset::Manual;
+        form
     }
 
     /// Edit an existing account. The password is never read back from the
@@ -170,19 +207,29 @@ impl AccountForm {
             None => ProviderPreset::Manual,
         };
         let native = imap_smtp.is_none();
+        let proton = matches!(
+            account.backend,
+            pige_core::account::MailBackend::Proton { .. }
+        );
         let google_contacts = account.contact_sources.iter().any(|source| {
             source.id.as_str() == pige_core::account::GOOGLE_SAVED_CONTACTS_SOURCE_ID
                 && source.enabled
         });
+        let proton_contacts = account.contact_sources.iter().any(|source| {
+            source.id.as_str() == pige_core::account::PROTON_CONTACTS_SOURCE_ID && source.enabled
+        });
         Self {
             editing: Some(account.id.clone()),
-            method: if native {
+            method: if proton {
+                AccountMethod::Proton
+            } else if native {
                 AccountMethod::Google
             } else {
                 AccountMethod::Imap
             },
             native,
             google_contacts,
+            proton_contacts,
             label: account.label.clone(),
             email: account.email.clone(),
             display_name: account.display_name.clone(),
@@ -197,6 +244,9 @@ impl AccountForm {
             smtp_security,
             test: TestState::Idle,
             busy: false,
+            proton_attempt: None,
+            proton_challenge: None,
+            proton_answer: String::new(),
         }
     }
 
@@ -219,6 +269,88 @@ impl AccountForm {
             AccountField::SmtpPort => self.smtp_port = value,
         }
         self.test = TestState::Idle;
+    }
+
+    /// Record a live Proton challenge and clear the previous secret answer.
+    pub fn set_proton_challenge(
+        &mut self,
+        attempt: pige_core::providers::AuthAttemptId,
+        challenge: pige_core::auth::AuthChallenge,
+    ) {
+        self.proton_attempt = Some(attempt);
+        self.proton_challenge = Some(challenge);
+        self.proton_answer.clear();
+        self.busy = false;
+    }
+
+    /// Drop every in-flight Proton challenge (completed, cancelled, or closed).
+    pub fn clear_proton_challenge(&mut self) {
+        self.proton_attempt = None;
+        self.proton_challenge = None;
+        self.proton_answer.clear();
+    }
+
+    /// A user-facing prompt for the current Proton challenge. No raw server
+    /// challenge payload is rendered.
+    pub fn proton_prompt(&self) -> Option<String> {
+        use pige_core::auth::AuthChallenge;
+        match self.proton_challenge.as_ref()? {
+            AuthChallenge::Password { username } => Some(match username {
+                Some(username) if !username.trim().is_empty() => {
+                    format!("Enter the Proton account password for {username}.")
+                }
+                _ => "Enter your Proton account password.".to_string(),
+            }),
+            AuthChallenge::Totp => {
+                Some("Enter the six-digit two-step code from your authenticator.".to_string())
+            }
+            AuthChallenge::MailboxPassword => Some(
+                "Enter your Proton mailbox password to unlock this account's keys.".to_string(),
+            ),
+            AuthChallenge::HumanVerification(challenge) => {
+                Some(if challenge.instructions.is_empty() {
+                    "Complete Proton's human verification, then paste the verification token."
+                        .to_string()
+                } else if challenge.instructions.starts_with("https://") {
+                    "Complete Proton's human verification at the page below, then paste the verification token."
+                        .to_string()
+                } else {
+                    challenge.instructions.clone()
+                })
+            }
+            AuthChallenge::Unsupported { reason } => Some(reason.clone()),
+            AuthChallenge::Browser(_) => Some(
+                "This sign-in step is not supported by the Proton adapter in this build."
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Whether the current challenge accepts a typed secret/token.
+    pub fn proton_accepts_answer(&self) -> bool {
+        use pige_core::auth::AuthChallenge;
+        matches!(
+            self.proton_challenge,
+            Some(
+                AuthChallenge::Password { .. }
+                    | AuthChallenge::Totp
+                    | AuthChallenge::MailboxPassword
+                    | AuthChallenge::HumanVerification(_)
+            )
+        )
+    }
+
+    /// The verification page opened by the human-verification prompt, when the
+    /// provider supplied one.
+    pub fn proton_verification_url(&self) -> Option<&str> {
+        match self.proton_challenge.as_ref()? {
+            pige_core::auth::AuthChallenge::HumanVerification(challenge)
+                if challenge.instructions.starts_with("https://") =>
+            {
+                Some(challenge.instructions.as_str())
+            }
+            _ => None,
+        }
     }
 
     /// Fill the server fields from a provider preset. Manual clears them so the
@@ -253,7 +385,8 @@ impl AccountForm {
     /// `gmail.com` restriction always run first.
     pub fn choose_method(&mut self, method: AccountMethod) {
         if self.native {
-            self.method = AccountMethod::Google;
+            // A native account reconnects in place; it has no IMAP endpoints
+            // and must not be silently converted through a method chip.
             return;
         }
         if self.editing.is_some() {
@@ -323,6 +456,10 @@ pub struct AccountsState {
     pub label_drafts: HashMap<AccountId, String>,
     /// A persistent (non-snackbar) note, such as "Account removed".
     pub notice: Option<String>,
+    /// The contact opt-in carried by the in-flight Proton attempt. It is kept
+    /// outside the form so a list-row "Enable Proton contacts" action finishes
+    /// with the same intent even when no form is open.
+    pub proton_contacts_request: bool,
 }
 
 impl AccountsState {
@@ -342,16 +479,22 @@ impl AccountsState {
         self.start_new_with_google(false);
     }
 
-    /// Start the add-account form. When this build registers native Google, the
-    /// Google path is the default; manual IMAP stays one chip away.
-    pub fn start_new_with_google(&mut self, google_available: bool) {
+    /// Start the add-account form with the native providers this build offers.
+    pub fn start_new_with_providers(&mut self, google_available: bool, proton_available: bool) {
         let mut form = AccountForm::new();
-        if google_available {
+        if proton_available {
+            form.choose_method(AccountMethod::Proton);
+        } else if google_available {
             form.choose_method(AccountMethod::Google);
         }
         self.form = Some(form);
         self.confirm_remove = None;
         self.notice = None;
+    }
+
+    /// Backwards-compatible Google-only entry point used by older call sites.
+    pub fn start_new_with_google(&mut self, google_available: bool) {
+        self.start_new_with_providers(google_available, false);
     }
 
     pub fn edit(&mut self, account: &Account) {
@@ -398,7 +541,12 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
             .available_providers
             .iter()
             .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
-        form_view(form, google_available)
+        let proton_available = app
+            .snapshot
+            .available_providers
+            .iter()
+            .any(|provider| provider == pige_core::providers::PROTON_PROVIDER);
+        form_view(form, google_available, proton_available)
     } else {
         list_view(app)
     };
@@ -458,6 +606,11 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
         .available_providers
         .iter()
         .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
+    let proton_available = app
+        .snapshot
+        .available_providers
+        .iter()
+        .any(|provider| provider == pige_core::providers::PROTON_PROVIDER);
 
     let mut list = column![].spacing(palette.space.md).width(Fill);
     for account in &app.snapshot.accounts {
@@ -468,6 +621,7 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
             .unwrap_or(&account.label);
         let provider_label = match account.provider.as_str() {
             "gmail" => "Native Google",
+            "proton" => "Native Proton (E2E)",
             "imap-smtp" if looks_like_gmail(&account.email) => "Gmail over IMAP",
             "imap-smtp" => "IMAP/SMTP",
             other => other,
@@ -561,6 +715,31 @@ fn list_view<'a>(app: &'a App) -> Element<'a, Message> {
                 },
             ));
         }
+        if account.provider == pige_core::providers::PROTON_PROVIDER && proton_available {
+            let contacts_on = account.contact_sources.iter().any(|source| {
+                source.source.as_str() == pige_core::account::PROTON_CONTACTS_SOURCE_ID
+                    && source.enabled
+            });
+            google_actions = google_actions.push(components::button(
+                "Unlock / reconnect",
+                ButtonVariant::Outlined,
+                Message::ProtonAuth {
+                    account: Some(account.id.clone()),
+                    email: account.email.clone(),
+                    enable_contacts: contacts_on,
+                    resume: true,
+                },
+            ));
+            google_actions = google_actions.push(components::button(
+                if contacts_on {
+                    "Disable Proton contacts"
+                } else {
+                    "Enable Proton contacts"
+                },
+                ButtonVariant::Text,
+                Message::ProtonContactsToggle(account.id.clone(), !contacts_on),
+            ));
+        }
 
         list = list.push(
             container(
@@ -636,9 +815,15 @@ fn color_picker<'a>(account: &'a AccountSummary) -> Element<'a, Message> {
     .into()
 }
 
-fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, Message> {
+fn form_view<'a>(
+    form: &'a AccountForm,
+    google_available: bool,
+    proton_available: bool,
+) -> Element<'a, Message> {
     let palette = theme::active();
-    let title = if form.native {
+    let title = if form.native && form.method == AccountMethod::Proton {
+        "Proton account"
+    } else if form.native {
         "Google account"
     } else if form.editing.is_some() {
         "Edit account"
@@ -646,6 +831,7 @@ fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, M
         "Add account"
     };
     let is_google = form.method == AccountMethod::Google;
+    let is_proton = form.method == AccountMethod::Proton;
 
     let mut fields = column![styled(title, TextRole::TitleMedium, palette.on_surface)]
         .spacing(palette.space.md)
@@ -666,9 +852,22 @@ fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, M
                 palette.on_surface_variant,
             ));
         }
+        if proton_available {
+            methods = methods.push(components::chip(
+                "Proton account",
+                is_proton,
+                Message::AccountMethodChanged(AccountMethod::Proton),
+            ));
+        } else {
+            methods = methods.push(styled(
+                "Proton account (not available in this build)",
+                TextRole::LabelMedium,
+                palette.on_surface_variant,
+            ));
+        }
         methods = methods.push(components::chip(
             "IMAP/SMTP",
-            !is_google,
+            !is_google && !is_proton,
             Message::AccountMethodChanged(AccountMethod::Imap),
         ));
         fields = fields
@@ -714,6 +913,49 @@ fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, M
                     &form.display_name,
                     |value| Message::AccountFieldChanged(AccountField::DisplayName, value),
                 ));
+        }
+    } else if is_proton {
+        fields = fields.push(styled(
+            proton_setup_copy(),
+            TextRole::BodyMedium,
+            palette.on_surface_variant,
+        ));
+        fields = fields
+            .push(components::text_field("Email", &form.email, |value| {
+                Message::AccountFieldChanged(AccountField::Email, value)
+            }))
+            .push(components::text_field("Label", &form.label, |value| {
+                Message::AccountFieldChanged(AccountField::Label, value)
+            }))
+            .push(components::text_field(
+                "Display name",
+                &form.display_name,
+                |value| Message::AccountFieldChanged(AccountField::DisplayName, value),
+            ))
+            .push(components::chip(
+                "Sync Proton contacts (read-only, optional)",
+                form.proton_contacts,
+                Message::ProtonContactsToggled(!form.proton_contacts),
+            ));
+        if let TestState::Failed(error) = &form.test {
+            fields = fields.push(styled(error.clone(), TextRole::BodyMedium, palette.error));
+        }
+        if let Some(prompt) = form.proton_prompt() {
+            fields = fields.push(styled(prompt, TextRole::BodyMedium, palette.on_surface));
+            if form.proton_accepts_answer() {
+                fields = fields.push(components::password_field(
+                    "Proton answer",
+                    &form.proton_answer,
+                    |value| Message::ProtonAnswerChanged(crate::message::Password::new(value)),
+                ));
+            }
+            if let Some(url) = form.proton_verification_url() {
+                fields = fields.push(components::button(
+                    "Open verification page",
+                    ButtonVariant::Outlined,
+                    Message::OpenUrl(url.to_string()),
+                ));
+            }
         }
     } else {
         let mut providers = row![].spacing(palette.space.sm).align_y(Alignment::Center);
@@ -848,6 +1090,47 @@ fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, M
             ));
         }
         actions
+    } else if is_proton {
+        let mut actions = row![components::button(
+            "Cancel",
+            ButtonVariant::Text,
+            Message::AccountCancel
+        )]
+        .spacing(palette.space.sm)
+        .align_y(Alignment::Center);
+        if proton_available {
+            if form.proton_challenge.is_some() {
+                if form.proton_accepts_answer() {
+                    actions = actions.push(components::button(
+                        "Continue",
+                        ButtonVariant::Filled,
+                        Message::ProtonAuthSubmit,
+                    ));
+                }
+            } else {
+                actions = actions.push(components::button(
+                    if form.editing.is_some() {
+                        "Unlock / reconnect with Proton"
+                    } else {
+                        "Sign in with Proton"
+                    },
+                    ButtonVariant::Filled,
+                    Message::ProtonAuth {
+                        account: form.editing.clone(),
+                        email: form.email.clone(),
+                        enable_contacts: form.proton_contacts,
+                        resume: form.editing.is_some(),
+                    },
+                ));
+            }
+        } else {
+            actions = actions.push(styled(
+                "Native Proton is not available in this build.",
+                TextRole::LabelMedium,
+                palette.on_surface_variant,
+            ));
+        }
+        actions
     } else {
         let mut actions = row![
             components::button(
@@ -891,6 +1174,16 @@ fn form_view<'a>(form: &'a AccountForm, google_available: bool) -> Element<'a, M
     .width(Fill)
     .padding(palette.space.xl)
     .into()
+}
+
+/// Setup copy for the native Proton pane. It deliberately promises only the
+/// supported interactive flow and never IMAP, SMTP, OAuth or an app-password
+/// shortcut.
+pub fn proton_setup_copy() -> &'static str {
+    "Sign in directly with your Proton account email and password. Pige asks for \
+     two-step verification, the mailbox password and human verification only when \
+     Proton requires them. Mail is end-to-end encrypted where Proton provides keys; \
+     ordinary external recipients are labelled clearly before sending."
 }
 
 fn looks_like_gmail(email: &str) -> bool {
@@ -944,6 +1237,32 @@ fn styled<'a>(
 mod tests {
     use super::*;
     use crate::message::AccountSaveResult;
+
+    #[test]
+    fn proton_setup_has_no_imap_or_oauth_promise() {
+        let form = AccountForm::proton("alice@proton.me".to_string());
+        assert_eq!(form.method, AccountMethod::Proton);
+        assert_eq!(form.email, "alice@proton.me");
+        assert!(
+            form.imap_host.is_empty() && form.smtp_host.is_empty(),
+            "Proton setup must not invent IMAP/SMTP endpoints"
+        );
+        assert!(
+            form.password.is_empty(),
+            "the Proton password is requested by the interactive challenge, never the IMAP form field"
+        );
+        let copy = proton_setup_copy().to_ascii_lowercase();
+        for forbidden in ["imap", "smtp", "oauth", "app password"] {
+            assert!(
+                !copy.contains(forbidden),
+                "Proton setup copy must not promise {forbidden}: {copy}"
+            );
+        }
+        assert!(
+            copy.contains("password") && copy.contains("two-step"),
+            "Proton setup copy explains the interactive sign-in: {copy}"
+        );
+    }
 
     #[test]
     fn a_new_form_starts_with_gmail_defaults() {

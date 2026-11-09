@@ -160,6 +160,23 @@ pub struct AuthenticatedAccount {
 #[async_trait]
 pub trait AuthenticationService: Send {
     async fn begin(&mut self, request: AuthRequest) -> Result<AuthProgress, ProviderError>;
+
+    /// Start an attempt for a provider whose interactive login is keyed by an
+    /// account address rather than a local account id. `AuthRequest` deliberately
+    /// has no email field, so new Proton accounts use this entry point. The
+    /// default is unsupported: providers that only need `begin` are unchanged.
+    async fn begin_with_username(
+        &mut self,
+        _provider: ProviderId,
+        _username: &str,
+        _account: Option<AccountId>,
+        _enable_contacts: bool,
+    ) -> Result<AuthProgress, ProviderError> {
+        Err(ProviderError::unsupported(
+            "username-first authentication for this provider",
+        ))
+    }
+
     async fn respond(
         &mut self,
         attempt: &AuthAttemptId,

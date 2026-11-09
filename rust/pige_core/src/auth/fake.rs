@@ -290,6 +290,29 @@ impl super::AuthenticationService for FakeAuthService {
         })
     }
 
+    async fn begin_with_username(
+        &mut self,
+        provider: crate::providers::ProviderId,
+        username: &str,
+        account: Option<AccountId>,
+        enable_contacts: bool,
+    ) -> Result<AuthProgress, ProviderError> {
+        let progress = self
+            .begin(AuthRequest {
+                provider,
+                account,
+                enable_contacts,
+            })
+            .await?;
+        if let AuthProgress::Challenge { attempt, .. } = &progress
+            && let Some(state) = self.attempts.get_mut(attempt)
+        {
+            state.account.email = username.to_string();
+            state.account.label = username.to_string();
+        }
+        Ok(progress)
+    }
+
     async fn respond(
         &mut self,
         attempt: &AuthAttemptId,
@@ -356,7 +379,9 @@ impl super::AuthenticationService for FakeAuthService {
         let to_discard: Vec<(AuthAttemptId, StagedSecretRef)> = self
             .attempts
             .iter()
-            .filter(|(_, state)| state.account.id == *account && state.state == AttemptState::Pending)
+            .filter(|(_, state)| {
+                state.account.id == *account && state.state == AttemptState::Pending
+            })
             .map(|(attempt, state)| (attempt.clone(), state.staged.clone()))
             .collect();
         for (attempt, staged) in to_discard {

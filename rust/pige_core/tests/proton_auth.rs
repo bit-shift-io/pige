@@ -1009,6 +1009,42 @@ async fn fido_only_returns_unsupported() {
 }
 
 #[tokio::test]
+async fn unsupported_mode_is_actionable() {
+    let mut harness = Harness::new(MockConfig {
+        two_fa: 2,
+        ..MockConfig::default()
+    })
+    .await;
+    let (attempt, _) = challenge_attempt(harness.begin().await);
+    let (_, challenge) = challenge_attempt(
+        harness
+            .auth
+            .respond(
+                &attempt,
+                AuthAnswer::Password(SecretString::from("account-password")),
+            )
+            .await
+            .expect("FIDO-only account"),
+    );
+    let AuthChallenge::Unsupported { reason } = challenge else {
+        panic!("expected an unsupported-mode challenge, got {challenge:?}");
+    };
+    let lowercase = reason.to_ascii_lowercase();
+    assert!(
+        lowercase.contains("fido2"),
+        "the reason names the unsupported mode: {reason}"
+    );
+    assert!(
+        lowercase.contains("totp") && lowercase.contains("app password"),
+        "the reason tells the user an alternative sign-in path: {reason}"
+    );
+    assert!(
+        !reason.contains('{') && !reason.contains("challenge"),
+        "raw server challenge JSON is never shown: {reason}"
+    );
+}
+
+#[tokio::test]
 async fn refresh_rotation_survives_restart() {
     let harness = Harness::new(MockConfig::default()).await;
     harness.save_proton_secret("session-uid", "access-1", "refresh-1", "skp-secret");

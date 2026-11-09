@@ -236,7 +236,17 @@ impl ProtonRecipientPolicy {
             // Key lookup failures are never permission to send cleartext.
             let keys = self.fetch_recipient_keys(email, ctx).await?;
             let contact = contact_policy(&self.client, &materials, email)?;
-            let (security, public_key) = classify(&keys, contact.as_ref())?;
+            let (security, public_key) =
+                classify(&keys, contact.as_ref()).map_err(|mut error| {
+                    if error.kind == ErrorKind::Unsupported {
+                        error.safe_message = format!(
+                            "{} for {email}. Add a usable OpenPGP key, or turn off encryption \
+                         for this contact before sending.",
+                            error.safe_message
+                        );
+                    }
+                    error
+                })?;
             self.resolved.insert(
                 key,
                 RecipientMaterial {
@@ -463,11 +473,11 @@ fn card_signature_verified(client: &ProtonClient, card: &ContactCard) -> bool {
         .unlocked_keys()
         .with_keys(|keys| {
             let mut public_keys = Vec::new();
-            for stored in keys
-                .user_keys
-                .iter()
-                .chain(keys.addresses.iter().flat_map(|address| address.keys.iter()))
-            {
+            for stored in keys.user_keys.iter().chain(
+                keys.addresses
+                    .iter()
+                    .flat_map(|address| address.keys.iter()),
+            ) {
                 let Ok(private) = provider.private_key_import(
                     stored.armored.as_bytes(),
                     stored.passphrase.expose_secret().as_bytes(),
@@ -842,7 +852,8 @@ mod tests {
             keys: Vec::new(),
             unverified: Vec::new(),
         };
-        let (security, key) = classify(&keys, Some(&policy)).expect("sign-only is not verification");
+        let (security, key) =
+            classify(&keys, Some(&policy)).expect("sign-only is not verification");
         assert_eq!(security, DeliverySecurity::ExternalOrdinary);
         assert!(key.is_none());
     }
@@ -857,7 +868,9 @@ mod tests {
         let unauthenticated = ContactPolicy {
             verify: Some(true),
             keys: vec![ContactKey {
-                armored: "-----BEGIN PGP PUBLIC KEY BLOCK-----\nkey\n-----END PGP PUBLIC KEY BLOCK-----".into(),
+                armored:
+                    "-----BEGIN PGP PUBLIC KEY BLOCK-----\nkey\n-----END PGP PUBLIC KEY BLOCK-----"
+                        .into(),
                 authenticated: false,
             }],
             ..ContactPolicy::default()
@@ -867,7 +880,9 @@ mod tests {
         let authenticated = ContactPolicy {
             verify: Some(true),
             keys: vec![ContactKey {
-                armored: "-----BEGIN PGP PUBLIC KEY BLOCK-----\nkey\n-----END PGP PUBLIC KEY BLOCK-----".into(),
+                armored:
+                    "-----BEGIN PGP PUBLIC KEY BLOCK-----\nkey\n-----END PGP PUBLIC KEY BLOCK-----"
+                        .into(),
                 authenticated: true,
             }],
             ..ContactPolicy::default()

@@ -58,11 +58,13 @@ use mailbox::{INTERACTIVE_TIMEOUT, SYNC_TIMEOUT, open_session, scheduler_message
 const SYNC_PAGES: u32 = 8;
 
 pub use crate::contacts::{RecipientQuery, RecipientSuggestion, SuggestionSource};
-pub use crate::sync::history::LearningProgress;
+pub use crate::providers::{DeliveryClass, DeliveryClassification};
 pub use crate::settings::{Settings, ThemeMode};
+pub use crate::sync::history::LearningProgress;
 pub use accounts::{
-    answer_auth, await_platform_auth, begin_auth, can_switch_backend, cancel_auth, finish_auth,
-    finish_auth_with_contacts, poll_platform_auth, switch_backend,
+    answer_auth, await_platform_auth, begin_auth, begin_auth_with_username, can_switch_backend,
+    cancel_auth, finish_auth, finish_auth_with_contacts, poll_platform_auth, resume_auth,
+    switch_backend,
 };
 #[doc(hidden)]
 pub use accounts::{
@@ -79,7 +81,7 @@ pub use mutations::{
 };
 pub use snapshot::{
     AccountSection, AccountSummary, ContactSyncSummary, ConversationDetail, ConversationSummary,
-    FolderSummary, MessageBody, MessageSummary, ModelSnapshot, SyncStatus,
+    DeliveryPreview, FolderSummary, MessageBody, MessageSummary, ModelSnapshot, SyncStatus,
 };
 
 /// Database filename inside [`Config::data_dir`].
@@ -949,7 +951,10 @@ pub async fn learn_history_now(account: &AccountId) -> Result<LearningProgress, 
     };
 
     let ctx = sessions
-        .context(&account.id, crate::sync::history::HISTORY_FOREGROUND_TIMEOUT)
+        .context(
+            &account.id,
+            crate::sync::history::HISTORY_FOREGROUND_TIMEOUT,
+        )
         .map_err(|error| format!("{}: {}", account.label, error.safe_message))?;
     crate::sync::history::learn_account_slice(
         &store,
@@ -1501,8 +1506,7 @@ pub async fn restore_config(file_name: String) -> Result<ConfigOutcome, String> 
         if let Err(error) = state.config.credentials.delete_session(id) {
             log::warn!("clear session password for restored-away account {id}: {error}");
         }
-        if let Err(error) =
-            accounts::discard_switch_backup_reporting(&state.config.credentials, id)
+        if let Err(error) = accounts::discard_switch_backup_reporting(&state.config.credentials, id)
         {
             log::warn!("discard rollback backup for restored-away account {id}: {error}");
             warnings.push(format!(
@@ -1578,8 +1582,7 @@ pub async fn factory_reset() -> Result<ConfigOutcome, String> {
             log::warn!("clear session password during factory reset for {id}: {error}");
         }
         // Remove a rollback backup even if its intent row was already lost.
-        if let Err(error) =
-            accounts::discard_switch_backup_reporting(&state.config.credentials, id)
+        if let Err(error) = accounts::discard_switch_backup_reporting(&state.config.credentials, id)
         {
             log::warn!("discard rollback backup during factory reset for {id}: {error}");
             warnings.push(format!(
@@ -2884,6 +2887,7 @@ fn conversation_detail_from_store(
         })
         .collect();
     build_conversation_detail(
+        store,
         thread_id,
         account_id,
         messages,
@@ -2949,6 +2953,45 @@ fn message_text(store: &Store, message: &crate::mail::StoredMessage) -> String {
         .and_then(|body| body.plain_text)
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| message.snippet.clone())
+}
+
+/// Resolve each recipient's delivery classification before sending.
+///
+/// This is a network read through the account's submission service: Proton
+/// resolves its key/contact policy and blocks on any policy it cannot honor.
+/// Providers without a recipient-level policy return an empty preview, which
+/// the compose screen treats as "nothing to add" rather than an encryption
+/// claim. The message is not queued and no draft is created.
+pub async fn preview_delivery(message: &OutgoingMessage) -> Result<DeliveryPreview, String> {
+    let (config, sessions, account) = {
+        let guard = lock_state();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| not_initialized_message().to_string())?;
+        let account = find_account(&state.store, &message.account_id)?;
+        (state.config.clone(), state.sessions.clone(), account)
+    };
+    // Only Proton has a recipient-level security policy. Do not open an
+    // IMAP/Gmail connection just to render "nothing to add" in compose.
+    if account.provider_id().as_str() != crate::providers::PROTON_PROVIDER {
+        return Ok(DeliveryPreview::default());
+    }
+    let ctx = sessions
+        .context(&account.id, INTERACTIVE_TIMEOUT)
+        .map_err(|error| error.safe_message)?;
+    let mut session = config
+        .providers
+        .open(&account, &ctx)
+        .await
+        .map_err(|error| error.safe_message)?;
+    let service = session
+        .submission_service()
+        .map_err(mailbox::provider_message)?;
+    let recipients = service
+        .classify(message, &ctx)
+        .await
+        .map_err(|error| error.safe_message)?;
+    Ok(DeliveryPreview { recipients })
 }
 
 /// Queue a message durably, then try to flush this account's outbox. A network
@@ -3052,7 +3095,10 @@ pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> 
     let failure = entry.as_ref().and_then(|entry| match entry.state {
         send::SubmissionState::Rejected | send::SubmissionState::Uncertain => {
             entry.error.clone().or_else(|| {
-                Some("the message may already have been sent; check Sent before retrying".to_string())
+                Some(
+                    "the message may already have been sent; check Sent before retrying"
+                        .to_string(),
+                )
             })
         }
         _ => None,
@@ -3337,6 +3383,7 @@ fn verified_cached_attachment(cache_dir: &Path, path: &Path) -> Option<PathBuf> 
 /// Assemble the reader view for a conversation, attaching the newest message's
 /// resolved body and any cached bodies for earlier messages.
 fn build_conversation_detail(
+    store: &Store,
     thread_id: &ThreadId,
     account_id: &AccountId,
     messages: &[StoredMessage],
@@ -3375,6 +3422,9 @@ fn build_conversation_detail(
             } else {
                 earlier_bodies.get(&message.id).cloned()
             },
+            signature: store
+                .signature_status(&message.id)
+                .unwrap_or(crate::providers::SignatureStatus::NotApplicable),
         })
         .collect();
 
@@ -3739,9 +3789,7 @@ async fn sync_one(
             let has_pending = store
                 .outbox_pending(&target.id)
                 .is_ok_and(|pending| !pending.is_empty());
-            if has_pending
-                && let Some(service) = session.submission.as_mut()
-            {
+            if has_pending && let Some(service) = session.submission.as_mut() {
                 match send::flush_provider_outbox(store, &target, service.as_mut(), &sync_ctx).await
                 {
                     Ok(outbox) => outbox_errors.extend(outbox.errors),

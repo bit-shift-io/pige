@@ -140,6 +140,36 @@ pub async fn begin_auth(request: AuthRequest) -> Result<AuthProgress, String> {
         .map_err(|error| error.safe_message)
 }
 
+/// Start an interactive attempt for a provider that signs in with an account
+/// address before any local account exists. Proton's `AuthRequest` has no email
+/// field, so new Proton accounts must use this entry point; Google and IMAP
+/// intentionally keep their existing `begin` path.
+pub async fn begin_auth_with_username(
+    provider: crate::providers::ProviderId,
+    username: String,
+    account: Option<AccountId>,
+    enable_contacts: bool,
+) -> Result<AuthProgress, String> {
+    let service = auth_service()?;
+    let mut guard = service.lock().await;
+    guard
+        .begin_with_username(provider, &username, account, enable_contacts)
+        .await
+        .map_err(|error| error.safe_message)
+}
+
+/// Resume a stored provider session without a password. Proton's cold resume
+/// unlocks its key material from the protected mailbox key; a missing or
+/// expired session returns the adapter's actionable reauthentication error.
+pub async fn resume_auth(account: &AccountId) -> Result<AuthProgress, String> {
+    let service = auth_service()?;
+    let mut guard = service.lock().await;
+    guard
+        .resume(account)
+        .await
+        .map_err(|error| error.safe_message)
+}
+
 /// Answer a challenge on an interactive attempt.
 pub async fn answer_auth(
     attempt: &AuthAttemptId,
@@ -188,27 +218,43 @@ pub async fn poll_platform_auth(attempt: &AuthAttemptId) -> Result<Option<AuthPr
         .map_err(|error| error.safe_message)
 }
 
-/// Commit a completed native Google authentication, optionally attaching the
-/// R6 People contact sources the user opted into.
+/// Commit a completed native provider authentication, optionally attaching the
+/// R6 contact sources the user opted into.
 ///
-/// Contacts are a separate authorization (the attempt requested the contacts
-/// scopes), so the sources are registered only from this completed credential.
-/// The account/switch commit remains the same generation-fenced F10 path.
+/// Google contacts are a separate authorization, so its sources are registered
+/// only when the completed credential actually granted both People read
+/// scopes. Proton contacts are part of the account session and are read-only;
+/// the user's opt-in is enough to attach `proton.contacts`. The account/switch
+/// commit remains the same generation-fenced F10 path.
 pub async fn finish_auth_with_contacts(
     mut authenticated: AuthenticatedAccount,
     enable_contacts: bool,
 ) -> Result<(AccountId, ModelSnapshot), String> {
-    if enable_contacts
-        && authenticated.account.provider_id().as_str() != crate::providers::GMAIL_PROVIDER
-    {
-        return Err("contacts can only be enabled for a native Google account".to_string());
-    }
-    // The contacts capability follows the scopes Google actually granted, not
-    // the scopes this attempt requested. A user can decline the People consent
-    // while keeping mail, and that mail-only grant must not register sources.
-    let enable_contacts = enable_contacts && google_contacts_granted(&authenticated)?;
-    if enable_contacts {
-        for source in crate::account::google_contact_sources() {
+    let provider = authenticated.account.provider_id();
+    let sources = match provider.as_str() {
+        crate::providers::GMAIL_PROVIDER => {
+            // The contacts capability follows the scopes Google actually
+            // granted, not the scopes this attempt requested. A user can
+            // decline the People consent while keeping mail, and that mail-only
+            // grant must not register sources.
+            if enable_contacts && google_contacts_granted(&authenticated)? {
+                Some(crate::account::google_contact_sources())
+            } else {
+                None
+            }
+        }
+        crate::providers::PROTON_PROVIDER => {
+            enable_contacts.then(crate::account::proton_contact_sources)
+        }
+        _ if enable_contacts => {
+            return Err(
+                "contacts can only be enabled for a native Google or Proton account".to_string(),
+            );
+        }
+        _ => None,
+    };
+    if let Some(sources) = &sources {
+        for source in sources {
             match authenticated
                 .account
                 .contact_sources
@@ -216,19 +262,19 @@ pub async fn finish_auth_with_contacts(
                 .find(|existing| existing.id == source.id)
             {
                 Some(existing) => existing.enabled = true,
-                None => authenticated.account.contact_sources.push(source),
+                None => authenticated.account.contact_sources.push(source.clone()),
             }
         }
     }
     let (id, snapshot) = finish_auth(authenticated).await?;
-    if enable_contacts {
+    if let Some(sources) = sources {
         // R6 owns the durable source state. Register the same ids the account
         // configuration now lists so the next maintenance pass can run them.
         let guard = lock_state();
         let state = guard
             .as_ref()
             .ok_or_else(|| not_initialized_message().to_string())?;
-        for source in crate::account::google_contact_sources() {
+        for source in sources {
             state
                 .store
                 .upsert_contact_source_with_kind(&id, &source.id, None, &source.kind)
@@ -345,6 +391,32 @@ pub async fn finish_auth(
         state.ensure_writable()?;
 
         let mut account = authenticated.account.clone();
+        // A brand-new account must be backed by a live pending attempt. Account
+        // removal/reset delete pending rows even when the background provider
+        // revocation has not run yet, so a late completed login can never
+        // resurrect a removed account or save a staged credential.
+        let pending = state
+            .store
+            .pending_auth_for_account(&account.id)
+            .map_err(map_store)?;
+        let Some(pending) = pending else {
+            let secrets = CredentialSecretRepository::with_gate(
+                state.config.credentials.clone(),
+                state.store.clone(),
+            );
+            let _ = secrets.discard_staged(&authenticated.credential_ref);
+            return Err("the authentication attempt is no longer active; start again".to_string());
+        };
+        if pending.account.as_ref() != Some(&account.id) {
+            let secrets = CredentialSecretRepository::with_gate(
+                state.config.credentials.clone(),
+                state.store.clone(),
+            );
+            let _ = secrets.discard_staged(&authenticated.credential_ref);
+            return Err(
+                "the authentication attempt does not match this account; start again".to_string(),
+            );
+        }
         if !state.config.providers.supports(&account.provider_id()) {
             return Err(format!(
                 "the `{}` provider is not available in this build",

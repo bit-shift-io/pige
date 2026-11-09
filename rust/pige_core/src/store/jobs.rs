@@ -197,7 +197,11 @@ impl Store {
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map(|value| value.map(|value| value as u64).unwrap_or(INITIAL_GENERATION))
+            .map(|value| {
+                value
+                    .map(|value| value as u64)
+                    .unwrap_or(INITIAL_GENERATION)
+            })
             .map_err(StoreError::from)
     }
 
@@ -498,10 +502,43 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// The live pending-auth row for an account, if one exists. Account removal
+    /// and reset delete these rows, so a late completion cannot re-create an
+    /// account after the user removed it.
+    pub fn pending_auth_for_account(
+        &self,
+        account: &crate::account::AccountId,
+    ) -> Result<Option<PendingAuthRecord>, StoreError> {
+        let conn = self.connection();
+        conn.query_row(
+            "SELECT attempt_id, account_id, provider, credential_ref, generation,
+                    created_at, expires_at
+             FROM pending_auth WHERE account_id = ?1
+             ORDER BY created_at DESC LIMIT 1",
+            [&account.0],
+            |row| {
+                let account: Option<String> = row.get(1)?;
+                Ok(PendingAuthRecord {
+                    attempt: AuthAttemptId::new(row.get::<_, String>(0)?),
+                    account: account.map(AccountId),
+                    provider: crate::providers::ProviderId::from(row.get::<_, String>(2)?),
+                    credential_ref: row.get(3)?,
+                    generation: row.get::<_, i64>(4)? as u64,
+                    created_at_ms: row.get(5)?,
+                    expires_at_ms: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+    }
+
     /// Remove a pending attempt. Idempotent.
     pub fn remove_pending_auth(&self, attempt: &AuthAttemptId) -> Result<(), StoreError> {
-        self.connection()
-            .execute("DELETE FROM pending_auth WHERE attempt_id = ?1", [attempt.as_str()])?;
+        self.connection().execute(
+            "DELETE FROM pending_auth WHERE attempt_id = ?1",
+            [attempt.as_str()],
+        )?;
         Ok(())
     }
 
@@ -625,7 +662,10 @@ mod tests {
             .acquire_lease(&account, "process-b", Duration::from_secs(60))
             .unwrap();
         assert_eq!(second.fencing, 2);
-        assert!(matches!(store.ensure_lease(&first), Err(StoreError::LeaseLost)));
+        assert!(matches!(
+            store.ensure_lease(&first),
+            Err(StoreError::LeaseLost)
+        ));
     }
 
     #[test]
@@ -682,7 +722,12 @@ mod tests {
         let (_dir, store) = store();
         let account = AccountId::new();
         let lease = store
-            .fence_credential_write(&account, "cred-a", INITIAL_GENERATION, Duration::from_secs(30))
+            .fence_credential_write(
+                &account,
+                "cred-a",
+                INITIAL_GENERATION,
+                Duration::from_secs(30),
+            )
             .unwrap();
         assert_eq!(lease.fencing, 1);
         store.ensure_lease(&lease).unwrap();
@@ -705,12 +750,20 @@ mod tests {
         let (_dir, store) = store();
         let account = AccountId::new();
         let lease = store
-            .fence_credential_write(&account, "cred-a", INITIAL_GENERATION, Duration::from_secs(60))
+            .fence_credential_write(
+                &account,
+                "cred-a",
+                INITIAL_GENERATION,
+                Duration::from_secs(60),
+            )
             .unwrap();
         let next = store.invalidate_account(&account).unwrap();
         assert_eq!(next, 2);
         assert_eq!(store.generation(&account).unwrap(), 2);
-        assert!(matches!(store.ensure_lease(&lease), Err(StoreError::LeaseLost)));
+        assert!(matches!(
+            store.ensure_lease(&lease),
+            Err(StoreError::LeaseLost)
+        ));
         assert!(matches!(
             store.fence_credential_write(
                 &account,
@@ -753,7 +806,9 @@ mod tests {
             source: "INBOX".to_string(),
         };
         let cursor = ProviderCursor::new(1, "a");
-        store.set_checkpoint(&key, INITIAL_GENERATION, &cursor).unwrap();
+        store
+            .set_checkpoint(&key, INITIAL_GENERATION, &cursor)
+            .unwrap();
         assert_eq!(
             store.checkpoint(&key).unwrap(),
             Some(JournalCheckpoint {

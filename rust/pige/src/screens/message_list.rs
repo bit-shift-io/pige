@@ -76,7 +76,8 @@ pub fn list_pane<'a>(
             pane = pane.push(components::scroller(draft_rows(&drafts)));
         }
     } else if app.snapshot.conversations.is_empty() {
-        pane = pane.push(components::empty_state(empty_title(app), empty_body(app)));
+        let (title, body) = folder_empty_copy(app);
+        pane = pane.push(components::empty_state(&title, &body));
     } else {
         let mut rows = column![].spacing(0).width(Fill);
         for conversation in &app.snapshot.conversations {
@@ -214,18 +215,80 @@ fn folder_title(app: &App) -> &str {
         .map_or("All inboxes", |folder| folder.name.as_str())
 }
 
-fn empty_title(app: &App) -> &'static str {
+/// Copy for an empty conversation list. A sync failure is not an empty folder:
+/// a locked Proton mailbox (keys are not in memory after a restart) must read
+/// as a prompt to unlock, never as "nothing here".
+fn folder_empty_copy(app: &App) -> (String, String) {
     if app.snapshot.accounts.is_empty() {
-        "No accounts yet"
-    } else {
-        "Nothing here"
+        return (
+            "No accounts yet".to_string(),
+            "Use Add account in the navigation rail to connect your first mailbox.".to_string(),
+        );
     }
+    if let pige_core::api::SyncStatus::Error(error) = &app.snapshot.status {
+        let locked = error.to_ascii_lowercase().contains("unlock");
+        return (
+            if locked {
+                "Mailbox locked"
+            } else {
+                "Mail could not be synchronized"
+            }
+            .to_string(),
+            if locked {
+                "Unlock this mailbox by reconnecting the account. Open Accounts and choose Reconnect; cached mail stays available."
+                    .to_string()
+            } else {
+                format!("{error} Open Accounts to reconnect; cached mail stays available.")
+            },
+        );
+    }
+    (
+        "Nothing here".to_string(),
+        "This folder is empty, or its first sync has not finished.".to_string(),
+    )
 }
 
-fn empty_body(app: &App) -> &'static str {
-    if app.snapshot.accounts.is_empty() {
-        "Use Add account in the navigation rail to connect your first mailbox."
-    } else {
-        "This folder is empty, or its first sync has not finished."
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pige_core::api::{ModelSnapshot, SyncStatus};
+
+    fn app_with_status(status: SyncStatus) -> App {
+        let mut app = App::for_test();
+        app.snapshot = ModelSnapshot {
+            accounts: vec![pige_core::api::AccountSummary {
+                id: pige_core::account::AccountId("proton".to_string()),
+                label: "Proton".to_string(),
+                email: "alice@proton.me".to_string(),
+                unread: 0,
+                color: "#00897b".to_string(),
+                learning_paused: false,
+                contact_sources: Vec::new(),
+                provider: "proton".to_string(),
+                available: true,
+                unavailable_reason: None,
+            }],
+            status,
+            ..ModelSnapshot::default()
+        };
+        app
+    }
+
+    #[test]
+    fn mailbox_locked_prompts_unlock_not_empty_inbox() {
+        let app = app_with_status(SyncStatus::Error(
+            "Proton: unlock the Proton mailbox to continue".to_string(),
+        ));
+        let (title, body) = folder_empty_copy(&app);
+        assert_eq!(title, "Mailbox locked");
+        let body = body.to_ascii_lowercase();
+        assert!(
+            body.contains("unlock") && body.contains("reconnect"),
+            "the prompt tells the user how to unlock: {body}"
+        );
+        assert!(
+            !body.contains("folder is empty"),
+            "a locked mailbox must never be presented as an ordinary empty inbox: {body}"
+        );
     }
 }

@@ -11,14 +11,15 @@ use std::fmt;
 use async_trait::async_trait;
 
 use crate::account::Account;
+use crate::send::OutgoingMessage;
 
 use super::error::ProviderError;
 use super::types::{
-    BodyContent, ChangePage, CollectionRecord, ContactPage, ContactSourceId, HistoryPage,
-    HistoryRequest, IMAP_SMTP_PROVIDER, MutationRequest, MutationResult, OperationContext,
-    PreparedSubmission, ProviderCapabilities, ProviderCursor, ProviderId, ReconcileOutcome,
-    RemoteAttachmentId, RemoteMessageId, SentCopyPolicy, SubmissionOutcome, SubmissionReceipt,
-    SubmissionRequest, SyncRequest,
+    BodyContent, ChangePage, CollectionRecord, ContactPage, ContactSourceId,
+    DeliveryClassification, HistoryPage, HistoryRequest, IMAP_SMTP_PROVIDER, MutationRequest,
+    MutationResult, OperationContext, PreparedSubmission, ProviderCapabilities, ProviderCursor,
+    ProviderId, ReconcileOutcome, RemoteAttachmentId, RemoteMessageId, SentCopyPolicy,
+    SubmissionOutcome, SubmissionReceipt, SubmissionRequest, SyncRequest,
 };
 
 /// Read-side mailbox access: collections, bodies, attachments, and history.
@@ -74,6 +75,21 @@ pub trait MutationService: Send {
 pub trait SubmissionService: Send {
     /// Whether the provider writes the Sent copy itself or the client must.
     fn sent_copy_policy(&self) -> SentCopyPolicy;
+
+    /// Resolve the delivery classification for every recipient before sending.
+    ///
+    /// The default is an empty list: providers without a recipient-level
+    /// security policy (IMAP/SMTP, Gmail) have nothing to preview. A provider
+    /// that can refuse a recipient must return the same classification/error
+    /// its submission path enforces, so compose cannot show a weaker promise
+    /// than delivery keeps.
+    async fn classify(
+        &mut self,
+        _message: &OutgoingMessage,
+        _ctx: &OperationContext,
+    ) -> Result<Vec<DeliveryClassification>, ProviderError> {
+        Ok(Vec::new())
+    }
 
     async fn prepare(
         &mut self,

@@ -1049,6 +1049,18 @@ impl AuthenticationService for GoogleAuthentication {
             })
             .map(|(attempt, _)| attempt.clone())
             .collect();
+        let owns = !attempts.is_empty()
+            || matches!(
+                self.secrets
+                    .load(account)?
+                    .map(|envelope| envelope.credentials),
+                Some(crate::auth::StoredCredentials::Google(_))
+            );
+        if !owns {
+            // A composite authentication service offers revoke to every
+            // provider. Never delete a Proton (or other) credential here.
+            return Ok(());
+        }
         for attempt in attempts {
             self.discard_attempt(&attempt);
         }

@@ -29,9 +29,10 @@ use sha2::{Digest, Sha256};
 use crate::account::Account;
 use crate::mail::{Address, MAX_ATTACHMENT_BYTES};
 use crate::providers::{
-    ErrorKind, OperationContext, OperationId, PreparedSubmission, ProviderError, ProviderId,
-    ReconcileOutcome, RemoteMessageId, RemoteThreadId, SentCopyPolicy, SubmissionAttachment,
-    SubmissionOutcome, SubmissionReceipt, SubmissionRequest, SubmissionService,
+    DeliveryClass, DeliveryClassification, ErrorKind, OperationContext, OperationId,
+    PreparedSubmission, ProviderError, ProviderId, ReconcileOutcome, RemoteMessageId,
+    RemoteThreadId, SentCopyPolicy, SubmissionAttachment, SubmissionOutcome, SubmissionReceipt,
+    SubmissionRequest, SubmissionService,
 };
 use crate::send::OutgoingMessage;
 
@@ -445,6 +446,27 @@ struct Uploaded {
 impl SubmissionService for ProtonSubmission {
     fn sent_copy_policy(&self) -> SentCopyPolicy {
         SentCopyPolicy::ServerManaged
+    }
+
+    async fn classify(
+        &mut self,
+        message: &OutgoingMessage,
+        ctx: &OperationContext,
+    ) -> Result<Vec<DeliveryClassification>, ProviderError> {
+        let sender = self.sender_email().to_string();
+        self.policy.set_sender_alias(sender);
+        let deliveries = self.policy.resolve(message, ctx).await?;
+        Ok(deliveries
+            .into_iter()
+            .map(|delivery| DeliveryClassification {
+                address: delivery.address,
+                class: match delivery.security {
+                    DeliverySecurity::ProtonEncrypted => DeliveryClass::EndToEndEncrypted,
+                    DeliverySecurity::ExternalOpenPgp => DeliveryClass::ExternalOpenPgp,
+                    DeliverySecurity::ExternalOrdinary => DeliveryClass::ExternalOrdinary,
+                },
+            })
+            .collect())
     }
 
     async fn prepare(

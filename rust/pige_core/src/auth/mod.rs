@@ -15,9 +15,12 @@
 pub mod fake;
 #[cfg(feature = "provider-proton")]
 pub mod proton;
+pub mod router;
 pub mod secrets;
 pub mod session;
 pub mod types;
+
+pub use router::{AuthRouter, SharedAuthenticationService, compose as compose_auth_services};
 
 pub use fake::{FakeAuthScript, FakeAuthService, FakeTokenRefresher};
 pub use secrets::{
@@ -27,8 +30,9 @@ pub use secrets::{
 };
 pub use session::{AccountSessionManager, CachedTokenSource, TokenRefresher, TokenSource};
 pub use types::{
-    AuthAnswer, AuthChallenge, AuthProgress, AuthRequest, AuthenticatedAccount, AuthenticationService,
-    BrowserAnswer, BrowserChallenge, HumanChallenge, HumanVerificationAnswer, SecretPersistence,
+    AuthAnswer, AuthChallenge, AuthProgress, AuthRequest, AuthenticatedAccount,
+    AuthenticationService, BrowserAnswer, BrowserChallenge, HumanChallenge,
+    HumanVerificationAnswer, SecretPersistence,
 };
 
 /// Re-exported so callers can name the secret wrapper without adding the crate

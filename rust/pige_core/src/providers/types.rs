@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::account::AccountId;
-use crate::mail::{AttachmentDisposition, Flags, FolderKind, MessageHeader};
+use crate::mail::{Address, AttachmentDisposition, Flags, FolderKind, MessageHeader};
 
 use super::error::ProviderError;
 
@@ -320,6 +320,35 @@ pub enum SignatureStatus {
     Unverified,
     Invalid,
     Unsupported,
+}
+
+/// How a provider will protect one recipient's copy. This is a delivery
+/// classification, not a claim about the message body: an ordinary external
+/// classification is deliberately *not* encrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryClass {
+    /// Provider-native end-to-end encryption (for example Proton to Proton).
+    EndToEndEncrypted,
+    /// OpenPGP to an external recipient's public key.
+    ExternalOpenPgp,
+    /// Ordinary transport encryption only. The recipient copy is not
+    /// end-to-end encrypted and the compose UI must say so.
+    ExternalOrdinary,
+}
+
+impl DeliveryClass {
+    /// Whether the recipient's copy is protected end-to-end. `ExternalOrdinary`
+    /// is transport-protected at best, never an encryption badge.
+    pub fn is_encrypted(self) -> bool {
+        matches!(self, Self::EndToEndEncrypted | Self::ExternalOpenPgp)
+    }
+}
+
+/// One resolved recipient classification from a provider's delivery policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryClassification {
+    pub address: Address,
+    pub class: DeliveryClass,
 }
 
 /// One attachment offered by a fetched body, with the id used to fetch bytes.

@@ -22,7 +22,7 @@ use crate::account::{Account, AccountId, MailBackend};
 use crate::auth::{
     AccountSessionManager, AuthAnswer, AuthChallenge, AuthProgress, AuthRequest,
     AuthenticatedAccount, AuthenticationService, HumanChallenge, SecretPersistence,
-    SecretRepository, StagedSecretRef, TokenRefresher, proton::proton_secret,
+    SecretRepository, StagedSecretRef, StoredCredentials, TokenRefresher, proton::proton_secret,
 };
 use crate::providers::{
     AuthAttemptId, OperationContext, PROTON_PROVIDER, ProviderError, ProviderId,
@@ -86,12 +86,8 @@ async fn authenticated_http(
     access: SecretString,
 ) -> HttpClient {
     let http = HttpClient::new(endpoints.as_str(), PROTON_APP_VERSION);
-    http.set_tokens(
-        uid.to_string(),
-        access,
-        SecretString::from(String::new()),
-    )
-    .await;
+    http.set_tokens(uid.to_string(), access, SecretString::from(String::new()))
+        .await;
     http
 }
 
@@ -1013,8 +1009,7 @@ impl ProtonAuthentication {
             match fetch_user_and_addresses(&http).await {
                 Ok(material) => break material,
                 Err(error)
-                    if error.kind == crate::providers::ErrorKind::Reauthenticate
-                        && may_refresh =>
+                    if error.kind == crate::providers::ErrorKind::Reauthenticate && may_refresh =>
                 {
                     may_refresh = false;
                     access = None;
@@ -1098,6 +1093,21 @@ impl AuthenticationService for ProtonAuthentication {
         self.begin_inner(&username, request.account, request.enable_contacts)
     }
 
+    async fn begin_with_username(
+        &mut self,
+        provider: ProviderId,
+        username: &str,
+        account: Option<AccountId>,
+        enable_contacts: bool,
+    ) -> Result<AuthProgress, ProviderError> {
+        if provider != ProviderId::from(PROTON_PROVIDER) {
+            return Err(ProviderError::unsupported(
+                "Proton authentication for this provider",
+            ));
+        }
+        ProtonAuthentication::begin_with_username(self, username, account, enable_contacts).await
+    }
+
     async fn respond(
         &mut self,
         attempt: &AuthAttemptId,
@@ -1166,24 +1176,37 @@ impl AuthenticationService for ProtonAuthentication {
             .filter(|(_, state)| state.account.id == *account)
             .map(|(attempt, _)| attempt.clone())
             .collect();
-        for attempt in attempts {
-            self.discard_attempt(&attempt);
+        for attempt in &attempts {
+            self.discard_attempt(attempt);
         }
 
         // Capture the session tokens before deleting the credential; local
         // protection must not depend on the network.
-        let logout_tokens = match self.secrets.load(account) {
-            Ok(Some(envelope)) => proton_secret(envelope).ok().and_then(|secret| {
-                Some((secret.uid?, secret.access_token?))
-            }),
-            _ => None,
-        };
+        let loaded = self.secrets.load(account);
+        let owns = !attempts.is_empty()
+            || matches!(
+                loaded.as_ref(),
+                Ok(Some(envelope))
+                    if matches!(envelope.credentials, StoredCredentials::Proton(_))
+            );
+        // Key material is per adapter and keyed by account id: lock it even if
+        // this looks like another provider's account (a no-op for a Gmail id).
+        self.keys.lock_and_remove(account);
+        if !owns {
+            // A composite authentication service offers revoke to every
+            // provider. Never invalidate or delete another provider's session.
+            return Ok(());
+        }
+        let logout_tokens = loaded.ok().flatten().and_then(|envelope| {
+            proton_secret(envelope)
+                .ok()
+                .and_then(|secret| Some((secret.uid?, secret.access_token?)))
+        });
 
-        // Cancel live work, lock keys, and delete the credential first. Only then
-        // is a bounded best-effort server logout attempted; an unreachable or
+        // Cancel live work and delete the credential first. Only then is a
+        // bounded best-effort server logout attempted; an unreachable or
         // hostile endpoint cannot leave keys unlocked or contexts live.
         let invalidated = self.sessions.invalidate(account);
-        self.keys.lock_and_remove(account);
         let deleted = self.secrets.delete(account);
 
         if let Some((uid, access)) = logout_tokens {

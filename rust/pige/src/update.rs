@@ -7,10 +7,12 @@ use iced::window;
 use iced::{Subscription, Task};
 use pige_core::account::AccountId;
 use pige_core::api::{self, AccountInput, ConfigOutcome, ModelSnapshot};
-use pige_core::auth::{AuthChallenge, AuthProgress, AuthRequest};
+use pige_core::auth::{AuthAnswer, AuthChallenge, AuthProgress, AuthRequest};
 use pige_core::mail::{FolderId, FolderKind, ThreadId};
 use pige_core::platform::credentials_unavailable;
-use pige_core::providers::{AuthAttemptId, ContactSourceId, GMAIL_PROVIDER, ProviderId};
+use pige_core::providers::{
+    AuthAttemptId, ContactSourceId, GMAIL_PROVIDER, PROTON_PROVIDER, ProviderId,
+};
 use pige_core::settings::{Settings, ThemeMode};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -323,12 +325,10 @@ impl App {
                 // First run goes straight to the form; afterwards the screen
                 // shows the list so labels and removals are one click away.
                 if self.snapshot.accounts.is_empty() {
-                    let google_available = self
-                        .snapshot
-                        .available_providers
-                        .iter()
-                        .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
-                    self.accounts.start_new_with_google(google_available);
+                    let google_available = provider_available(&self.snapshot, GMAIL_PROVIDER);
+                    let proton_available = provider_available(&self.snapshot, PROTON_PROVIDER);
+                    self.accounts
+                        .start_new_with_providers(google_available, proton_available);
                 }
             }
             Message::CloseAccounts => {
@@ -337,12 +337,10 @@ impl App {
                 self.accounts.confirm_remove = None;
             }
             Message::AccountNew => {
-                let google_available = self
-                    .snapshot
-                    .available_providers
-                    .iter()
-                    .any(|provider| provider == pige_core::providers::GMAIL_PROVIDER);
-                self.accounts.start_new_with_google(google_available);
+                let google_available = provider_available(&self.snapshot, GMAIL_PROVIDER);
+                let proton_available = provider_available(&self.snapshot, PROTON_PROVIDER);
+                self.accounts
+                    .start_new_with_providers(google_available, proton_available);
             }
             Message::AccountEdit(id) => {
                 return Task::perform(async move { api::account(&id) }, Message::AccountLoaded);
@@ -351,7 +349,22 @@ impl App {
                 Ok(account) => self.accounts.edit(&account),
                 Err(error) => return self.show_toast(error),
             },
-            Message::AccountCancel => self.accounts.close_form(),
+            Message::AccountCancel => {
+                let attempt = self
+                    .accounts
+                    .form
+                    .as_ref()
+                    .and_then(|form| form.proton_attempt.clone());
+                self.accounts.close_form();
+                if let Some(attempt) = attempt {
+                    return Task::perform(
+                        async move {
+                            let _ = api::cancel_auth(&attempt).await;
+                        },
+                        |_| Message::Noop,
+                    );
+                }
+            }
             Message::AccountFieldChanged(field, value) => {
                 if let Some(form) = self.accounts.form.as_mut() {
                     let old_email = form.email.clone();
@@ -420,6 +433,141 @@ impl App {
                     return self.show_toast(error);
                 }
             },
+            Message::ProtonAuth {
+                account,
+                email,
+                enable_contacts,
+                resume,
+            } => {
+                self.accounts.proton_contacts_request = enable_contacts;
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.busy = true;
+                    form.test = TestState::Idle;
+                    form.clear_proton_challenge();
+                }
+                return Task::perform(
+                    proton_start(account, email, enable_contacts, resume),
+                    Message::ProtonAuthProgress,
+                );
+            }
+            Message::ProtonAuthProgress(result) => match result {
+                Ok(AuthProgress::Challenge { attempt, challenge }) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        if let AuthChallenge::Unsupported { reason } = &challenge {
+                            form.test = TestState::Failed(reason.clone());
+                        }
+                        form.set_proton_challenge(attempt, challenge);
+                    }
+                }
+                Ok(AuthProgress::Complete(authenticated)) => {
+                    let enable_contacts = self.accounts.proton_contacts_request;
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = true;
+                        form.clear_proton_challenge();
+                    }
+                    return Task::perform(
+                        proton_finish(authenticated, enable_contacts),
+                        Message::ProtonAuthFinished,
+                    );
+                }
+                Ok(AuthProgress::Cancelled) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.clear_proton_challenge();
+                    }
+                    self.accounts.notice = Some("Proton sign-in was cancelled.".to_string());
+                }
+                Err(error) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.test = TestState::Failed(error.clone());
+                    }
+                    return self.show_toast(error);
+                }
+            },
+            Message::ProtonAnswerChanged(password) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.proton_answer = password.into_inner();
+                }
+            }
+            Message::ProtonAuthSubmit => {
+                let Some(form) = self.accounts.form.as_mut() else {
+                    return Task::none();
+                };
+                let (Some(attempt), Some(challenge)) =
+                    (form.proton_attempt.clone(), form.proton_challenge.clone())
+                else {
+                    return Task::none();
+                };
+                if !form.proton_accepts_answer() {
+                    return Task::none();
+                }
+                let answer = std::mem::take(&mut form.proton_answer);
+                form.busy = true;
+                form.test = TestState::Idle;
+                return Task::perform(
+                    proton_answer(attempt, challenge, answer),
+                    Message::ProtonAuthProgress,
+                );
+            }
+            Message::ProtonAuthFinished(result) => match result {
+                Ok(Some(snapshot)) => {
+                    self.apply_snapshot(snapshot);
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.clear_proton_challenge();
+                    }
+                    self.accounts.close_form();
+                    self.accounts_open = false;
+                    return prefetch_task();
+                }
+                Ok(None) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.clear_proton_challenge();
+                    }
+                    self.accounts.notice = Some("Proton sign-in was cancelled.".to_string());
+                }
+                Err(error) => {
+                    if let Some(form) = self.accounts.form.as_mut() {
+                        form.busy = false;
+                        form.test = TestState::Failed(error.clone());
+                    }
+                    return self.show_toast(error);
+                }
+            },
+            Message::ProtonContactsToggled(enabled) => {
+                if let Some(form) = self.accounts.form.as_mut() {
+                    form.proton_contacts = enabled;
+                }
+            }
+            Message::ProtonContactsToggle(account, enabled) => {
+                if enabled {
+                    self.accounts.proton_contacts_request = true;
+                    let email = self
+                        .snapshot
+                        .accounts
+                        .iter()
+                        .find(|candidate| candidate.id == account)
+                        .map(|candidate| candidate.email.clone())
+                        .unwrap_or_default();
+                    return Task::perform(
+                        proton_start(Some(account), email, true, true),
+                        Message::ProtonAuthProgress,
+                    );
+                }
+                return Task::perform(
+                    async move {
+                        api::set_contact_sync(
+                            &account,
+                            &ContactSourceId::from(pige_core::account::PROTON_CONTACTS_SOURCE_ID),
+                            false,
+                        )?;
+                        Ok(Some(api::snapshot()))
+                    },
+                    Message::ProtonAuthFinished,
+                );
+            }
             Message::AccountPresetChanged(preset) => {
                 if let Some(form) = self.accounts.form.as_mut() {
                     form.choose_preset(preset);
@@ -600,6 +748,9 @@ impl App {
                         self.drawer_open = false;
                         self.accounts_open = false;
                         self.compose = Some(ComposeState::new(account));
+                        if let Some(compose) = self.compose.as_mut() {
+                            return delivery_preview_task(compose);
+                        }
                     }
                     None => {
                         return self.show_toast("Add an account before composing.".to_string());
@@ -613,6 +764,9 @@ impl App {
                     self.drawer_open = false;
                     self.accounts_open = false;
                     self.compose = Some(ComposeState::from_message(seed.message, seed.id));
+                    if let Some(compose) = self.compose.as_mut() {
+                        return delivery_preview_task(compose);
+                    }
                 }
                 Err(error) => return self.show_toast(error),
             },
@@ -629,6 +783,14 @@ impl App {
             Message::ComposeField(field, value) => {
                 if let Some(compose) = self.compose.as_mut() {
                     compose.apply_field(field, value);
+                    if field.is_recipient() {
+                        return delivery_preview_task(compose);
+                    }
+                }
+            }
+            Message::ComposeDeliveryChecked { generation, result } => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.apply_delivery(generation, result);
                 }
             }
             Message::ComposeCaret(field, caret) => {
@@ -706,15 +868,20 @@ impl App {
                     Ok(_) => {
                         // Only this explicit choice records evidence. Typing
                         // and merely viewing results never do.
-                        if let Some(address) = compose.take_pending_selection() {
+                        let recording = compose.take_pending_selection().map(|address| {
                             let account = key.account_id.clone();
-                            return Task::perform(
+                            Task::perform(
                                 async move {
                                     let _ = api::record_recipient_selection(&account, &address);
                                 },
                                 |_| Message::Noop,
-                            );
-                        }
+                            )
+                        });
+                        let delivery = delivery_preview_task(compose);
+                        return match recording {
+                            Some(recording) => Task::batch([recording, delivery]),
+                            None => delivery,
+                        };
                     }
                     Err(error) => compose.notice = Some(error),
                 }
@@ -735,6 +902,11 @@ impl App {
                 };
                 if compose.busy {
                     return Task::none();
+                }
+                if let Some(error) = compose.blocked_delivery() {
+                    let error = error.to_string();
+                    compose.notice = Some(error.clone());
+                    return self.show_toast(error);
                 }
                 let message = match compose.outgoing() {
                     Ok(message) => message,
@@ -1266,6 +1438,28 @@ impl App {
     }
 }
 
+/// Debounced recipient-delivery preview for compose. The generation makes an
+/// older response harmless if the user is still typing.
+fn delivery_preview_task(compose: &mut ComposeState) -> Task<Message> {
+    let Some((generation, message)) = compose.begin_delivery_check() else {
+        return Task::none();
+    };
+    Task::perform(
+        async move {
+            tokio::time::sleep(Duration::from_millis(450)).await;
+            api::preview_delivery(&message).await
+        },
+        move |result| Message::ComposeDeliveryChecked { generation, result },
+    )
+}
+
+fn provider_available(snapshot: &ModelSnapshot, provider: &str) -> bool {
+    snapshot
+        .available_providers
+        .iter()
+        .any(|available| available == provider)
+}
+
 /// Drive one native Google sign-in to completion and commit it.
 ///
 /// `switch_backend` is the only path that converts an existing IMAP account and
@@ -1320,6 +1514,79 @@ async fn google_auth(
             Err("Google sign-in needs another step; start again".to_string())
         }
     }
+}
+
+/// Start Proton sign-in. A reconnect first tries the stored session resume
+/// (which unlocks keys from the protected mailbox key); if that reports a
+/// missing/expired session, the interactive password/TOTP/mailbox-password
+/// flow starts instead. A new account always uses the username-first entry
+/// point because `AuthRequest` carries no email.
+async fn proton_start(
+    account: Option<AccountId>,
+    email: String,
+    enable_contacts: bool,
+    resume: bool,
+) -> Result<AuthProgress, String> {
+    if !api::provider_available(PROTON_PROVIDER)? {
+        return Err("Native Proton is not available in this build".to_string());
+    }
+    if resume && let Some(id) = account.as_ref() {
+        match api::resume_auth(id).await {
+            Ok(progress) => return Ok(progress),
+            Err(error) => log::debug!("Proton resume needs interactive sign-in: {error}"),
+        }
+    }
+    let email = email.trim().to_string();
+    if email.is_empty() {
+        return Err("Enter your Proton account email first.".to_string());
+    }
+    api::begin_auth_with_username(
+        ProviderId::from(PROTON_PROVIDER),
+        email,
+        account,
+        enable_contacts,
+    )
+    .await
+}
+
+/// Answer the current Proton challenge. The challenge type selects the
+/// provider-neutral answer variant; the answer itself never leaves this task
+/// except through the protected auth service.
+async fn proton_answer(
+    attempt: AuthAttemptId,
+    challenge: AuthChallenge,
+    answer: String,
+) -> Result<AuthProgress, String> {
+    let secret = pige_core::auth::secrecy::SecretString::from(answer);
+    let answer = match challenge {
+        AuthChallenge::Password { .. } => AuthAnswer::Password(secret),
+        AuthChallenge::Totp => AuthAnswer::Totp(secret),
+        AuthChallenge::MailboxPassword => AuthAnswer::MailboxPassword(secret),
+        AuthChallenge::HumanVerification(_) => {
+            AuthAnswer::HumanVerification(pige_core::auth::HumanVerificationAnswer {
+                token: pige_core::auth::secrecy::ExposeSecret::expose_secret(&secret).to_string(),
+            })
+        }
+        AuthChallenge::Unsupported { .. } | AuthChallenge::Browser(_) => {
+            return Err("This Proton sign-in step needs no answer; start again.".to_string());
+        }
+    };
+    api::answer_auth(&attempt, answer).await
+}
+
+async fn proton_finish(
+    authenticated: pige_core::auth::AuthenticatedAccount,
+    enable_contacts: bool,
+) -> Result<Option<ModelSnapshot>, String> {
+    let (id, snapshot) = api::finish_auth_with_contacts(authenticated, enable_contacts).await?;
+    let snapshot = match api::sync_account(&id).await {
+        Ok(synced) => synced,
+        Err(error) => {
+            log::warn!("first Proton sync: {error}");
+            snapshot
+        }
+    };
+    Ok(Some(snapshot))
 }
 
 async fn wait_for_android_auth(attempt: &AuthAttemptId) -> Result<AuthProgress, String> {
@@ -1484,6 +1751,7 @@ mod tests {
                     has_attachments: false,
                     attachments: vec![],
                     body: Some(api::MessageBody::Loading),
+                    signature: pige_core::providers::SignatureStatus::NotApplicable,
                 }],
             }),
             ..ModelSnapshot::default()
