@@ -197,6 +197,57 @@ pub(crate) fn recipient_account_search_sql(token_count: usize, exact: bool) -> S
     }
 }
 
+/// The SQL for one account's bounded candidate page driven by a selective
+/// token prefix.
+///
+/// The rank-index scan above is ideal for a broad prefix: every early row
+/// matches, so `LIMIT` stops immediately. It is poor for a selective prefix
+/// whose few matches rank late, because every preceding row pays an
+/// `EXISTS` probe. When the lookup has already verified that `driving` token
+/// matches at most a small bounded number of tokens, drive from
+/// `recipient_tokens_token` instead, join the rank row, and sort only that small
+/// set. The same rank order, exact-match exclusion, and cap are preserved.
+///
+/// Bind parameters are identical to [`recipient_account_search_sql`].
+pub(crate) fn recipient_account_token_search_sql(token_count: usize, driving: usize) -> String {
+    let token_predicates = (0..token_count)
+        .filter(|slot| *slot != driving)
+        .map(|slot| {
+            format!(
+                "AND EXISTS (SELECT 1 FROM recipient_tokens \
+                 WHERE recipient_tokens.account_id = r.account_id \
+                   AND recipient_tokens.address_key = r.address_key \
+                   AND recipient_tokens.token >= ?{lower} \
+                   AND recipient_tokens.token < ?{upper})",
+                lower = 3 + slot * 2,
+                upper = 4 + slot * 2,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = 3 + driving * 2;
+    let upper = 4 + driving * 2;
+    let cap = 3 + token_count * 2;
+    format!(
+        "SELECT DISTINCT r.account_id, r.address_key, r.email, r.display_name,
+                r.saved_contact, r.other_contact, r.outgoing, r.selected,
+                r.incoming, r.low_trust_only, r.last_seen, r.frequency, r.tier
+         FROM recipient_tokens t INDEXED BY recipient_tokens_token
+         CROSS JOIN recipient_index r
+         WHERE t.account_id = ?1
+           AND t.token >= ?{lower}
+           AND t.token < ?{upper}
+           AND r.account_id = t.account_id
+           AND r.address_key = t.address_key
+           AND r.account_id = ?1
+           AND r.low_trust_only = 0
+           AND NOT (r.email_folded = ?2 OR r.name_folded = ?2)
+           {token_predicates}
+         ORDER BY r.tier ASC, r.last_seen DESC, r.frequency DESC, r.address_key ASC
+         LIMIT ?{cap}"
+    )
+}
+
 /// Merge per-account rows into one suggestion per exact address, suppress
 /// blocked/self identities, rank, and truncate.
 pub fn rank_candidates(

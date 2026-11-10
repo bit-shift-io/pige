@@ -18,8 +18,8 @@ use crate::account::AccountId;
 use crate::contacts::learn;
 use crate::contacts::normalize::normalize_address;
 use crate::contacts::rank::{
-    MAX_FREQUENCY, OTHER_CONTACT_KIND, RecipientCandidate, recipient_account_search_sql,
-    recipient_search_tokens,
+    MAX_FREQUENCY, OTHER_CONTACT_KIND, RecipientCandidate, prefix_upper_bound,
+    recipient_account_search_sql, recipient_account_token_search_sql, recipient_search_tokens,
 };
 use crate::contacts::types::{
     AddressKey, EvidenceId, HeaderRole, LearningOrigin, Observation, ObservationTrust,
@@ -710,7 +710,19 @@ impl Store {
         let mut steps = 0i64;
         for account in accounts {
             for exact in [true, false] {
-                let sql = recipient_account_search_sql(tokens.len(), exact);
+                let sql = if exact {
+                    recipient_account_search_sql(tokens.len(), true)
+                } else {
+                    let (drive, probe_steps) = choose_prefix_drive(&conn, &account, tokens)?;
+                    steps += probe_steps;
+                    match drive {
+                        PrefixDrive::NoMatches => continue,
+                        PrefixDrive::Token(driving) => {
+                            recipient_account_token_search_sql(tokens.len(), driving)
+                        }
+                        PrefixDrive::Rank => recipient_account_search_sql(tokens.len(), false),
+                    }
+                };
                 let values = recipient_query_values(&account, folded_query, tokens, cap);
                 let mut statement = conn.prepare(&sql)?;
                 {
@@ -743,10 +755,18 @@ impl Store {
         for account in store_account_ids(&conn)? {
             for exact in [true, false] {
                 let label = if exact { "exact" } else { "prefix" };
-                let sql = format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    recipient_account_search_sql(tokens.len(), exact)
-                );
+                let sql = if exact {
+                    recipient_account_search_sql(tokens.len(), true)
+                } else {
+                    match choose_prefix_drive(&conn, &account, tokens)?.0 {
+                        PrefixDrive::NoMatches => continue,
+                        PrefixDrive::Token(driving) => {
+                            recipient_account_token_search_sql(tokens.len(), driving)
+                        }
+                        PrefixDrive::Rank => recipient_account_search_sql(tokens.len(), false),
+                    }
+                };
+                let sql = format!("EXPLAIN QUERY PLAN {sql}");
                 let values = recipient_query_values(&account, folded_query, tokens, cap);
                 let mut statement = conn.prepare(&sql)?;
                 let mut rows = statement.query(params_from_iter(values))?;
@@ -768,6 +788,120 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// How one account's prefix branch should be executed.
+enum PrefixDrive {
+    /// The rank-index scan is the right plan (broad or short prefix).
+    Rank,
+    /// Drive from this token's prefix because it matches a small bounded set.
+    Token(usize),
+    /// At least one query token has no matches, so the prefix branch is empty.
+    NoMatches,
+}
+
+/// Tokens whose prefixes match at most this many rows are cheap enough to drive
+/// the lookup. Bigger ranges use the rank-index scan, which stops at the cap.
+const PREFIX_DRIVE_LIMIT: usize = 4_096;
+
+/// Pick the cheapest bounded prefix strategy without scanning an unbounded
+/// token range. Each probe stops after [`PREFIX_DRIVE_LIMIT`] + 1 rows, so even
+/// a broad token costs bounded index work. Very short tokens (one or two
+/// characters) probe for "no match" only, keeping the historical short-prefix
+/// plan and its low step count.
+fn choose_prefix_drive(
+    conn: &rusqlite::Connection,
+    account: &str,
+    tokens: &[String],
+) -> Result<(PrefixDrive, i64), StoreError> {
+    if tokens.is_empty() {
+        return Ok((PrefixDrive::NoMatches, 0));
+    }
+    // A pathological number of query words is cheaper to answer with the
+    // rank-index scan than with one bounded probe per word.
+    if tokens.len() > 8 {
+        return Ok((PrefixDrive::Rank, 0));
+    }
+
+    let mut steps = 0i64;
+    let mut short = false;
+    let mut exact_one = None;
+
+    // First pass: detect any token with no matches and any token that matches
+    // exactly one projection row. A unique token is automatically the most
+    // selective drive, so the common selective query stops after two rows per
+    // token instead of probing every prefix up to the large bound.
+    for (index, token) in tokens.iter().enumerate() {
+        let (count, probe_steps) = probe_prefix(conn, account, token, 2)?;
+        steps += probe_steps;
+        if count == 0 {
+            return Ok((PrefixDrive::NoMatches, steps));
+        }
+        if token.chars().count() <= 2 {
+            short = true;
+        }
+        if count == 1 && exact_one.is_none() {
+            exact_one = Some(index);
+        }
+    }
+    if let Some(index) = exact_one {
+        return Ok((PrefixDrive::Token(index), steps));
+    }
+    // Short prefixes are answered by the historical rank-index plan; it is
+    // already optimal when almost every row matches.
+    if short {
+        return Ok((PrefixDrive::Rank, steps));
+    }
+
+    // Second pass: find the rarest token, stopping each probe at the drive
+    // bound. If even the rarest prefix is larger than the bound, use the rank
+    // index scan, which stops at the result cap instead of sorting the range.
+    let mut best: Option<(usize, usize)> = None;
+    for (index, token) in tokens.iter().enumerate() {
+        let (count, probe_steps) =
+            probe_prefix(conn, account, token, PREFIX_DRIVE_LIMIT as i64 + 1)?;
+        steps += probe_steps;
+        if count == 0 {
+            return Ok((PrefixDrive::NoMatches, steps));
+        }
+        if best.is_none_or(|(_, best_count)| count < best_count) {
+            best = Some((index, count));
+        }
+    }
+
+    match best {
+        Some((index, count)) if count <= PREFIX_DRIVE_LIMIT => {
+            Ok((PrefixDrive::Token(index), steps))
+        }
+        _ => Ok((PrefixDrive::Rank, steps)),
+    }
+}
+
+/// Count one token's prefix range, stopping at `limit`. A fresh statement is
+/// used so `VmStep` reports this probe rather than a cached statement's total.
+fn probe_prefix(
+    conn: &rusqlite::Connection,
+    account: &str,
+    token: &str,
+    limit: i64,
+) -> Result<(usize, i64), StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT 1 FROM recipient_tokens INDEXED BY recipient_tokens_token
+         WHERE account_id = ?1 AND token >= ?2 AND token < ?3
+         LIMIT ?4",
+    )?;
+    let mut count = 0usize;
+    {
+        let mut rows =
+            statement.query(params![account, token, prefix_upper_bound(token), limit])?;
+        while rows.next()?.is_some() {
+            count += 1;
+        }
+    }
+    Ok((
+        count,
+        i64::from(statement.get_status(StatementStatus::VmStep)),
+    ))
 }
 
 fn store_account_ids(conn: &rusqlite::Connection) -> Result<Vec<String>, StoreError> {
