@@ -42,9 +42,17 @@ directory.
 | Released desktop artifact | `dist/pige-2026.11.5-linux-x86_64` | PASS | `release-artifacts.txt` |
 | Released Android artifact | `dist/pige-2026.11.5-android-arm64.apk` | PASS | `release-artifacts.txt` |
 
-The verify script is intentionally credential-free and never runs an ignored
-live test. It refuses `PIGE_TEST_ALLOW_SEND=1`, so the ordinary default run can
-never send mail.
+The recorded run on 2026-11-10 was:
+
+- default: **638 passed, 0 failed, 28 ignored**;
+- all features: **792 passed, 0 failed, 34 ignored**.
+
+Clippy completes without errors. The only warnings are the pre-existing unused
+imports inside the vendored `proton-core` fork and the gate's advisory note that
+the allow-listed Proton crates publish a license file rather than SPDX
+metadata. The verify script is intentionally credential-free and never runs an
+ignored live test. It refuses `PIGE_TEST_ALLOW_SEND=1`, so the ordinary default
+run can never send mail.
 
 ## Live provider matrix
 
