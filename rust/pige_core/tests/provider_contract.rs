@@ -5,15 +5,33 @@
 //! [`ProviderCursor`] values opaque, short-circuiting an already-cancelled
 //! context before any network work, and never leaking adapter wire payloads
 //! through a [`ProviderError`]'s `Display`/`Debug`.
+//!
+//! The shared `common::provider_contract::run_suite` additionally runs the
+//! provider-neutral conformance checks against the scripted fake, the IMAP
+//! adapter over a scripted transport, and (with the matching feature) the
+//! native Gmail/Proton adapters with injected credentials and no live network.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use pige_core::FolderKind;
 use pige_core::account::{Account, AccountId, AuthKind, MailBackend, Security, ServerConfig};
+use pige_core::auth::CredentialSecretRepository;
+use pige_core::platform::CredentialStore;
+use pige_core::platform::fake::{FakeCredentials, FakeTransportFactory};
 use pige_core::providers::{
-    ErrorKind, OperationContext, ProviderCursor, ProviderError, ProviderFactory, ProviderId,
-    ProviderRegistry, SentCopyPolicy, SyncRequest, fake::FakeProviderFactory,
+    CollectionRecord, ContactCapabilities, ErrorKind, MutationCapabilities, OperationContext,
+    ProviderCapabilities, ProviderCursor, ProviderError, ProviderFactory, ProviderId,
+    ProviderRegistry, ProviderSession, RemoteCollectionId, SentCopyPolicy, SyncRequest,
+    fake::{FakeProviderFactory, FakeProviderSession},
+    imap::{ImapProviderFactory, imap_capabilities},
 };
+use pige_core::transport::{Capabilities, FakeTransport, FolderState, RemoteFolder};
+
+use common::provider_contract::{ContractFixture, ProviderTestHarness, run_suite};
 
 /// The existing IMAP/SMTP account shape always reports the `imap-smtp` backend.
 fn account() -> Account {
@@ -203,4 +221,466 @@ fn errors_redact_wire_payloads() {
         "Display leaked the wire payload: {display}"
     );
     assert!(display.contains("sign-in required"));
+}
+
+// ---------------------------------------------------------------------------
+// Shared conformance suite drivers
+// ---------------------------------------------------------------------------
+
+fn full_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        mailbox: true,
+        sync: true,
+        mutations: MutationCapabilities {
+            read: true,
+            star: true,
+            labels: true,
+            move_messages: true,
+            archive: true,
+            trash: true,
+            permanent_delete: true,
+        },
+        submission: true,
+        contacts: ContactCapabilities {
+            read: true,
+            incremental_sync: true,
+            remote_search: false,
+            write: false,
+            groups: false,
+        },
+        server_search: false,
+    }
+}
+
+fn collection(remote: &str, name: &str, kind: FolderKind) -> CollectionRecord {
+    CollectionRecord {
+        remote_id: RemoteCollectionId::new(remote),
+        name: name.to_string(),
+        kind,
+        delimiter: Some("/".to_string()),
+        total: None,
+        unread: None,
+    }
+}
+
+struct FakeHarness {
+    factory: Arc<FakeProviderFactory>,
+    account: Account,
+    collections: Vec<CollectionRecord>,
+}
+
+impl FakeHarness {
+    fn new() -> Self {
+        let collections = vec![
+            collection("remote-inbox", "INBOX", FolderKind::Inbox),
+            collection("remote-sent", "Sent", FolderKind::Sent),
+        ];
+        let factory = Arc::new(
+            FakeProviderFactory::new()
+                .session(FakeProviderSession::new().collections(collections.clone())),
+        );
+        Self {
+            factory,
+            account: account(),
+            collections,
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderTestHarness for FakeHarness {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn account(&self) -> Account {
+        self.account.clone()
+    }
+
+    fn expected_capabilities(&self) -> ProviderCapabilities {
+        full_capabilities()
+    }
+
+    async fn open(&self, ctx: &OperationContext) -> Result<ProviderSession, ProviderError> {
+        self.factory.open(&self.account, ctx).await
+    }
+
+    fn fixture(&self) -> ContractFixture {
+        ContractFixture {
+            collections: Some(self.collections.clone()),
+            sent_copy_policy: Some(SentCopyPolicy::ClientAppend),
+        }
+    }
+
+    fn reset_events(&self) {
+        self.factory.recorder().clear();
+    }
+}
+
+struct ImapHarness {
+    factory: ImapProviderFactory,
+    account: Account,
+    collections: Vec<CollectionRecord>,
+}
+
+impl ImapHarness {
+    fn new() -> Self {
+        let account = account();
+        let folders = vec![
+            RemoteFolder {
+                name: "INBOX".to_string(),
+                delimiter: Some("/".to_string()),
+                kind: FolderKind::Inbox,
+            },
+            RemoteFolder {
+                name: "Sent".to_string(),
+                delimiter: Some("/".to_string()),
+                kind: FolderKind::Sent,
+            },
+        ];
+        let states = [
+            (
+                "INBOX".to_string(),
+                FolderState {
+                    uidvalidity: 1,
+                    uidnext: 2,
+                    exists: 1,
+                },
+            ),
+            (
+                "Sent".to_string(),
+                FolderState {
+                    uidvalidity: 1,
+                    uidnext: 1,
+                    exists: 0,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let transports = Arc::new(FakeTransportFactory::default());
+        transports.add_transport(
+            account.id.clone(),
+            FakeTransport {
+                folders: folders.clone(),
+                states,
+                ..FakeTransport::default()
+            },
+        );
+        let credentials: Arc<dyn CredentialStore> = Arc::new(FakeCredentials::new());
+        let factory = ImapProviderFactory::new(
+            transports,
+            Arc::new(CredentialSecretRepository::new(credentials)),
+        );
+        let collections = folders
+            .into_iter()
+            .map(|folder| CollectionRecord {
+                remote_id: pige_core::providers::imap::identity::collection_remote_id(&folder.name),
+                name: folder.name,
+                kind: folder.kind,
+                delimiter: folder.delimiter,
+                total: None,
+                unread: None,
+            })
+            .collect();
+        Self {
+            factory,
+            account,
+            collections,
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderTestHarness for ImapHarness {
+    fn name(&self) -> &'static str {
+        "imap"
+    }
+
+    fn account(&self) -> Account {
+        self.account.clone()
+    }
+
+    fn expected_capabilities(&self) -> ProviderCapabilities {
+        imap_capabilities(Capabilities::default())
+    }
+
+    async fn open(&self, ctx: &OperationContext) -> Result<ProviderSession, ProviderError> {
+        self.factory.open(&self.account, ctx).await
+    }
+
+    fn fixture(&self) -> ContractFixture {
+        ContractFixture {
+            collections: Some(self.collections.clone()),
+            sent_copy_policy: Some(SentCopyPolicy::ClientAppend),
+        }
+    }
+}
+
+#[tokio::test]
+async fn fake_provider_matches_the_shared_contract() {
+    run_suite(FakeHarness::new()).await;
+}
+
+#[tokio::test]
+async fn imap_provider_matches_the_shared_contract() {
+    run_suite(ImapHarness::new()).await;
+}
+
+#[cfg(feature = "provider-google")]
+mod google_contract {
+    use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    use pige_core::auth::{AccountSessionManager, TokenSource};
+    use pige_core::providers::google::{
+        GMAIL_MODIFY_SCOPE, GoogleEndpoints, GoogleProviderFactory, GoogleTokenSourceProvider,
+    };
+    use pige_core::providers::{GMAIL_PROVIDER, ProviderError};
+    use pige_core::store::Store;
+    use pige_core::{AccountId, MailBackend};
+
+    struct FixedTokenSource;
+
+    #[async_trait]
+    impl TokenSource for FixedTokenSource {
+        async fn access_token(
+            &self,
+            _ctx: &OperationContext,
+        ) -> Result<SecretString, ProviderError> {
+            Ok(SecretString::from("synthetic-access-token"))
+        }
+    }
+
+    struct FixedSources;
+
+    impl GoogleTokenSourceProvider for FixedSources {
+        fn token_source(
+            &self,
+            _account: &AccountId,
+        ) -> Result<Arc<dyn TokenSource>, ProviderError> {
+            Ok(Arc::new(FixedTokenSource))
+        }
+    }
+
+    struct GoogleHarness {
+        _dir: TempDir,
+        factory: GoogleProviderFactory,
+        account: Account,
+    }
+
+    impl GoogleHarness {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("temp dir");
+            let store = Arc::new(Store::open(dir.path().join("pige.db")).expect("store"));
+            store.migrate().expect("migrate");
+            let sessions = Arc::new(AccountSessionManager::new(store));
+            let endpoints = GoogleEndpoints {
+                gmail_base: url::Url::parse("https://gmail.invalid").expect("gmail url"),
+                people_base: url::Url::parse("https://people.invalid").expect("people url"),
+            };
+            let factory = GoogleProviderFactory::new(sessions, endpoints)
+                .with_token_source_provider(Arc::new(FixedSources));
+            let account = Account {
+                id: AccountId::new(),
+                label: "Gmail".to_string(),
+                email: "person@example.com".to_string(),
+                display_name: "Person".to_string(),
+                backend: MailBackend::gmail("google-user-contract"),
+                contact_sources: Vec::new(),
+                sort_order: 0,
+                color: None,
+            };
+            Self {
+                _dir: dir,
+                factory,
+                account,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProviderTestHarness for GoogleHarness {
+        fn name(&self) -> &'static str {
+            "gmail"
+        }
+
+        fn account(&self) -> Account {
+            self.account.clone()
+        }
+
+        fn expected_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                mailbox: true,
+                sync: true,
+                mutations: MutationCapabilities {
+                    read: true,
+                    star: true,
+                    labels: true,
+                    move_messages: true,
+                    archive: true,
+                    trash: true,
+                    permanent_delete: false,
+                },
+                submission: true,
+                contacts: ContactCapabilities {
+                    read: true,
+                    incremental_sync: true,
+                    remote_search: false,
+                    write: false,
+                    groups: false,
+                },
+                server_search: false,
+            }
+        }
+
+        async fn open(&self, ctx: &OperationContext) -> Result<ProviderSession, ProviderError> {
+            self.factory.open(&self.account, ctx).await
+        }
+
+        fn fixture(&self) -> ContractFixture {
+            ContractFixture {
+                collections: None,
+                sent_copy_policy: Some(SentCopyPolicy::ServerManaged),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_provider_matches_the_shared_contract() {
+        let harness = GoogleHarness::new();
+        assert_eq!(
+            harness.account.provider_id(),
+            ProviderId::from(GMAIL_PROVIDER)
+        );
+        run_suite(harness).await;
+    }
+
+    #[test]
+    fn the_synthetic_gmail_scope_is_the_mail_scope() {
+        // Keep the contract fixture tied to the scope the adapter actually
+        // requests; a suite that passed under a broader scope would hide a
+        // capability regression.
+        assert_eq!(
+            GMAIL_MODIFY_SCOPE,
+            "https://www.googleapis.com/auth/gmail.modify"
+        );
+    }
+}
+
+#[cfg(feature = "provider-proton")]
+mod proton_contract {
+    use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+
+    use pige_core::auth::{AccountSessionManager, CredentialSecretRepository};
+    use pige_core::platform::fake::FakeCredentials;
+    use pige_core::providers::proton::{ProtonEndpoints, ProtonKeyStores, ProtonProviderFactory};
+    use pige_core::providers::{PROTON_PROVIDER, ProviderError};
+    use pige_core::store::Store;
+    use pige_core::{AccountId, MailBackend};
+
+    struct ProtonHarness {
+        _dir: TempDir,
+        factory: ProtonProviderFactory,
+        account: Account,
+    }
+
+    impl ProtonHarness {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("temp dir");
+            let store = Arc::new(Store::open(dir.path().join("pige.db")).expect("store"));
+            store.migrate().expect("migrate");
+            let sessions = Arc::new(AccountSessionManager::new(store));
+            let credentials = Arc::new(FakeCredentials::new());
+            let secrets = Arc::new(CredentialSecretRepository::new(credentials));
+            let endpoints = ProtonEndpoints::new_insecure_for_tests("http://127.0.0.1:9")
+                .expect("synthetic Proton endpoint");
+            let factory = ProtonProviderFactory::new(
+                sessions,
+                secrets,
+                endpoints,
+                Arc::new(ProtonKeyStores::new()),
+            );
+            let account = Account {
+                id: AccountId::new(),
+                label: "Proton".to_string(),
+                email: "person@proton.example".to_string(),
+                display_name: "Person".to_string(),
+                backend: MailBackend::proton(Some("proton-user-contract".to_string())),
+                contact_sources: Vec::new(),
+                sort_order: 0,
+                color: None,
+            };
+            Self {
+                _dir: dir,
+                factory,
+                account,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProviderTestHarness for ProtonHarness {
+        fn name(&self) -> &'static str {
+            "proton"
+        }
+
+        fn account(&self) -> Account {
+            self.account.clone()
+        }
+
+        fn expected_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                mailbox: true,
+                sync: true,
+                mutations: MutationCapabilities {
+                    read: true,
+                    star: true,
+                    labels: true,
+                    move_messages: true,
+                    archive: true,
+                    trash: true,
+                    permanent_delete: true,
+                },
+                submission: true,
+                contacts: ContactCapabilities {
+                    read: true,
+                    incremental_sync: false,
+                    remote_search: false,
+                    write: false,
+                    groups: false,
+                },
+                server_search: false,
+            }
+        }
+
+        async fn open(&self, ctx: &OperationContext) -> Result<ProviderSession, ProviderError> {
+            self.factory.open(&self.account, ctx).await
+        }
+
+        fn fixture(&self) -> ContractFixture {
+            ContractFixture {
+                collections: None,
+                sent_copy_policy: Some(SentCopyPolicy::ServerManaged),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proton_provider_matches_the_shared_contract() {
+        let harness = ProtonHarness::new();
+        assert_eq!(
+            harness.account.provider_id(),
+            ProviderId::from(PROTON_PROVIDER)
+        );
+        run_suite(harness).await;
+    }
 }
