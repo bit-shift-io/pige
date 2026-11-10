@@ -45,8 +45,49 @@ pub(crate) async fn open_session(
     account: &Account,
     ctx: &OperationContext,
 ) -> Result<ProviderSession, String> {
-    providers
-        .open(account, ctx)
+    // Opening may connect and authenticate, so race it against the deadline
+    // and cancellation; a stalled server must not hang the caller.
+    ctx.bound(providers.open(account, ctx))
         .await
         .map_err(|_| RECONNECT_ERROR.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::account::{Account, AccountId, MailBackend};
+    use crate::providers::fake::FakeProviderFactory;
+
+    fn account() -> Account {
+        Account {
+            id: AccountId("acc-open-deadline".to_string()),
+            label: "Proton".to_string(),
+            email: "person@proton.example".to_string(),
+            display_name: "Person".to_string(),
+            backend: MailBackend::proton(None),
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        }
+    }
+
+    /// Opening a provider session is network work too: a stalled connect/login
+    /// must not outlive the operation deadline.
+    #[tokio::test]
+    async fn hanging_session_open_is_bounded() {
+        let factory: Arc<dyn ProviderFactory> =
+            Arc::new(FakeProviderFactory::new().open_delay(Duration::from_secs(5)));
+        let account = account();
+        let ctx = OperationContext::with_timeout(account.id.clone(), 1, Duration::from_millis(50));
+
+        let started = Instant::now();
+        let result = open_session(&factory, &account, &ctx).await;
+        assert_eq!(result.unwrap_err(), RECONNECT_ERROR);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a hanging session open must be bounded by the operation deadline"
+        );
+    }
 }

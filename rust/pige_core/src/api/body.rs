@@ -47,7 +47,10 @@ pub(crate) async fn fetch_body_with(
     remote: &RemoteMessageId,
 ) -> Result<BodyContent, String> {
     let service = session.mailbox_service().map_err(provider_message)?;
-    service.body(remote, ctx).await.map_err(provider_message)
+    // A stalled provider body read must not outlive the operation deadline.
+    ctx.bound(service.body(remote, ctx))
+        .await
+        .map_err(provider_message)
 }
 
 /// Fetch one attachment's bytes through the account's provider mailbox service,
@@ -61,8 +64,7 @@ pub(crate) async fn fetch_attachment(
 ) -> Result<Vec<u8>, String> {
     let mut session = open_session(providers, account, ctx).await?;
     let service = session.mailbox_service().map_err(provider_message)?;
-    service
-        .attachment(message, attachment, ctx)
+    ctx.bound(service.attachment(message, attachment, ctx))
         .await
         .map_err(provider_message)
 }
@@ -130,5 +132,48 @@ pub(crate) fn document_from_body(body: &Body) -> Option<MailDocument> {
         Some(parse_html(html, false))
     } else {
         body.plain_text.as_deref().map(plain_text_document)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::account::{Account, AccountId, MailBackend};
+    use crate::providers::ProviderFactory;
+    use crate::providers::fake::{FakeProviderFactory, FakeProviderSession};
+
+    fn account() -> Account {
+        Account {
+            id: AccountId("acc-body-deadline".to_string()),
+            label: "Proton".to_string(),
+            email: "person@proton.example".to_string(),
+            display_name: "Person".to_string(),
+            backend: MailBackend::proton(None),
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        }
+    }
+
+    /// A stalled body read must not outlive the operation deadline.
+    #[tokio::test]
+    async fn hanging_body_fetch_is_bounded() {
+        let factory = FakeProviderFactory::new()
+            .session(FakeProviderSession::new().delay(Duration::from_secs(5)));
+        let account = account();
+        let open_ctx =
+            OperationContext::with_timeout(account.id.clone(), 1, Duration::from_secs(30));
+        let mut session = factory.open(&account, &open_ctx).await.expect("open");
+        let ctx = OperationContext::with_timeout(account.id.clone(), 1, Duration::from_millis(50));
+
+        let started = Instant::now();
+        let result = fetch_body_with(&mut session, &ctx, &RemoteMessageId::new("m1")).await;
+        assert!(result.is_err(), "a stalled body read must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stalled body read must be bounded by the operation deadline"
+        );
     }
 }

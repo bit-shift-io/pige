@@ -39,7 +39,7 @@ use crate::mail::{
 use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
 use crate::providers::{
     ContactSourceId, OperationContext, ProviderCapabilities, ProviderFactory, RemoteAttachmentId,
-    RemoteContactId, imap::ImapSubmission,
+    RemoteContactId, SubmissionService, imap::ImapSubmission,
 };
 use crate::search::{SearchHit, SearchScope};
 use crate::send::{
@@ -1273,7 +1273,7 @@ async fn run_maintenance_inner(
             continue;
         };
         let (ctx, _listener) = bounds.context_with_cancel(ctx);
-        let mut session = match config.providers.open(account, &ctx).await {
+        let mut session = match ctx.bound(config.providers.open(account, &ctx)).await {
             Ok(session) => session,
             Err(error) => {
                 log::debug!(
@@ -2295,6 +2295,28 @@ async fn bounded_operation<T>(
     }
 }
 
+/// Bound a provider outbox flush by the operation context. The flush records
+/// per-row failures internally; only a stalled network call needs cutting, so a
+/// deadline or cancellation surfaces as an error and leaves the rows durable
+/// for the next pass.
+async fn bounded_flush(
+    store: &Store,
+    account: &Account,
+    service: &mut dyn SubmissionService,
+    ctx: &OperationContext,
+) -> Result<send::OutboxReport, String> {
+    tokio::select! {
+        biased;
+        _ = ctx.cancellation.cancelled() => Err("operation cancelled".to_string()),
+        _ = tokio::time::sleep_until(ctx.deadline) => {
+            Err("operation deadline exceeded".to_string())
+        }
+        result = send::flush_provider_outbox(store, account, service, ctx) => {
+            result.map_err(|error| error.to_string())
+        }
+    }
+}
+
 async fn sync_folder_inner(id: &FolderId) -> Result<ModelSnapshot, String> {
     let (config, account, folder, ctx, scheduler, sender) = {
         let guard = lock_state();
@@ -3040,9 +3062,8 @@ pub async fn preview_delivery(
     let ctx = sessions
         .context(&account.id, INTERACTIVE_TIMEOUT)
         .map_err(|error| DeliveryPreviewError::transient(error.safe_message))?;
-    let mut session = config
-        .providers
-        .open(&account, &ctx)
+    let mut session = ctx
+        .bound(config.providers.open(&account, &ctx))
         .await
         .map_err(|error| DeliveryPreviewError::transient(error.safe_message))?;
     let service = session
@@ -3100,12 +3121,11 @@ pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> 
         let transports = config.transport.clone();
         let target = account.clone();
         let delivery = async {
-            match providers.open(&target, &ctx).await {
+            match ctx.bound(providers.open(&target, &ctx)).await {
                 Ok(mut session) => match session.submission_service() {
                     Ok(service) => {
                         if let Err(error) =
-                            send::flush_provider_outbox(&store, &target, service.as_mut(), &ctx)
-                                .await
+                            bounded_flush(&store, &target, service.as_mut(), &ctx).await
                         {
                             log::warn!("flush outbox for {}: {error}", target.label);
                         }
@@ -3132,7 +3152,7 @@ pub async fn send_mail(message: OutgoingMessage) -> Result<SendOutcome, String> 
                     if ctx.ensure_active().is_ok() && target.imap_smtp().is_some() {
                         let mut fallback = ImapSubmission::new(transports, target.clone());
                         if let Err(error) =
-                            send::flush_provider_outbox(&store, &target, &mut fallback, &ctx).await
+                            bounded_flush(&store, &target, &mut fallback, &ctx).await
                         {
                             log::warn!("SMTP-only flush outbox for {}: {error}", target.label);
                         }
@@ -3839,8 +3859,8 @@ async fn sync_one(
     let sync_ctx = ctx.clone();
     let inner = scheduler
         .run_interactive(&ctx, async move {
-            let mut session = providers
-                .open(&target, &sync_ctx)
+            let mut session = sync_ctx
+                .bound(providers.open(&target, &sync_ctx))
                 .await
                 .map_err(|error| error.safe_message)?;
             let capabilities = session.capabilities;
@@ -3858,10 +3878,9 @@ async fn sync_one(
                 .outbox_pending(&target.id)
                 .is_ok_and(|pending| !pending.is_empty());
             if has_pending && let Some(service) = session.submission.as_mut() {
-                match send::flush_provider_outbox(store, &target, service.as_mut(), &sync_ctx).await
-                {
+                match bounded_flush(store, &target, service.as_mut(), &sync_ctx).await {
                     Ok(outbox) => outbox_errors.extend(outbox.errors),
-                    Err(error) => outbox_errors.push(error.to_string()),
+                    Err(error) => outbox_errors.push(error),
                 }
             }
 
@@ -4244,5 +4263,53 @@ mod tests {
             "a stalled backfill must be bounded by the operation deadline"
         );
         assert!(result.is_err());
+    }
+
+    /// A stalled provider submission must not hold the account gate past the
+    /// operation deadline; the queued row stays durable.
+    #[tokio::test]
+    async fn stalled_outbox_flush_is_bounded() {
+        use crate::mail::Address;
+        use crate::providers::fake::{FakeProviderFactory, FakeProviderSession};
+        use crate::send::{OutgoingMessage, queue_submission};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("pige.db")).expect("store");
+        store.migrate().expect("migrate");
+        let account = bounded_account();
+        store.upsert_account(&account).expect("seed account");
+        queue_submission(
+            &store,
+            OutgoingMessage {
+                account_id: account.id.clone(),
+                to: vec![Address::new(None, "to@example.com")],
+                ..OutgoingMessage::default()
+            },
+            Vec::new(),
+        )
+        .expect("queue");
+
+        let factory = FakeProviderFactory::new()
+            .session(FakeProviderSession::new().delay(std::time::Duration::from_secs(5)));
+        let open_ctx = OperationContext::with_timeout(
+            account.id.clone(),
+            1,
+            std::time::Duration::from_secs(30),
+        );
+        let mut session = factory.open(&account, &open_ctx).await.expect("open");
+        let service = session.submission_service().expect("submission");
+        let ctx = OperationContext::with_timeout(
+            account.id.clone(),
+            1,
+            std::time::Duration::from_millis(50),
+        );
+
+        let started = std::time::Instant::now();
+        let result = bounded_flush(&store, &account, service.as_mut(), &ctx).await;
+        assert!(result.is_err(), "a stalled flush must fail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a stalled flush must be bounded by the operation deadline"
+        );
     }
 }
