@@ -22,6 +22,7 @@
 //! from the bootstrap anchor.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -70,13 +71,51 @@ enum ProtonCursor {
 /// `known` is the previous completed sweep's ids; `seen` is the union of ids
 /// observed so far. Keeping these out of [`SweepState`] is what bounds the
 /// cursor: serializing the whole set on every page would make a large mailbox
-/// re-encode megabytes per page (O(n^2) over the sweep). The set lives only for
-/// the lifetime of the sweep in this process; a process restart loses it, and
-/// the sweep then fails safe by not retiring anything.
+/// re-encode megabytes per page (O(n^2) over the sweep). The table lives on the
+/// account's shared [`ProtonClient`], so it survives the per-pass provider
+/// session; only a process restart loses it, and the sweep then fails safe by
+/// not retiring anything.
 #[derive(Debug, Clone, Default)]
-struct SweepBaseline {
+pub(crate) struct SweepBaseline {
     known: Vec<String>,
     seen: Vec<String>,
+}
+
+/// Adapter-private sweep/al-completed-sweep baselines for one account.
+///
+/// Held on the [`ProtonClient`] (shared across provider sessions/passes for an
+/// account, cloned cheaply), never serialized into the durable cursor.
+#[derive(Debug, Default)]
+pub(crate) struct SweepTable {
+    next_id: u64,
+    baselines: HashMap<String, SweepBaseline>,
+}
+
+impl SweepTable {
+    fn begin(&mut self, known: Vec<String>) -> String {
+        // Only one sweep is ever in flight per account; drop any abandoned one.
+        self.baselines.retain(|key, _| key == EVENTS_BASELINE);
+        self.next_id = self.next_id.saturating_add(1);
+        let handle = format!("sweep-{}", self.next_id);
+        self.baselines.insert(
+            handle.clone(),
+            SweepBaseline {
+                known,
+                seen: Vec::new(),
+            },
+        );
+        handle
+    }
+
+    fn set_events(&mut self, known: Vec<String>) {
+        self.baselines.insert(
+            EVENTS_BASELINE.to_string(),
+            SweepBaseline {
+                known,
+                seen: Vec::new(),
+            },
+        );
+    }
 }
 
 /// Mutable state of one snapshot/reconciliation sweep.
@@ -131,57 +170,52 @@ struct SweepState {
 /// Proton sync service.
 pub struct ProtonSync {
     client: ProtonClient,
-    /// Adapter-local sweep baselines, keyed by [`SweepState::sweep`]. Entries
-    /// live only while a sweep is in flight.
-    baselines: HashMap<String, SweepBaseline>,
-    /// Monotonic handle source for a sweep baseline.
-    sweep_seq: u64,
+    /// The account's shared sweep baselines (on the [`ProtonClient`]), so they
+    /// survive a per-pass provider session.
+    baselines: Arc<Mutex<SweepTable>>,
 }
 
 impl ProtonSync {
     pub fn new(client: ProtonClient) -> Self {
-        Self {
-            client,
-            baselines: HashMap::new(),
-            sweep_seq: 0,
-        }
+        let baselines = client.sweep_table();
+        Self { client, baselines }
     }
 
-    /// Register a new sweep baseline and return its handle. Any abandoned
-    /// sweep entry is dropped: only one sweep is ever in flight per session.
-    fn begin_sweep(&mut self, known: Vec<String>) -> String {
-        self.baselines.retain(|key, _| key == EVENTS_BASELINE);
-        self.sweep_seq = self.sweep_seq.saturating_add(1);
-        let handle = format!("sweep-{}", self.sweep_seq);
-        self.baselines.insert(
-            handle.clone(),
-            SweepBaseline {
-                known,
-                seen: Vec::new(),
-            },
-        );
-        handle
+    fn lock(&self) -> std::sync::MutexGuard<'_, SweepTable> {
+        self.baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register a new sweep baseline and return its handle.
+    fn begin_sweep(&self, known: Vec<String>) -> String {
+        self.lock().begin(known)
+    }
+
+    /// Take an in-flight sweep's baseline out of the table for this page.
+    fn take_sweep(&self, handle: &str) -> Option<SweepBaseline> {
+        self.lock().baselines.remove(handle)
+    }
+
+    /// Return a sweep's accumulated baseline under the same handle.
+    fn put_sweep(&self, handle: String, baseline: SweepBaseline) {
+        self.lock().baselines.insert(handle, baseline);
     }
 
     /// The last completed sweep's ids, for seeding a reconciliation. Missing
     /// after a process restart means an empty baseline: the reconcile then
     /// retires nothing (fail safe) until the next sweep rebuilds it.
     fn events_known(&self) -> Vec<String> {
-        self.baselines
+        self.lock()
+            .baselines
             .get(EVENTS_BASELINE)
             .map(|baseline| baseline.known.clone())
             .unwrap_or_default()
     }
 
     /// Replace the last completed sweep's ids.
-    fn set_events_baseline(&mut self, known: Vec<String>) {
-        self.baselines.insert(
-            EVENTS_BASELINE.to_string(),
-            SweepBaseline {
-                known,
-                seen: Vec::new(),
-            },
-        );
+    fn set_events_baseline(&self, known: Vec<String>) {
+        self.lock().set_events(known);
     }
 
     /// Close a fully enumerated sweep and record its baseline adapter-locally.
@@ -193,7 +227,7 @@ impl ProtonSync {
     /// gap. Set membership is checked with a `HashSet`, not a repeated `Vec`
     /// scan. The baseline never enters the durable cursor.
     fn finish_sweep(
-        &mut self,
+        &self,
         anchor: String,
         known: &[String],
         seen: Vec<String>,
@@ -290,7 +324,7 @@ impl ProtonSync {
         // page. It is never serialized into the cursor. A missing entry means
         // the process restarted mid-sweep: earlier seen ids are gone, so this
         // sweep must not retire anything.
-        let mut baseline = match self.baselines.remove(&sweep.sweep) {
+        let mut baseline = match self.take_sweep(&sweep.sweep) {
             Some(baseline) => baseline,
             None => {
                 sweep.scope_changed = true;
@@ -457,7 +491,7 @@ impl ProtonSync {
         }
 
         // Keep accumulating this sweep's baseline under the same handle.
-        self.baselines.insert(sweep.sweep.clone(), baseline);
+        self.put_sweep(sweep.sweep.clone(), baseline);
         let next = if reconcile {
             ProtonCursor::Reconcile(sweep)
         } else {

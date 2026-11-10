@@ -310,8 +310,10 @@ async fn run_mutation(
                 return Err(unsupported_message(&request.action));
             }
             let service = session.mutation_service().map_err(provider_message)?;
-            service
-                .apply(request, &operation_ctx)
+            // A stalled provider must not hold the account gate past the
+            // operation deadline or cancellation.
+            operation_ctx
+                .bound(service.apply(request, &operation_ctx))
                 .await
                 .map_err(provider_message)
         })
@@ -587,5 +589,90 @@ fn rollback_read_one(prepared: &Prepared, remote: &RemoteMessageId) {
         {
             summary.flags = original.flags;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::account::{Account, AccountId, MailBackend};
+    use crate::mail::{Folder, FolderId, FolderKind};
+    use crate::platform::fake::{
+        FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
+    };
+    use crate::providers::fake::{FakeProviderFactory, FakeProviderSession};
+    use crate::providers::{MutationAction, OperationContext, RemoteMessageId};
+    use crate::sync::scheduler::AccountScheduler;
+
+    use super::{Config, Prepared, run_mutation};
+
+    fn account() -> Account {
+        Account {
+            id: AccountId("acc-mutation-deadline".to_string()),
+            label: "Proton".to_string(),
+            email: "person@proton.example".to_string(),
+            display_name: "Person".to_string(),
+            backend: MailBackend::proton(None),
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        }
+    }
+
+    fn config(providers: Arc<dyn crate::providers::ProviderFactory>) -> Config {
+        Config {
+            data_dir: PathBuf::from("unused"),
+            cache_dir: PathBuf::from("unused"),
+            config_dir: PathBuf::from("unused"),
+            credentials: Arc::new(FakeCredentials::default()),
+            notifier: Arc::new(FakeNotifier::default()),
+            opener: Arc::new(FakeOpener::default()),
+            providers,
+            transport: Arc::new(FakeTransportFactory::default()),
+            backups: Arc::new(FakeBackupStore::new()),
+            auth: None,
+        }
+    }
+
+    /// A mutation whose provider never returns must not hold the account gate
+    /// past the operation deadline.
+    #[tokio::test]
+    async fn hanging_mutation_is_bounded_by_operation_deadline() {
+        let providers: Arc<dyn crate::providers::ProviderFactory> = Arc::new(
+            FakeProviderFactory::new()
+                .session(FakeProviderSession::new().delay(Duration::from_secs(5))),
+        );
+        let account = account();
+        let prepared = Prepared {
+            folder: Folder {
+                id: FolderId("inbox".to_string()),
+                account_id: account.id.clone(),
+                name: "INBOX".to_string(),
+                delimiter: Some("/".to_string()),
+                kind: FolderKind::Inbox,
+                unread: 0,
+                total: 1,
+                uidvalidity: Some(1),
+                uidnext: Some(2),
+            },
+            messages: Vec::new(),
+            remote_ids: vec![RemoteMessageId::new("remote-1")],
+            config: config(providers),
+            scheduler: Arc::new(AccountScheduler::new()),
+            ctx: OperationContext::with_timeout(account.id.clone(), 1, Duration::from_millis(50)),
+            sender: tokio::sync::broadcast::channel(1).0,
+            account,
+        };
+
+        let started = Instant::now();
+        let result = run_mutation(&prepared, MutationAction::SetRead(true)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a hung mutation must be bounded by the operation deadline"
+        );
+        assert!(result.is_err(), "a deadline must surface as an error");
     }
 }

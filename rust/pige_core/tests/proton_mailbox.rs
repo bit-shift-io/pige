@@ -1495,7 +1495,9 @@ async fn completed_reconcile_retires_absent_messages_after_event_gap() {
     }
     let mock = ProtonMock::start(state).await;
     let ctx = context();
-    let mut sync = ProtonSync::new(mock.client(Arc::new(StaticTokens)));
+    // One per-account client, as the factory caches it, shared across passes.
+    let client = mock.client(Arc::new(StaticTokens));
+    let mut sync = ProtonSync::new(client.clone());
 
     let first = drive_sync(&mut sync, &ctx, 10, 40).await;
     let checkpoint = first.last().expect("pages").checkpoint.clone();
@@ -1521,7 +1523,11 @@ async fn completed_reconcile_retires_absent_messages_after_event_gap() {
         );
     });
 
-    let after = drive_sync_from(&mut sync, &ctx, Some(checkpoint), 10, 40).await;
+    // The reconcile runs in a *later pass*: the sync service is rebuilt, but it
+    // shares the account's client. The completed-sweep baseline must survive
+    // that boundary or deletions are never retired after a retention gap.
+    let mut later_pass = ProtonSync::new(client.clone());
+    let after = drive_sync_from(&mut later_pass, &ctx, Some(checkpoint), 10, 40).await;
     assert_eq!(
         removed(&after),
         vec![RemoteMessageId::new("retire-me")],

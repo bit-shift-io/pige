@@ -21,6 +21,7 @@ use crate::auth::TokenSource;
 use crate::providers::{ErrorKind, OperationContext, ProviderError};
 
 use super::keys::UnlockedKeyStore;
+use super::sync::SweepTable;
 
 /// The app version and headers accepted by S3. No user-agent impersonation.
 pub const PROTON_APP_VERSION: &str = "Other";
@@ -104,6 +105,10 @@ pub struct ProtonClient {
     tokens: Arc<dyn TokenSource>,
     keys: Arc<UnlockedKeyStore>,
     endpoints: ProtonEndpoints,
+    /// Sync baselines shared by every [`super::sync::ProtonSync`] built from
+    /// this account client, so a multi-pass sweep or a later reconcile keeps
+    /// its baseline across per-pass provider sessions.
+    sweep_table: Arc<Mutex<SweepTable>>,
 }
 
 impl ProtonClient {
@@ -116,7 +121,13 @@ impl ProtonClient {
             tokens,
             keys,
             endpoints,
+            sweep_table: Arc::new(Mutex::new(SweepTable::default())),
         }
+    }
+
+    /// The account's shared sync-baseline table.
+    pub(crate) fn sweep_table(&self) -> Arc<Mutex<SweepTable>> {
+        self.sweep_table.clone()
     }
 
     pub fn endpoints(&self) -> &ProtonEndpoints {
