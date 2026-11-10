@@ -116,6 +116,55 @@ impl SweepTable {
             },
         );
     }
+
+    fn put(&mut self, handle: String, baseline: SweepBaseline) {
+        self.baselines.insert(handle, baseline);
+    }
+}
+
+/// Holds an in-flight sweep's baseline for one page and reinserts it on every
+/// exit: a normal page, an early finish (disarmed first via [`Self::take`]), or
+/// an error propagating through `?`. Without this, a single transient page
+/// error would discard the accumulated `seen` set, and the retry would fail
+/// safe by retiring nothing for the whole sweep.
+struct SweepGuard {
+    table: Arc<Mutex<SweepTable>>,
+    handle: String,
+    baseline: Option<SweepBaseline>,
+}
+
+impl SweepGuard {
+    fn new(table: Arc<Mutex<SweepTable>>, handle: String, baseline: SweepBaseline) -> Self {
+        Self {
+            table,
+            handle,
+            baseline: Some(baseline),
+        }
+    }
+
+    fn baseline(&self) -> &SweepBaseline {
+        self.baseline.as_ref().expect("a live sweep guard is armed")
+    }
+
+    fn baseline_mut(&mut self) -> &mut SweepBaseline {
+        self.baseline.as_mut().expect("a live sweep guard is armed")
+    }
+
+    /// Disarm the guard and hand back the baseline (used when the sweep ends).
+    fn take(&mut self) -> SweepBaseline {
+        self.baseline.take().expect("a live sweep guard is armed")
+    }
+}
+
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        if let Some(baseline) = self.baseline.take() {
+            self.table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .put(self.handle.clone(), baseline);
+        }
+    }
 }
 
 /// Mutable state of one snapshot/reconciliation sweep.
@@ -195,11 +244,6 @@ impl ProtonSync {
     /// Take an in-flight sweep's baseline out of the table for this page.
     fn take_sweep(&self, handle: &str) -> Option<SweepBaseline> {
         self.lock().baselines.remove(handle)
-    }
-
-    /// Return a sweep's accumulated baseline under the same handle.
-    fn put_sweep(&self, handle: String, baseline: SweepBaseline) {
-        self.lock().baselines.insert(handle, baseline);
     }
 
     /// The last completed sweep's ids, for seeding a reconciliation. Missing
@@ -320,17 +364,20 @@ impl ProtonSync {
         let syncable = normalize::syncable_collections(&labels);
         let live_scope: Vec<String> = syncable.iter().map(|id| id.as_str().to_string()).collect();
 
-        // Take the sweep baseline out of the table for the duration of this
-        // page. It is never serialized into the cursor. A missing entry means
-        // the process restarted mid-sweep: earlier seen ids are gone, so this
-        // sweep must not retire anything.
-        let mut baseline = match self.take_sweep(&sweep.sweep) {
-            Some(baseline) => baseline,
-            None => {
-                sweep.scope_changed = true;
-                SweepBaseline::default()
-            }
-        };
+        // Hold the sweep baseline in a guard for this page; it is reinserted on
+        // any exit (including an error), so a transient failure never discards
+        // the accumulated set. It is never serialized into the cursor. A missing
+        // entry means the process restarted mid-sweep: earlier seen ids are
+        // gone, so this sweep must not retire anything.
+        let baseline = self.take_sweep(&sweep.sweep);
+        if baseline.is_none() {
+            sweep.scope_changed = true;
+        }
+        let mut sweep_guard = SweepGuard::new(
+            self.baselines.clone(),
+            sweep.sweep.clone(),
+            baseline.unwrap_or_default(),
+        );
 
         // Freeze the scope on the first page. Any later difference means a
         // label appeared or disappeared mid-sweep: keep enumerating the live
@@ -369,6 +416,7 @@ impl ProtonSync {
             // Nothing left to enumerate. Either the sweep genuinely finished or
             // the scope shrank to empty; `finish_sweep` only retires when the
             // scope held still.
+            let mut baseline = sweep_guard.take();
             let (changes, next) = self.finish_sweep(
                 sweep.anchor.clone(),
                 &baseline.known,
@@ -399,7 +447,7 @@ impl ProtonSync {
         let mut total = 0u32;
         let mut ids = HashSet::new();
         let mut last_page_ids: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = baseline.seen.iter().cloned().collect();
+        let mut seen: HashSet<String> = sweep_guard.baseline().seen.iter().cloned().collect();
         for number in first_page..=sweep.page {
             // A fenced/cancelled context must not fetch or emit another page.
             ctx.ensure_active()?;
@@ -459,7 +507,7 @@ impl ProtonSync {
             sweep.churned = churned;
             sweep.current = Some(collection_id.as_str().to_string());
         }
-        baseline.seen = {
+        sweep_guard.baseline_mut().seen = {
             let mut seen: Vec<String> = seen.into_iter().collect();
             seen.sort_unstable();
             seen
@@ -475,6 +523,7 @@ impl ProtonSync {
             // Retire records that were known after the previous completed
             // sweep but did not appear anywhere in this one. This is the only
             // place a snapshot emits removals; one bounded page never does.
+            let mut baseline = sweep_guard.take();
             let (changes, next) = self.finish_sweep(
                 sweep.anchor.clone(),
                 &baseline.known,
@@ -490,8 +539,8 @@ impl ProtonSync {
             });
         }
 
-        // Keep accumulating this sweep's baseline under the same handle.
-        self.put_sweep(sweep.sweep.clone(), baseline);
+        // On the normal path `sweep_guard` drops at the end of this function
+        // and reinserts the accumulated baseline under the same handle.
         let next = if reconcile {
             ProtonCursor::Reconcile(sweep)
         } else {

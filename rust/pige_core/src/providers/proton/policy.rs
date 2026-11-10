@@ -155,6 +155,14 @@ impl ContactPolicyStore {
         (state.complete && fresh).then(|| state.materials.clone())
     }
 
+    /// Test-only: age the completed snapshot so staleness can be exercised
+    /// without sleeping for the real TTL.
+    #[cfg(test)]
+    fn age_snapshot(&self, age: std::time::Duration) {
+        let mut state = self.lock();
+        state.refreshed_at = std::time::Instant::now().checked_sub(age);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, StoreState> {
         self.state
             .lock()
@@ -844,6 +852,22 @@ mod tests {
         assert_eq!(parsed.emails, vec!["alice@example.com"]);
         assert_eq!(parsed.global.encrypt, Some(true));
         assert_eq!(parsed.global.sign, Some(false));
+    }
+
+    #[test]
+    fn stale_snapshot_is_not_reused() {
+        let store = ContactPolicyStore::default();
+        store.replace_completed(Vec::new());
+        assert!(
+            store.snapshot_if_fresh(CONTACT_POLICY_TTL).is_some(),
+            "a just-completed snapshot is fresh"
+        );
+
+        store.age_snapshot(CONTACT_POLICY_TTL + std::time::Duration::from_secs(1));
+        assert!(
+            store.snapshot_if_fresh(CONTACT_POLICY_TTL).is_none(),
+            "a snapshot past the TTL must force a fresh enumeration"
+        );
     }
 
     #[test]

@@ -2277,6 +2277,24 @@ pub async fn sync_folder(id: &FolderId) -> Result<ModelSnapshot, String> {
 /// One-folder sync that assumes `SYNC_LOCK` is already held. Locates the
 /// account and folder, connects, and runs the engine's one-folder sync with a
 /// thread index seeded from the account's cached messages.
+/// Bound a legacy IMAP transport operation by the operation context, so a
+/// stalled server cannot hold the account gate past the deadline or survive
+/// cancellation. Legacy paths return `String` errors, so this mirrors
+/// [`OperationContext::bound`] rather than reusing it.
+async fn bounded_operation<T>(
+    ctx: &OperationContext,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        _ = ctx.cancellation.cancelled() => Err("operation cancelled".to_string()),
+        _ = tokio::time::sleep_until(ctx.deadline) => {
+            Err("operation deadline exceeded".to_string())
+        }
+        result = future => result,
+    }
+}
+
 async fn sync_folder_inner(id: &FolderId) -> Result<ModelSnapshot, String> {
     let (config, account, folder, ctx, scheduler, sender) = {
         let guard = lock_state();
@@ -2338,7 +2356,7 @@ async fn sync_folder_inner(id: &FolderId) -> Result<ModelSnapshot, String> {
         }
     };
     scheduler
-        .run_interactive(&ctx, operation)
+        .run_interactive(&ctx, bounded_operation(&ctx, operation))
         .await
         .map_err(scheduler_message)??;
 
@@ -2493,7 +2511,10 @@ pub async fn load_older(folder: &FolderId) -> Result<ModelSnapshot, String> {
         ctx,
         scheduler,
     } = request;
-    let operation = backfill_older(&config, &store, &account, &backfill_folder, oldest);
+    let operation = bounded_operation(
+        &ctx,
+        backfill_older(&config, &store, &account, &backfill_folder, oldest),
+    );
     let outcome = scheduler
         .run_interactive(&ctx, operation)
         .await
@@ -4087,5 +4108,141 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    fn bounded_config(transport: Arc<dyn crate::platform::TransportFactory>) -> Config {
+        Config {
+            data_dir: std::path::PathBuf::from("unused"),
+            cache_dir: std::path::PathBuf::from("unused"),
+            config_dir: std::path::PathBuf::from("unused"),
+            credentials: Arc::new(crate::platform::fake::FakeCredentials::default()),
+            notifier: Arc::new(crate::platform::fake::FakeNotifier::default()),
+            opener: Arc::new(crate::platform::fake::FakeOpener::default()),
+            providers: Arc::new(crate::providers::fake::FakeProviderFactory::new()),
+            transport,
+            backups: Arc::new(crate::platform::fake::FakeBackupStore::new()),
+            auth: None,
+        }
+    }
+
+    fn bounded_account() -> crate::account::Account {
+        use crate::account::{MailBackend, Security, ServerConfig};
+        crate::account::Account {
+            id: AccountId("acc-backfill-deadline".to_string()),
+            label: "IMAP".to_string(),
+            email: "ada@example.com".to_string(),
+            display_name: "Ada".to_string(),
+            backend: MailBackend::imap_smtp(
+                "ada@example.com",
+                ServerConfig {
+                    host: "imap.example.com".to_string(),
+                    port: 993,
+                    security: Security::Tls,
+                },
+                ServerConfig {
+                    host: "smtp.example.com".to_string(),
+                    port: 465,
+                    security: Security::Tls,
+                },
+            ),
+            contact_sources: Vec::new(),
+            sort_order: 0,
+            color: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_operation_stops_at_the_deadline() {
+        let ctx = OperationContext::with_timeout(
+            AccountId("a".to_string()),
+            1,
+            std::time::Duration::from_millis(20),
+        );
+        let started = std::time::Instant::now();
+        let result: Result<(), String> = bounded_operation(&ctx, std::future::pending()).await;
+        assert_eq!(result.unwrap_err(), "operation deadline exceeded");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn bounded_operation_stops_on_cancellation() {
+        let ctx = OperationContext::with_timeout(
+            AccountId("a".to_string()),
+            1,
+            std::time::Duration::from_secs(60),
+        );
+        ctx.cancellation.cancel();
+        let result: Result<(), String> = bounded_operation(&ctx, std::future::pending()).await;
+        assert_eq!(result.unwrap_err(), "operation cancelled");
+    }
+
+    /// A stalled IMAP server must not let the legacy "load older" path hold the
+    /// account gate past the operation deadline.
+    #[tokio::test]
+    async fn stalled_backfill_is_bounded_by_the_operation_deadline() {
+        use std::collections::HashMap;
+
+        use crate::mail::{Folder, FolderKind};
+        use crate::platform::fake::FakeTransportFactory;
+        use crate::transport::{FakeTransport, FolderState, RemoteFolder};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("pige.db")).expect("store");
+        store.migrate().expect("migrate");
+
+        let account = bounded_account();
+        let folder = Folder {
+            id: FolderId("inbox".to_string()),
+            account_id: account.id.clone(),
+            name: "INBOX".to_string(),
+            delimiter: Some("/".to_string()),
+            kind: FolderKind::Inbox,
+            unread: 0,
+            total: 1,
+            uidvalidity: Some(1),
+            uidnext: Some(2),
+        };
+
+        let factory = Arc::new(FakeTransportFactory::default());
+        factory.add_transport(
+            account.id.clone(),
+            FakeTransport {
+                folders: vec![RemoteFolder {
+                    name: "INBOX".to_string(),
+                    delimiter: Some("/".to_string()),
+                    kind: FolderKind::Inbox,
+                    selectable: true,
+                }],
+                states: HashMap::from([(
+                    "INBOX".to_string(),
+                    FolderState {
+                        uidvalidity: 1,
+                        uidnext: 2,
+                        exists: 1,
+                    },
+                )]),
+                // The header fetch after SELECT never completes.
+                fetch_headers_pause: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+                ..FakeTransport::default()
+            },
+        );
+        let config = bounded_config(factory);
+        let ctx = OperationContext::with_timeout(
+            account.id.clone(),
+            1,
+            std::time::Duration::from_millis(30),
+        );
+
+        let started = std::time::Instant::now();
+        let result = bounded_operation(
+            &ctx,
+            backfill_older(&config, &store, &account, &folder, None),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a stalled backfill must be bounded by the operation deadline"
+        );
+        assert!(result.is_err());
     }
 }

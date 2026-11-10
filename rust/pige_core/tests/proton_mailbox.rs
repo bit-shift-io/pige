@@ -521,6 +521,33 @@ async fn drive_sync_from(
     pages
 }
 
+/// Drive pages from `cursor` until the provider returns an error, returning it.
+/// Used to prove a stalled/failed page does not corrupt durable sweep state.
+async fn first_page_error(
+    sync: &mut ProtonSync,
+    ctx: &OperationContext,
+    mut cursor: Option<ProviderCursor>,
+) -> ProviderError {
+    loop {
+        match sync
+            .next_page(
+                SyncRequest {
+                    cursor: cursor.clone(),
+                    initial_limit: 10,
+                },
+                ctx,
+            )
+            .await
+        {
+            Ok(page) => {
+                assert!(page.has_more, "expected an error before the stream ended");
+                cursor = Some(page.checkpoint);
+            }
+            Err(error) => return error,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Required tests
 // ---------------------------------------------------------------------------
@@ -1544,6 +1571,65 @@ async fn completed_reconcile_retires_absent_messages_after_event_gap() {
             .iter()
             .any(|(record, _)| record.remote_id.as_str() == "retire-me"),
         "an absent record must never be re-upserted as present"
+    );
+}
+
+#[tokio::test]
+async fn transient_page_error_does_not_disable_retirement() {
+    // A reconcile can span several passes. A transient listing failure must not
+    // discard the accumulated sweep baseline, or the retry would fail safe by
+    // never retiring a message the server already deleted.
+    let mut state = default_state();
+    for (id, time) in [("retire-me", 1_700_000_100), ("keep-me", 1_700_000_000)] {
+        state.put_message(message(
+            id,
+            &format!("conv-{id}"),
+            id,
+            &["0"],
+            "sender@example.com",
+            "alice@example.com",
+            time,
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let client = mock.client(Arc::new(StaticTokens));
+    let ctx = context();
+    let mut sync = ProtonSync::new(client.clone());
+    let first = drive_sync(&mut sync, &ctx, 10, 40).await;
+    let checkpoint = first.last().expect("pages").checkpoint.clone();
+    assert_eq!(cursor_stage(&checkpoint).expect("stage"), "complete");
+
+    // Delete a message and force a retention-gap reset.
+    mock.update(|state| {
+        state
+            .messages
+            .retain(|message| message["ID"] != "retire-me");
+        state.latest_event = "event-gap".to_string();
+        state.event(
+            "event-0",
+            json!({
+                "EventID": "event-gap",
+                "More": 0,
+                "Refresh": 1,
+                "Messages": [],
+                "MessageCounts": [],
+            }),
+        );
+    });
+
+    // The first reconcile listing page fails transiently.
+    mock.fail_page(0);
+    let mut later_pass = ProtonSync::new(client.clone());
+    let error = first_page_error(&mut later_pass, &ctx, Some(checkpoint.clone())).await;
+    assert_eq!(error.kind, ErrorKind::Transient);
+
+    // Retry from the same checkpoint: retirement must still happen.
+    mock.update(|state| state.fail_pages.clear());
+    let after = drive_sync_from(&mut later_pass, &ctx, Some(checkpoint), 10, 40).await;
+    assert_eq!(
+        removed(&after),
+        vec![RemoteMessageId::new("retire-me")],
+        "a transient page error must not disable retirement for the sweep"
     );
 }
 
