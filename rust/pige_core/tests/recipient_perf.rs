@@ -258,6 +258,17 @@ fn fixture_name(index: usize) -> &'static str {
     }
 }
 
+/// Display name for a fixture address. Three tail addresses carry a rare
+/// two-character leading word so the deterministic test can prove that a
+/// selective short prefix does not fall back to the rank-index scan.
+fn fixture_display_name(index: usize) -> String {
+    if index >= FIXTURE_ADDRESSES - 3 {
+        format!("Zq {} {index:06}", fixture_name(index))
+    } else {
+        format!("{} {index:06}", fixture_name(index))
+    }
+}
+
 /// Seed exactly 100,000 unique addresses with mixed durable sources:
 /// 40k saved contacts, 20k Other contacts, 20k incoming-only, 10k outgoing, and
 /// 10k deliberately selected. Learned rows carry real evidence rows so the
@@ -312,7 +323,7 @@ fn seed_hundred_thousand_mixed(db_path: &Path, account: &Account) {
 
         for index in 0..FIXTURE_ADDRESSES {
             let email = fixture_email(index);
-            let name = format!("{} {index:06}", fixture_name(index));
+            let name = fixture_display_name(index);
             let last_seen = 1_000 + index as i64;
 
             match index % 10 {
@@ -476,6 +487,33 @@ fn lookup_uses_bounded_projection() {
             "selective prefix {query:?} must use a bounded selective path, consumed {steps} VM steps"
         );
     }
+
+    // Three of the 100,000 rows carry the rare two-character name word "Zq".
+    // A short selective prefix must drive from the token index, not scan the
+    // rank order probing every preceding row (which costs ~2M VM steps here).
+    let rare_tokens = query_tokens("zq");
+    let rare_steps = store
+        .recipient_search_vm_steps(&account.id, "zq", &rare_tokens, 20)
+        .unwrap();
+    println!("rare two-character prefix: {rare_steps} VM steps");
+    assert!(
+        rare_steps < 20_000,
+        "a rare two-character prefix must use a bounded selective path, consumed {rare_steps} VM steps"
+    );
+    let rare_hits = harness.suggest(&account.id, "zq", 20);
+    assert_eq!(
+        rare_hits.len(),
+        3,
+        "the rare two-character prefix must surface exactly its three rows"
+    );
+    let rare_plan = store
+        .explain_recipient_search(&account.id, "zq", &rare_tokens, 20)
+        .unwrap()
+        .join("\n");
+    assert!(
+        rare_plan.contains("recipient_tokens") && rare_plan.contains("SEARCH recipient_tokens"),
+        "a rare two-character prefix must be driven by the token index: {rare_plan}"
+    );
 
     let plan = store
         .explain_recipient_search(&account.id, "p", &tokens, 20)
@@ -1211,6 +1249,17 @@ fn report_latency(label: &str, samples: &mut [Duration], target: Option<Duration
     println!(
         "{label}: queries={count} min={min:?} p50={p50:?} mean={mean:?} p95={p95:?} max={max:?} ({target_note})"
     );
+    // The 50 ms target is an Android reference-device release gate. Fail the
+    // ignored benchmark on the device so a regression is caught, not merely
+    // printed. Desktop runs are comparison data and never assert the target.
+    if let Some(target) = target
+        && cfg!(target_os = "android")
+    {
+        assert!(
+            p95 <= target,
+            "{label}: p95 {p95:?} exceeds the Android reference target {target:?}"
+        );
+    }
 }
 
 /// A background crawl on a second SQLite connection, used to measure compose
@@ -1322,6 +1371,10 @@ fn recipient_lookup_100k() {
         "recipient lookup 100k (background crawl)",
         &mut during,
         Some(Duration::from_millis(50)),
+    );
+    assert!(
+        crawl_still_running,
+        "the background crawl finished before the lookup pass; the 'during crawl' measurement is invalid"
     );
     drop(crawl);
 

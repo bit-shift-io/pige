@@ -804,11 +804,19 @@ enum PrefixDrive {
 /// the lookup. Bigger ranges use the rank-index scan, which stops at the cap.
 const PREFIX_DRIVE_LIMIT: usize = 4_096;
 
+/// One- and two-character prefixes are common while typing, so they probe a
+/// smaller range. A short prefix matching within this bound is still selective
+/// enough to drive from `recipient_tokens_token`; above it almost every row
+/// matches and the rank-index scan is cheaper.
+const SHORT_PREFIX_DRIVE_LIMIT: usize = 256;
+
 /// Pick the cheapest bounded prefix strategy without scanning an unbounded
-/// token range. Each probe stops after [`PREFIX_DRIVE_LIMIT`] + 1 rows, so even
-/// a broad token costs bounded index work. Very short tokens (one or two
-/// characters) probe for "no match" only, keeping the historical short-prefix
-/// plan and its low step count.
+/// token range. Each probe stops after its limit + 1 rows, so even a broad
+/// token costs bounded index work. Very short tokens use the smaller
+/// [`SHORT_PREFIX_DRIVE_LIMIT`] probe: a broad one- or two-character prefix
+/// stays on the historical rank-index plan, while a rare short prefix (for
+/// example a single contact whose name starts with a distinctive two-character
+/// pair) is driven from the token index instead of scanning the rank order.
 fn choose_prefix_drive(
     conn: &rusqlite::Connection,
     account: &str,
@@ -824,7 +832,6 @@ fn choose_prefix_drive(
     }
 
     let mut steps = 0i64;
-    let mut short = false;
     let mut exact_one = None;
 
     // First pass: detect any token with no matches and any token that matches
@@ -837,9 +844,6 @@ fn choose_prefix_drive(
         if count == 0 {
             return Ok((PrefixDrive::NoMatches, steps));
         }
-        if token.chars().count() <= 2 {
-            short = true;
-        }
         if count == 1 && exact_one.is_none() {
             exact_one = Some(index);
         }
@@ -847,33 +851,30 @@ fn choose_prefix_drive(
     if let Some(index) = exact_one {
         return Ok((PrefixDrive::Token(index), steps));
     }
-    // Short prefixes are answered by the historical rank-index plan; it is
-    // already optimal when almost every row matches.
-    if short {
-        return Ok((PrefixDrive::Rank, steps));
-    }
 
-    // Second pass: find the rarest token, stopping each probe at the drive
-    // bound. If even the rarest prefix is larger than the bound, use the rank
-    // index scan, which stops at the result cap instead of sorting the range.
+    // Second pass: find the rarest token whose bounded range fits its drive
+    // limit. If even the rarest fitting prefix is too large, use the rank index
+    // scan, which stops at the result cap instead of sorting the range.
     let mut best: Option<(usize, usize)> = None;
     for (index, token) in tokens.iter().enumerate() {
-        let (count, probe_steps) =
-            probe_prefix(conn, account, token, PREFIX_DRIVE_LIMIT as i64 + 1)?;
+        let limit = if token.chars().count() <= 2 {
+            SHORT_PREFIX_DRIVE_LIMIT
+        } else {
+            PREFIX_DRIVE_LIMIT
+        };
+        let (count, probe_steps) = probe_prefix(conn, account, token, limit as i64 + 1)?;
         steps += probe_steps;
         if count == 0 {
             return Ok((PrefixDrive::NoMatches, steps));
         }
-        if best.is_none_or(|(_, best_count)| count < best_count) {
+        if count <= limit && best.is_none_or(|(_, best_count)| count < best_count) {
             best = Some((index, count));
         }
     }
 
     match best {
-        Some((index, count)) if count <= PREFIX_DRIVE_LIMIT => {
-            Ok((PrefixDrive::Token(index), steps))
-        }
-        _ => Ok((PrefixDrive::Rank, steps)),
+        Some((index, _)) => Ok((PrefixDrive::Token(index), steps)),
+        None => Ok((PrefixDrive::Rank, steps)),
     }
 }
 
