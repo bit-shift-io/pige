@@ -37,7 +37,7 @@ directory.
 | All features | `cargo check -p pige_core --all-features` | PASS | `verify-all.log` |
 | Dependency/license gate | `scripts/check-provider-boundaries.py` through the verify script | PASS | `verify-all.log` |
 | Privacy regressions | `cargo test -p pige_core --all-features --test provider_privacy` | PASS | `provider-privacy.log` |
-| Desktop release build | `cargo build --locked -p pige --bin pige` (release profile through `scripts/release.sh desktop`) | PASS | `desktop-release.log` |
+| Desktop release build | `cargo build --locked --release -p pige --bin pige` (through `scripts/release.sh desktop`) | PASS | `desktop-release.log` |
 | Android release build | `JAVA_HOME=/opt/jbr-21 bash scripts/build.sh release` | PASS | `android-release.log` |
 | Released desktop artifact | `dist/pige-2026.11.5-linux-x86_64` | PASS | `release-artifacts.txt` |
 | Released Android artifact | `dist/pige-2026.11.5-android-arm64.apk` | PASS | `release-artifacts.txt` |

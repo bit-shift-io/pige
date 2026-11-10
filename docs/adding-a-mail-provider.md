@@ -68,10 +68,11 @@ Implement the full page contract; partial or optimistic pages are not enough:
 2. **Delta sync**: resume from the checkpoint, include every changed membership
    and flag, and preserve unmentioned header fields. Only a completed scoped
    snapshot generation may remove records that are truly absent.
-3. **History recovery**: use `HistoryService`-shaped pages (`HistoryPage`) with
-   `HistoryCoverage`. History is learned for suggestions and is not inserted
-   into the visible mailbox cache automatically. Respect the durable learning
-   epoch, pause/clear state, and rate-limit retry time.
+3. **History recovery**: implement `MailboxService::history` and return
+   `HistoryPage` values with `HistoryCoverage`. History is learned for
+   suggestions and is not inserted into the visible mailbox cache
+   automatically. Respect the durable learning epoch, pause/clear state, and
+   rate-limit retry time.
 4. **Interrupted work**: after a process death, resume from the last committed
    page. Never replay an accepted non-idempotent write.
 5. **Sent copy**: advertise `SentCopyPolicy::ServerManaged` only when the
@@ -162,9 +163,10 @@ Privacy:
 Licenses and dependency gate:
 
 - Run `scripts/check-provider-boundaries.py` through the verify script. It
-  rejects the Go `gopenpgp-sys` backend, unapproved AGPL packages, and a second
-  owner of the native SQLite link slot. `proton-crypto` must stay on the
-  pure-Rust `rustpgp` backend with `default-features = false`.
+  checks the resolved graphs for both the Android target and the host desktop
+  target, rejecting the Go `gopenpgp-sys` backend, unapproved AGPL packages,
+  and a second owner of the native SQLite link slot. `proton-crypto` must stay
+  on the pure-Rust `rustpgp` backend with `default-features = false`.
 - Update `Cargo.lock` deliberately in a normal change, never as a side effect
   of verification. The verify script uses `--locked`.
 - Build the actual Android target before accepting a dependency or feature

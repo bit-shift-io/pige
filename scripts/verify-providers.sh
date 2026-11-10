@@ -28,6 +28,12 @@ cd "$ROOT/rust"
 echo "==> cargo fmt --all --check"
 cargo fmt --all --check
 
+# The vendored Proton fork is deliberately excluded from the workspace, so the
+# workspace fmt check cannot see it. Format it through its own manifest rather
+# than silently allowing drift in dependency code we publish.
+echo "==> cargo fmt --check (vendored proton-core)"
+cargo fmt --manifest-path vendor/proton-core/Cargo.toml --all --check
+
 if [[ "$MODE" == "all" ]]; then
     TEST_FLAGS=(--workspace --all-features)
     CLIPPY_FLAGS=(--workspace --all-targets --all-features)
@@ -56,20 +62,31 @@ done
 echo "==> cargo check -p pige_core --all-features"
 cargo check --locked -p pige_core --all-features
 
-# Dependency and license boundary gate. Inspect the *resolved Android graph*
-# with every provider feature enabled: an unfiltered cargo metadata still lists
-# inactive optional dependencies such as gopenpgp-sys and would false-positive
-# the gate. cargo tree is a second, independent view of which optional backend
-# features actually build.
+# Dependency and license boundary gate. Inspect the *resolved* graph with every
+# provider feature enabled: an unfiltered cargo metadata still lists inactive
+# optional dependencies such as gopenpgp-sys and would false-positive the gate.
+# Check both the Android target and the host desktop target so the AGPL/link
+# rules are not silently Android-only. cargo tree is a second, independent view
+# of which optional backend features actually build.
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+HOST="$(rustc -vV | awk '/^host:/ {print $2}')"
+
 echo "==> cargo metadata/tree + provider dependency gate (Android graph)"
 cargo metadata --locked --format-version 1 --all-features \
-    --filter-platform aarch64-linux-android > "$TMP/metadata.json"
+    --filter-platform aarch64-linux-android > "$TMP/metadata-android.json"
 cargo tree --locked --all-features --target aarch64-linux-android \
-    --edges features > "$TMP/tree.txt"
+    --edges features > "$TMP/tree-android.txt"
 python3 "$ROOT/scripts/check-provider-boundaries.py" \
-    --metadata "$TMP/metadata.json" --tree "$TMP/tree.txt"
+    --metadata "$TMP/metadata-android.json" --tree "$TMP/tree-android.txt"
+
+echo "==> cargo metadata/tree + provider dependency gate (desktop graph: $HOST)"
+cargo metadata --locked --format-version 1 --all-features \
+    --filter-platform "$HOST" > "$TMP/metadata-desktop.json"
+cargo tree --locked --all-features --target "$HOST" \
+    --edges features > "$TMP/tree-desktop.txt"
+python3 "$ROOT/scripts/check-provider-boundaries.py" \
+    --metadata "$TMP/metadata-desktop.json" --tree "$TMP/tree-desktop.txt"
 
 # The gate's own regression tests are deterministic fixtures; they do not touch
 # Cargo, the network, or any credential.

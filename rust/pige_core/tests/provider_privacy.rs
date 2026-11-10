@@ -17,24 +17,34 @@ use log::{LevelFilter, Log, Metadata, Record};
 use pige_core::MailBackend;
 use pige_core::account::{Account, AccountId, Security, ServerConfig};
 use pige_core::api::{self, AccountInput, Config};
-use pige_core::mail::{Address, Flags, MessageHeader};
+use pige_core::mail::{
+    Address, AttachmentDisposition, AttachmentPart, Flags, MessageHeader, MessageId, StoredMessage,
+    ThreadId,
+};
 use pige_core::platform::fake::{
     FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
 };
 use pige_core::platform::{BackupStore, CredentialStore};
-use pige_core::providers::fake::{
-    FakeCall, FakeProviderFactory, FakeProviderSession, FakeServices,
-};
+use pige_core::providers::fake::{FakeCall, FakeProviderFactory, FakeProviderSession};
 use pige_core::providers::{
     AddressBookService, ContactPage, ContactSourceId, ErrorKind, HistoryCoverage, HistoryPage,
-    IMAP_SMTP_PROVIDER, MessageRecord, OperationContext, PreparedSubmission, ProviderCursor,
-    ProviderError, ProviderFactory, ProviderId, RemoteContactId, RemoteMessageId, SentCopyPolicy,
-    SubmissionOutcome, SubmissionReceipt,
+    MessageRecord, OperationContext, PreparedSubmission, ProviderCursor, ProviderError,
+    ReconcileOutcome, RemoteContactId, RemoteMessageId, SentCopyPolicy, SubmissionAttachment,
+    SubmissionOutcome, SubmissionReceipt, SubmissionRequest, SubmissionService,
 };
-use pige_core::send::{OutgoingMessage, SubmissionState, outbox_entry, queue_submission};
+use pige_core::send::{
+    OutboxEntry, OutgoingMessage, SubmissionState, outbox_entry, queue_submission,
+};
 use pige_core::store::{Store, history_job};
+
+#[cfg(feature = "provider-proton")]
+use pige_core::providers::proton::ProtonKeyStores;
 use pige_core::sync::provider::WorkBudget;
+#[cfg(feature = "provider-proton")]
+use proton_core::crypto::keys::{AddressKeys, KeyStore as ProtonKeyStore, StoredKey};
 use rusqlite::Connection;
+#[cfg(feature = "provider-proton")]
+use secrecy::SecretString;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -135,9 +145,9 @@ fn ctx(account: &AccountId) -> OperationContext {
     OperationContext::with_timeout(account.clone(), 1, Duration::from_secs(5))
 }
 
-fn message(subject: &str) -> OutgoingMessage {
+fn message_for(account_id: &AccountId, subject: &str) -> OutgoingMessage {
     OutgoingMessage {
-        account_id: account().id,
+        account_id: account_id.clone(),
         to: vec![Address::new(None, "recipient@example.com")],
         cc: Vec::new(),
         bcc: Vec::new(),
@@ -210,6 +220,150 @@ fn assert_tree_lacks(root: &Path, needle: &str, context: &str) {
     }
 }
 
+/// Marker scan shared by the positive assertion and its negative control. The
+/// control asserts that deliberately injected markers *are* found, so a helper
+/// that silently stopped looking cannot make the clean run pass.
+fn scan_text(label: &str, text: &str, markers: &[&str]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for marker in markers {
+        if text.contains(marker) {
+            findings.push(format!("{label}: {marker}"));
+        }
+    }
+    findings
+}
+
+fn scan_bytes(label: &str, bytes: &[u8], markers: &[&str]) -> Vec<String> {
+    scan_text(label, &String::from_utf8_lossy(bytes), markers)
+}
+
+fn scan_tree(root: &Path, markers: &[&str]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for path in files_under(root) {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        findings.extend(scan_bytes(&path.display().to_string(), &bytes, markers));
+    }
+    findings
+}
+
+fn submission_request_fragments(request: &SubmissionRequest) -> Vec<(String, String)> {
+    let mut fragments = vec![
+        ("request debug".to_string(), format!("{request:?}")),
+        (
+            "request message".to_string(),
+            format!("{:?}", request.message),
+        ),
+        ("request operation".to_string(), request.operation.0.clone()),
+    ];
+    if let Some(prepared) = &request.prepared {
+        fragments.push((
+            "request prepared backend".to_string(),
+            prepared.backend.0.clone(),
+        ));
+        fragments.push((
+            "request prepared reference".to_string(),
+            prepared.reference.clone().unwrap_or_default(),
+        ));
+        if let Some(raw) = &prepared.raw {
+            fragments.push((
+                "request prepared raw".to_string(),
+                String::from_utf8_lossy(raw).into_owned(),
+            ));
+        }
+    }
+    for (index, attachment) in request.attachments.iter().enumerate() {
+        fragments.push((
+            format!("request attachment {index}"),
+            format!("{attachment:?}"),
+        ));
+        fragments.push((
+            format!("request attachment {index} bytes"),
+            String::from_utf8_lossy(&attachment.bytes).into_owned(),
+        ));
+    }
+    fragments
+}
+
+fn scan_submission_requests(requests: &[SubmissionRequest], markers: &[&str]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        for (label, text) in submission_request_fragments(request) {
+            findings.extend(scan_text(
+                &format!("request {index} {label}"),
+                &text,
+                markers,
+            ));
+        }
+    }
+    findings
+}
+
+fn scan_outbox_entry(entry: &OutboxEntry, markers: &[&str]) -> Vec<String> {
+    let mut fragments = vec![
+        ("outbox debug".to_string(), format!("{entry:?}")),
+        ("outbox message".to_string(), format!("{:?}", entry.message)),
+        ("outbox operation".to_string(), entry.operation_id.0.clone()),
+        (
+            "outbox backend".to_string(),
+            entry
+                .backend
+                .as_ref()
+                .map(|backend| backend.0.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "outbox error".to_string(),
+            entry.error.clone().unwrap_or_default(),
+        ),
+    ];
+    if let Some(raw) = &entry.raw {
+        fragments.push((
+            "outbox raw".to_string(),
+            String::from_utf8_lossy(raw).into_owned(),
+        ));
+    }
+    if let Some(prepared) = &entry.prepared {
+        fragments.push((
+            "outbox prepared backend".to_string(),
+            prepared.backend.0.clone(),
+        ));
+        fragments.push((
+            "outbox prepared reference".to_string(),
+            prepared.reference.clone().unwrap_or_default(),
+        ));
+        if let Some(raw) = &prepared.raw {
+            fragments.push((
+                "outbox prepared raw".to_string(),
+                String::from_utf8_lossy(raw).into_owned(),
+            ));
+        }
+    }
+    let mut findings = Vec::new();
+    for (label, text) in fragments {
+        findings.extend(scan_text(&label, &text, markers));
+    }
+    findings
+}
+
+fn scan_outbox_parts(parts: &[SubmissionAttachment], markers: &[&str]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        findings.extend(scan_text(
+            &format!("outbox part {index}"),
+            &format!("{part:?}"),
+            markers,
+        ));
+        findings.extend(scan_bytes(
+            &format!("outbox part {index} bytes"),
+            &part.bytes,
+            markers,
+        ));
+    }
+    findings
+}
+
 fn count_for(db_path: &Path, table: &str, account: &AccountId) -> i64 {
     let conn = Connection::open(db_path).expect("open database for projection count");
     conn.query_row(
@@ -218,6 +372,27 @@ fn count_for(db_path: &Path, table: &str, account: &AccountId) -> i64 {
         |row| row.get(0),
     )
     .unwrap_or_else(|error| panic!("count {table}: {error}"))
+}
+
+fn count_query(db_path: &Path, sql: &str, account: &AccountId) -> i64 {
+    let conn = Connection::open(db_path).expect("open database for projection count");
+    conn.query_row(sql, [&account.0], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count query {sql}: {error}"))
+}
+
+#[cfg(feature = "provider-proton")]
+fn synthetic_private_key_store() -> ProtonKeyStore {
+    ProtonKeyStore {
+        user_keys: Vec::new(),
+        addresses: vec![AddressKeys {
+            address_id: "synthetic-address".to_string(),
+            email: "privacy@example.com".to_string(),
+            keys: vec![StoredKey {
+                armored: PRIVATE_KEY_SENTINEL.to_string(),
+                passphrase: SecretString::from(String::new()),
+            }],
+        }],
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,15 +506,19 @@ async fn logs_and_debug_omit_secret_sentinels() {
     log::info!("privacy log capture probe");
 
     let error = ProviderError::new(ErrorKind::Transient, "provider unavailable")
-        .with_source_detail(format!("Authorization: Bearer {SECRET_SENTINEL}"));
-    assert!(
-        !format!("{error}").contains(SECRET_SENTINEL),
-        "Display must exclude adapter source detail"
-    );
-    assert!(
-        !format!("{error:?}").contains(SECRET_SENTINEL),
-        "Debug must exclude adapter source detail"
-    );
+        .with_source_detail(format!(
+            "Authorization: Bearer {SECRET_SENTINEL}\n{PRIVATE_KEY_SENTINEL}"
+        ));
+    for marker in [SECRET_SENTINEL, PRIVATE_KEY_SENTINEL] {
+        assert!(
+            !format!("{error}").contains(marker),
+            "Display must exclude adapter source detail ({marker})"
+        );
+        assert!(
+            !format!("{error:?}").contains(marker),
+            "Debug must exclude adapter source detail ({marker})"
+        );
+    }
     assert!(
         format!("{error:?}").contains("<redacted>"),
         "Debug must mark the source detail as redacted"
@@ -602,6 +781,60 @@ async fn remove_account_deletes_all_private_projection_rows() {
                 &history_page(CORRESPONDENT_SENTINEL, "remove-cp"),
             )
             .expect("history page");
+        // Cache content and a queued submission are private projections too:
+        // removal must cascade the message, its attachment, the outbox row, and
+        // the structured parts instead of only the contact/history tables.
+        let cached = StoredMessage {
+            id: MessageId("message-remove".to_string()),
+            account_id: id.clone(),
+            folder_id: None,
+            uid: None,
+            uidvalidity: None,
+            header: MessageHeader {
+                message_id: Some("<remove@example.com>".to_string()),
+                in_reply_to: None,
+                references: Vec::new(),
+                subject: "Private cached message".to_string(),
+                from: vec![Address::new(None, "sender@example.com")],
+                to: vec![Address::new(None, "privacy@example.com")],
+                cc: Vec::new(),
+                reply_to: Vec::new(),
+                bcc: Vec::new(),
+                date: 1_700_000_000,
+                size: 32,
+            },
+            flags: Flags::default(),
+            thread_id: ThreadId("thread-remove".to_string()),
+            snippet: "private snippet".to_string(),
+            has_attachments: true,
+        };
+        store.upsert_message(&cached).expect("cached message");
+        store
+            .store_attachments(
+                &cached.id,
+                &[AttachmentPart {
+                    part_id: "part-1".to_string(),
+                    filename: "private.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    size: 8,
+                    content_id: None,
+                    disposition: AttachmentDisposition::Attachment,
+                }],
+            )
+            .expect("cached attachment");
+        queue_submission(
+            &store,
+            message_for(&id, "Outbox removal fixture"),
+            vec![SubmissionAttachment {
+                id: "part-1".to_string(),
+                filename: "private.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                bytes: b"private!".to_vec(),
+                content_id: None,
+                disposition: AttachmentDisposition::Attachment,
+            }],
+        )
+        .expect("queued outbox fixture");
         // Ensure the durable learning-control row exists even on a fresh
         // account; it is one of the private projections removal must cascade.
         store
@@ -635,10 +868,30 @@ async fn remove_account_deletes_all_private_projection_rows() {
         "recipient_index",
         "recipient_tokens",
         "contact_source_state",
+        "messages",
+        "threads",
+        "outbox",
     ] {
         assert!(
             count_for(&harness.db_path(), table, &id) > 0,
             "{table} must have fixture rows before removal"
+        );
+    }
+    for (label, sql) in [
+        (
+            "attachments",
+            "SELECT COUNT(*) FROM attachments a
+             JOIN messages m ON m.id = a.message_id WHERE m.account_id = ?1",
+        ),
+        (
+            "outbox_parts",
+            "SELECT COUNT(*) FROM outbox_parts p
+             JOIN outbox o ON o.id = p.outbox_id WHERE o.account_id = ?1",
+        ),
+    ] {
+        assert!(
+            count_query(&harness.db_path(), sql, &id) > 0,
+            "{label} must have fixture rows before removal"
         );
     }
 
@@ -656,11 +909,32 @@ async fn remove_account_deletes_all_private_projection_rows() {
         "contact_source_state",
         "pending_auth",
         "switch_intents",
+        "messages",
+        "threads",
+        "outbox",
     ] {
         assert_eq!(
             count_for(&harness.db_path(), table, &id),
             0,
             "{table} rows must not survive account removal"
+        );
+    }
+    for (label, sql) in [
+        (
+            "attachments",
+            "SELECT COUNT(*) FROM attachments a
+             JOIN messages m ON m.id = a.message_id WHERE m.account_id = ?1",
+        ),
+        (
+            "outbox_parts",
+            "SELECT COUNT(*) FROM outbox_parts p
+             JOIN outbox o ON o.id = p.outbox_id WHERE o.account_id = ?1",
+        ),
+    ] {
+        assert_eq!(
+            count_query(&harness.db_path(), sql, &id),
+            0,
+            "{label} rows must not survive account removal"
         );
     }
 
@@ -680,56 +954,239 @@ async fn remove_account_deletes_all_private_projection_rows() {
     );
 }
 
-#[tokio::test]
-async fn outbox_artifacts_have_no_session_or_private_key() {
-    let _guard = TEST_LOCK.lock().await;
+/// A recording submission adapter that resolves the same session secret and
+/// (under the Proton feature) private-key store a real adapter would. `clean`
+/// only reads them; `inject_leak` copies them into the prepared artifact, which
+/// is the exact bug the privacy scan must catch.
+struct RecordingSubmission {
+    credentials: Arc<FakeCredentials>,
+    key_material: Option<String>,
+    prepared: PreparedSubmission,
+    inject_leak: bool,
+    requests: Vec<SubmissionRequest>,
+    prepare_calls: usize,
+    submit_calls: usize,
+}
+
+impl RecordingSubmission {
+    fn new(
+        credentials: Arc<FakeCredentials>,
+        key_material: Option<String>,
+        prepared: PreparedSubmission,
+        inject_leak: bool,
+    ) -> Self {
+        Self {
+            credentials,
+            key_material,
+            prepared,
+            inject_leak,
+            requests: Vec::new(),
+            prepare_calls: 0,
+            submit_calls: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl SubmissionService for RecordingSubmission {
+    fn sent_copy_policy(&self) -> SentCopyPolicy {
+        SentCopyPolicy::ServerManaged
+    }
+
+    async fn prepare(
+        &mut self,
+        request: &SubmissionRequest,
+        ctx: &OperationContext,
+    ) -> Result<PreparedSubmission, ProviderError> {
+        ctx.ensure_active()?;
+        // Prove the adapter really resolves the seeded secret and key material
+        // instead of the assertion passing because nothing was read.
+        let session = self
+            .credentials
+            .get(&request.message.account_id)
+            .map_err(ProviderError::transient)?
+            .ok_or_else(|| ProviderError::reauthenticate("synthetic session secret is missing"))?;
+        assert_eq!(session, SECRET_SENTINEL);
+        if let Some(key) = &self.key_material {
+            assert_eq!(key, PRIVATE_KEY_SENTINEL);
+        }
+
+        self.requests.push(request.clone());
+        self.prepare_calls += 1;
+        let mut prepared = self.prepared.clone();
+        if self.inject_leak {
+            let key = self
+                .key_material
+                .clone()
+                .unwrap_or_else(|| PRIVATE_KEY_SENTINEL.to_string());
+            prepared.reference = Some(format!("{SECRET_SENTINEL} {key}"));
+            prepared.raw = Some(
+                format!(
+                    "From: privacy@example.com\r\nTo: recipient@example.com\r\n\r\n\
+                     {SECRET_SENTINEL}\n{key}\n"
+                )
+                .into_bytes(),
+            );
+        }
+        Ok(prepared)
+    }
+
+    async fn submit(
+        &mut self,
+        request: &SubmissionRequest,
+        ctx: &OperationContext,
+    ) -> Result<SubmissionOutcome, ProviderError> {
+        ctx.ensure_active()?;
+        self.requests.push(request.clone());
+        self.submit_calls += 1;
+        Ok(SubmissionOutcome::Accepted(SubmissionReceipt {
+            operation: request.operation.clone(),
+            remote_message: None,
+            remote_thread: None,
+        }))
+    }
+
+    async fn reconcile(
+        &mut self,
+        _request: &SubmissionRequest,
+        _ctx: &OperationContext,
+    ) -> Result<ReconcileOutcome, ProviderError> {
+        Ok(ReconcileOutcome::NotAccepted)
+    }
+
+    async fn finalize_sent(
+        &mut self,
+        _request: &SubmissionRequest,
+        _receipt: &SubmissionReceipt,
+        _ctx: &OperationContext,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
+fn outbox_privacy_fixture() -> (Store, TempDir, Account, Arc<FakeCredentials>, KeyFixture) {
     let dir = TempDir::new().expect("temp dir");
     let store = open_store(&dir);
-
-    // The platform credential store owns the session/private material. It must
-    // never be copied into an outbox row or prepared artifact.
-    let credentials = FakeCredentials::default();
+    let account = account();
+    let credentials = Arc::new(FakeCredentials::default());
     credentials
-        .set(&account().id, SECRET_SENTINEL)
-        .expect("store synthetic secret");
+        .set_session(&account.id, SECRET_SENTINEL)
+        .expect("seed synthetic session secret");
     assert_eq!(
-        credentials.secret(&account().id).as_deref(),
-        Some(SECRET_SENTINEL)
+        credentials.secret(&account.id).as_deref(),
+        Some(SECRET_SENTINEL),
+        "the session secret must be readable from the credential store"
     );
+    let key_fixture = seed_private_key_fixture(&account.id);
+    (store, dir, account, credentials, key_fixture)
+}
 
-    let outbox_id =
-        queue_submission(&store, message("Outbox privacy"), Vec::new()).expect("queue submission");
-
-    let prepared = PreparedSubmission {
+fn outbox_prepared(account: &Account) -> PreparedSubmission {
+    PreparedSubmission {
         version: 1,
-        backend: ProviderId::from(IMAP_SMTP_PROVIDER),
+        backend: account.provider_id(),
         raw: Some(
             b"From: privacy@example.com\r\nTo: recipient@example.com\r\n\r\nhello\r\n".to_vec(),
         ),
         reference: Some("prepared/privacy".to_string()),
-    };
-    let script = FakeProviderSession::new()
-        .prepared(prepared)
-        .sent_copy_policy(SentCopyPolicy::ServerManaged)
-        .submission_outcome(SubmissionOutcome::Accepted(SubmissionReceipt {
-            operation: pige_core::providers::OperationId::new("outbox-privacy"),
-            remote_message: None,
-            remote_thread: None,
-        }));
-    let factory = FakeProviderFactory::new()
-        .services(FakeServices::submission_only())
-        .session(script);
-    let context = ctx(&account().id);
-    let mut session = factory
-        .open(&account(), &context)
-        .await
-        .expect("open submission provider");
-    let service = session.submission_service().expect("submission capability");
+    }
+}
 
-    pige_core::send::flush_provider_outbox(&store, &account(), service.as_mut(), &context)
+fn queue_privacy_fixture(store: &Store, account: &Account) -> pige_core::send::OutboxId {
+    queue_submission(
+        store,
+        message_for(&account.id, "Outbox privacy"),
+        vec![SubmissionAttachment {
+            id: "part-1".to_string(),
+            filename: "note.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            bytes: b"benign synthetic attachment".to_vec(),
+            content_id: None,
+            disposition: AttachmentDisposition::Attachment,
+        }],
+    )
+    .expect("queue submission")
+}
+
+#[cfg(feature = "provider-proton")]
+struct KeyFixture {
+    armored: String,
+    _stores: ProtonKeyStores,
+}
+
+#[cfg(not(feature = "provider-proton"))]
+struct KeyFixture;
+
+#[cfg(feature = "provider-proton")]
+fn seed_private_key_fixture(account: &AccountId) -> KeyFixture {
+    let keys = synthetic_private_key_store();
+    let armored = keys.addresses[0].keys[0].armored.clone();
+    let stores = ProtonKeyStores::new();
+    let unlocked = stores.get_or_create(account);
+    unlocked.install_test_keys("synthetic-uid", keys);
+    assert!(
+        unlocked.is_unlocked(),
+        "the synthetic private key store must be seeded"
+    );
+    KeyFixture {
+        armored,
+        _stores: stores,
+    }
+}
+
+#[cfg(not(feature = "provider-proton"))]
+fn seed_private_key_fixture(_account: &AccountId) -> KeyFixture {
+    KeyFixture
+}
+
+#[cfg(feature = "provider-proton")]
+fn key_material(fixture: &KeyFixture) -> Option<String> {
+    Some(fixture.armored.clone())
+}
+
+#[cfg(not(feature = "provider-proton"))]
+fn key_material(_fixture: &KeyFixture) -> Option<String> {
+    None
+}
+
+fn scan_outbox_artifacts(
+    requests: &[SubmissionRequest],
+    entry: &OutboxEntry,
+    parts: &[SubmissionAttachment],
+    root: &Path,
+    markers: &[&str],
+) -> Vec<String> {
+    let mut findings = scan_submission_requests(requests, markers);
+    findings.extend(scan_outbox_entry(entry, markers));
+    findings.extend(scan_outbox_parts(parts, markers));
+    // Scan the database file itself, not just the typed struct, so a stray
+    // diagnostic column would fail this test.
+    findings.extend(scan_tree(root, markers));
+    findings
+}
+
+#[tokio::test]
+async fn outbox_artifacts_have_no_session_or_private_key() {
+    let _guard = TEST_LOCK.lock().await;
+    let (store, dir, account, credentials, key_fixture) = outbox_privacy_fixture();
+    let outbox_id = queue_privacy_fixture(&store, &account);
+
+    let mut service = RecordingSubmission::new(
+        credentials,
+        key_material(&key_fixture),
+        outbox_prepared(&account),
+        false,
+    );
+    let context = ctx(&account.id);
+    pige_core::send::flush_provider_outbox(&store, &account, &mut service, &context)
         .await
         .expect("flush provider outbox");
 
+    assert_eq!(
+        service.prepare_calls, 1,
+        "prepare must run for the queued row"
+    );
+    assert_eq!(service.submit_calls, 1, "submit must run once");
     let entry = outbox_entry(&store, &outbox_id)
         .expect("read outbox entry")
         .expect("outbox entry");
@@ -745,14 +1202,66 @@ async fn outbox_artifacts_have_no_session_or_private_key() {
         entry.prepared.is_some(),
         "the accepted artifact must be durable for reconciliation"
     );
-    let debug = format!("{entry:?}");
-    assert!(!debug.contains(SECRET_SENTINEL));
-    assert!(!debug.contains(PRIVATE_KEY_SENTINEL));
+    let parts = store.outbox_parts(&outbox_id).expect("outbox parts");
+    assert_eq!(parts.len(), 1, "the structured part must be durable");
 
-    // Scan the database file itself, not just the typed struct, so a stray
-    // diagnostic column would fail this test.
-    assert_tree_lacks(dir.path(), SECRET_SENTINEL, "outbox database");
-    assert_tree_lacks(dir.path(), PRIVATE_KEY_SENTINEL, "outbox database");
+    let markers = [SECRET_SENTINEL, PRIVATE_KEY_SENTINEL];
+    let findings = scan_outbox_artifacts(&service.requests, &entry, &parts, dir.path(), &markers);
+    assert!(
+        findings.is_empty(),
+        "outbox request, prepared artifact, row, parts, or database leaked synthetic material:\n{findings:#?}"
+    );
+}
+
+/// Negative control: if an adapter copies the same seeded session/key material
+/// into the prepared artifact, every scan must report it. Without this, a
+/// broken or empty scanner could make the positive test above pass.
+#[tokio::test]
+async fn outbox_privacy_scan_detects_injected_session_or_private_key() {
+    let _guard = TEST_LOCK.lock().await;
+    let (store, dir, account, credentials, key_fixture) = outbox_privacy_fixture();
+    let outbox_id = queue_privacy_fixture(&store, &account);
+
+    let mut service = RecordingSubmission::new(
+        credentials,
+        key_material(&key_fixture),
+        outbox_prepared(&account),
+        true,
+    );
+    let context = ctx(&account.id);
+    pige_core::send::flush_provider_outbox(&store, &account, &mut service, &context)
+        .await
+        .expect("flush leaky provider outbox");
+
+    let entry = outbox_entry(&store, &outbox_id)
+        .expect("read outbox entry")
+        .expect("outbox entry");
+    let parts = store.outbox_parts(&outbox_id).expect("outbox parts");
+    let markers = [SECRET_SENTINEL, PRIVATE_KEY_SENTINEL];
+
+    let request_findings = scan_submission_requests(&service.requests, &markers);
+    let entry_findings = scan_outbox_entry(&entry, &markers);
+    let database_findings = scan_tree(dir.path(), &markers);
+    assert!(
+        !request_findings.is_empty(),
+        "the scan must detect a leak in the SubmissionRequest handed to the adapter"
+    );
+    assert!(
+        !entry_findings.is_empty(),
+        "the scan must detect a leak in the persisted outbox/prepared artifact"
+    );
+    assert!(
+        !database_findings.is_empty(),
+        "the scan must detect a leak in the database file"
+    );
+
+    let findings = scan_outbox_artifacts(&service.requests, &entry, &parts, dir.path(), &markers);
+    for marker in markers {
+        assert!(
+            findings.iter().any(|finding| finding.contains(marker)),
+            "the leak scan missed {marker:?}:\n{findings:#?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
