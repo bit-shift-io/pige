@@ -192,10 +192,7 @@ impl Store {
 
     /// The folder a message was read under plus its first remote mapping, for
     /// the IMAP read path. `None` when the message row does not exist.
-    pub fn message_location(
-        &self,
-        id: &MessageId,
-    ) -> Result<Option<MessageLocation>, StoreError> {
+    pub fn message_location(&self, id: &MessageId) -> Result<Option<MessageLocation>, StoreError> {
         let conn = self.connection();
         let exists: Option<String> = conn
             .query_row("SELECT id FROM messages WHERE id = ?1", [&id.0], |row| {

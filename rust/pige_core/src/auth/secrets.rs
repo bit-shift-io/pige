@@ -63,7 +63,10 @@ impl fmt::Debug for ProtonSessionSecret {
         formatter
             .debug_struct("ProtonSessionSecret")
             .field("uid", &self.uid.as_ref().map(|_| "<present>"))
-            .field("access_token", &self.access_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
             .field(
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "<redacted>"),
@@ -157,10 +160,10 @@ impl SecretEnvelope {
                 "protected secret format {} is newer than supported format {}",
                 wire.version, SECRET_ENVELOPE_VERSION
             ))),
-            Err(error) => Err(ProviderError::transient(
-                "the protected secret could not be read",
-            )
-            .with_source_detail(error.to_string())),
+            Err(error) => Err(
+                ProviderError::transient("the protected secret could not be read")
+                    .with_source_detail(error.to_string()),
+            ),
         }
     }
 }
@@ -216,7 +219,9 @@ impl StoredCredentials {
 }
 
 fn expose(secret: &Option<SecretString>) -> Option<String> {
-    secret.as_ref().map(|value| value.expose_secret().to_string())
+    secret
+        .as_ref()
+        .map(|value| value.expose_secret().to_string())
 }
 
 impl fmt::Debug for SecretEnvelope {
@@ -235,7 +240,10 @@ impl fmt::Debug for StoredCredentials {
             Self::Password(_) => formatter.write_str("Password(<redacted>)"),
             Self::Google(secret) => formatter
                 .debug_struct("Google")
-                .field("access_token", &secret.access_token.as_ref().map(|_| "<redacted>"))
+                .field(
+                    "access_token",
+                    &secret.access_token.as_ref().map(|_| "<redacted>"),
+                )
                 .field(
                     "refresh_token",
                     &secret.refresh_token.as_ref().map(|_| "<redacted>"),
@@ -246,7 +254,10 @@ impl fmt::Debug for StoredCredentials {
             Self::Proton(secret) => formatter
                 .debug_struct("Proton")
                 .field("uid", &secret.uid.as_ref().map(|_| "<present>"))
-                .field("access_token", &secret.access_token.as_ref().map(|_| "<redacted>"))
+                .field(
+                    "access_token",
+                    &secret.access_token.as_ref().map(|_| "<redacted>"),
+                )
                 .field(
                     "refresh_token",
                     &secret.refresh_token.as_ref().map(|_| "<redacted>"),
@@ -656,8 +667,11 @@ pub fn store_error_to_provider(error: StoreError) -> ProviderError {
 pub fn credential_error(message: impl Into<String>) -> ProviderError {
     let message = message.into();
     if credentials_unavailable(&message) {
-        ProviderError::new(ErrorKind::Unsupported, "the credential store is unavailable")
-            .with_source_detail(message)
+        ProviderError::new(
+            ErrorKind::Unsupported,
+            "the credential store is unavailable",
+        )
+        .with_source_detail(message)
     } else {
         ProviderError::transient("could not access the account credential")
             .with_source_detail(message)

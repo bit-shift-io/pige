@@ -97,7 +97,8 @@ mod tests {
     #[test]
     fn prefetch_defaults_on_and_an_old_document_still_loads() {
         assert!(Settings::default().prefetch_bodies);
-        let old = r#"{"sync_minutes":15,"notifications":true,"background_sync":true,"theme":"system"}"#;
+        let old =
+            r#"{"sync_minutes":15,"notifications":true,"background_sync":true,"theme":"system"}"#;
         let parsed: Settings = serde_json::from_str(old).unwrap();
         assert!(parsed.prefetch_bodies, "missing key must default to on");
     }

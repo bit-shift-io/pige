@@ -14,9 +14,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::mail::{
-    FolderKind, Uid, body_parts, check_attachment_size, extract_attachments,
-};
+use crate::mail::{FolderKind, Uid, body_parts, check_attachment_size, extract_attachments};
 use crate::providers::error::ProviderError;
 use crate::providers::traits::MailboxService;
 use crate::providers::types::{
@@ -108,7 +106,11 @@ impl ImapMailbox {
 
     /// Begin a crawl: capture the ordered mailbox list and an empty cursor.
     async fn start_history(&mut self) -> Result<ImapHistoryState, ProviderError> {
-        let folders = self.transport.list_folders().await.map_err(transport_error)?;
+        let folders = self
+            .transport
+            .list_folders()
+            .await
+            .map_err(transport_error)?;
         Ok(ImapHistoryState {
             v: HISTORY_CURSOR_VERSION,
             mailboxes: folders.into_iter().map(|folder| folder.name).collect(),
@@ -128,7 +130,11 @@ impl MailboxService for ImapMailbox {
         ctx: &OperationContext,
     ) -> Result<Vec<CollectionRecord>, ProviderError> {
         ctx.ensure_active()?;
-        let folders = self.transport.list_folders().await.map_err(transport_error)?;
+        let folders = self
+            .transport
+            .list_folders()
+            .await
+            .map_err(transport_error)?;
         Ok(folders
             .into_iter()
             .map(|folder| CollectionRecord {
@@ -269,8 +275,8 @@ impl MailboxService for ImapMailbox {
             break;
         }
 
-        let has_more =
-            rebaselined || (produced && (more_in_mailbox || state.index + 1 < state.mailboxes.len()));
+        let has_more = rebaselined
+            || (produced && (more_in_mailbox || state.index + 1 < state.mailboxes.len()));
         let checkpoint = encode_history_cursor(&state)?;
 
         Ok(HistoryPage {
@@ -327,7 +333,9 @@ fn body_content(raw: &[u8]) -> BodyContent {
     }
 }
 
-fn encode_history_cursor(state: &ImapHistoryState) -> Result<crate::providers::ProviderCursor, ProviderError> {
+fn encode_history_cursor(
+    state: &ImapHistoryState,
+) -> Result<crate::providers::ProviderCursor, ProviderError> {
     let payload = serde_json::to_string(state).map_err(|error| {
         ProviderError::transient("could not encode the history cursor")
             .with_source_detail(error.to_string())

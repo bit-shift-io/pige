@@ -43,6 +43,8 @@ fn settings_round_trip_in_the_configuration_document() {
     };
     config::save(&path, &doc).expect("save document");
 
-    let loaded = config::load(&path).expect("load document").expect("document");
+    let loaded = config::load(&path)
+        .expect("load document")
+        .expect("document");
     assert_eq!(loaded.settings, settings);
 }

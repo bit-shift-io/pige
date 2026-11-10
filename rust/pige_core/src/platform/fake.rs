@@ -19,7 +19,8 @@ use crate::transport::{
 };
 
 use super::{
-    BackupStore, CredentialStore, CredentialsUnavailable, Notifier, Opener, Result, TransportFactory,
+    BackupStore, CredentialStore, CredentialsUnavailable, Notifier, Opener, Result,
+    TransportFactory,
 };
 
 /// In-memory password store.

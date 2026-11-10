@@ -19,13 +19,13 @@ use async_trait::async_trait;
 use crate::account::Account;
 use crate::mail::{Address, Flags, FolderKind};
 use crate::platform::TransportFactory;
+use crate::providers::ErrorKind;
 use crate::providers::error::ProviderError;
 use crate::providers::traits::SubmissionService;
 use crate::providers::types::{
     OperationContext, PreparedSubmission, ReconcileOutcome, SentCopyPolicy, SubmissionOutcome,
     SubmissionReceipt, SubmissionRequest,
 };
-use crate::providers::ErrorKind;
 use crate::send::compose::{build_mime_with_parts, raw_message_id};
 use crate::transport::{RemoteFolder, TransportError};
 
@@ -45,8 +45,7 @@ impl ImapSubmission {
 
     fn sender_address(&self) -> Address {
         Address::new(
-            Some(self.account.display_name.clone())
-                .filter(|name| !name.trim().is_empty()),
+            Some(self.account.display_name.clone()).filter(|name| !name.trim().is_empty()),
             self.account.email.clone(),
         )
     }
@@ -72,8 +71,12 @@ impl SubmissionService for ImapSubmission {
             return Ok(prepared.clone());
         }
 
-        let raw = build_mime_with_parts(&self.sender_address(), &request.message, &request.attachments)
-            .map_err(|error| ProviderError::new(ErrorKind::Forbidden, error.to_string()))?;
+        let raw = build_mime_with_parts(
+            &self.sender_address(),
+            &request.message,
+            &request.attachments,
+        )
+        .map_err(|error| ProviderError::new(ErrorKind::Forbidden, error.to_string()))?;
         Ok(PreparedSubmission {
             version: 1,
             backend: self.account.provider_id(),
@@ -104,14 +107,9 @@ impl SubmissionService for ImapSubmission {
 
         // A failure to open the SMTP connection means nothing was delivered, so
         // the queued row can be retried safely.
-        let mut smtp = self
-            .transports
-            .smtp(&self.account)
-            .await
-            .map_err(|error| {
-                ProviderError::offline("the mail server is not reachable")
-                    .with_source_detail(error)
-            })?;
+        let mut smtp = self.transports.smtp(&self.account).await.map_err(|error| {
+            ProviderError::offline("the mail server is not reachable").with_source_detail(error)
+        })?;
 
         match smtp.send_raw(&from, &recipients, &raw).await {
             Ok(()) => Ok(SubmissionOutcome::Accepted(SubmissionReceipt {
@@ -122,10 +120,10 @@ impl SubmissionService for ImapSubmission {
             // The connection was established before `send_raw`, so the server
             // may have accepted the message before the failure. Never report a
             // definite rejection here; the durable state becomes uncertain.
-            Err(error) => Err(
-                ProviderError::unknown_write_outcome("SMTP delivery did not complete")
-                    .with_source_detail(error.to_string()),
-            ),
+            Err(error) => Err(ProviderError::unknown_write_outcome(
+                "SMTP delivery did not complete",
+            )
+            .with_source_detail(error.to_string())),
         }
     }
 
@@ -162,14 +160,9 @@ impl SubmissionService for ImapSubmission {
             ));
         };
 
-        let mut imap = self
-            .transports
-            .imap(&self.account)
-            .await
-            .map_err(|error| {
-                ProviderError::transient("could not reach the Sent folder")
-                    .with_source_detail(error)
-            })?;
+        let mut imap = self.transports.imap(&self.account).await.map_err(|error| {
+            ProviderError::transient("could not reach the Sent folder").with_source_detail(error)
+        })?;
         let folders = imap
             .list_folders()
             .await
@@ -200,15 +193,12 @@ impl SubmissionService for ImapSubmission {
             ));
         };
         let query = format!("HEADER Message-ID \"{}\"", message_id.replace('"', ""));
-        let existing = imap
-            .search(&query)
-            .await
-            .map_err(|error| {
-                ProviderError::unknown_write_outcome(
-                    "the Sent folder could not be checked before appending",
-                )
-                .with_source_detail(error.to_string())
-            })?;
+        let existing = imap.search(&query).await.map_err(|error| {
+            ProviderError::unknown_write_outcome(
+                "the Sent folder could not be checked before appending",
+            )
+            .with_source_detail(error.to_string())
+        })?;
         if !existing.is_empty() {
             return Ok(());
         }
@@ -232,5 +222,6 @@ impl SubmissionService for ImapSubmission {
 /// converted into a transport error that the outbox could mistake for delivery;
 /// the copy is simply retried later.
 fn sent_copy_transport_error(error: TransportError) -> ProviderError {
-    ProviderError::transient("the Sent copy could not be written").with_source_detail(error.to_string())
+    ProviderError::transient("the Sent copy could not be written")
+        .with_source_detail(error.to_string())
 }

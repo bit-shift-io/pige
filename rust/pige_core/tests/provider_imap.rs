@@ -64,9 +64,7 @@ fn factory(transports: Arc<FakeTransportFactory>) -> ImapProviderFactory {
     )
 }
 
-async fn open(
-    transports: Arc<FakeTransportFactory>,
-) -> pige_core::providers::ProviderSession {
+async fn open(transports: Arc<FakeTransportFactory>) -> pige_core::providers::ProviderSession {
     factory(transports)
         .open(&account(), &context())
         .await
@@ -112,22 +110,13 @@ fn message(uid: u32, subject: &str) -> RemoteMessage {
 
 /// Drain every history page, newest first, returning the decoded UIDs in order
 /// and how many pages were needed.
-async fn drain_history(
-    service: &mut Box<dyn MailboxService>,
-    page_size: u32,
-) -> (Vec<u32>, usize) {
+async fn drain_history(service: &mut Box<dyn MailboxService>, page_size: u32) -> (Vec<u32>, usize) {
     let mut uids = Vec::new();
     let mut cursor = None;
     let mut pages = 0;
     loop {
         let page = service
-            .history(
-                HistoryRequest {
-                    cursor,
-                    page_size,
-                },
-                &context(),
-            )
+            .history(HistoryRequest { cursor, page_size }, &context())
             .await
             .expect("history page");
         for record in &page.messages {
@@ -158,10 +147,7 @@ async fn explicit_identity_selects_correct_mailbox() {
             folders: vec![folder(mailbox, FolderKind::Other)],
             states: HashMap::from([(mailbox.to_string(), state(7, 2))]),
             messages: HashMap::from([(mailbox.to_string(), vec![message(1, "stored")])]),
-            bodies: HashMap::from([(
-                mailbox.to_string(),
-                HashMap::from([(Uid(1), raw.to_vec())]),
-            )]),
+            bodies: HashMap::from([(mailbox.to_string(), HashMap::from([(Uid(1), raw.to_vec())]))]),
             ..FakeTransport::default()
         },
     );
@@ -411,7 +397,11 @@ async fn header_history_never_fetches_body() {
             states: HashMap::from([("INBOX".to_string(), state(1, 50_001))]),
             messages: HashMap::from([(
                 "INBOX".to_string(),
-                vec![message(1, "one"), message(900, "nine"), message(50_000, "big")],
+                vec![
+                    message(1, "one"),
+                    message(900, "nine"),
+                    message(50_000, "big"),
+                ],
             )]),
             // A body is scripted; history must not ask for it.
             bodies: HashMap::from([(

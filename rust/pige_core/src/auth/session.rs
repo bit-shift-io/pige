@@ -84,10 +84,12 @@ impl AccountSessionManager {
     ) -> Result<OperationContext, ProviderError> {
         let mut sessions = self.sessions();
         let durable = self.generation(account)?;
-        let state = sessions.entry(account.clone()).or_insert_with(|| SessionState {
-            generation: durable,
-            cancellation: CancellationToken::new(),
-        });
+        let state = sessions
+            .entry(account.clone())
+            .or_insert_with(|| SessionState {
+                generation: durable,
+                cancellation: CancellationToken::new(),
+            });
         // Only ever advance: never lower the in-process generation back to a
         // stale durable value.
         if durable > state.generation {
@@ -122,10 +124,12 @@ impl AccountSessionManager {
                 .map_err(store_error_to_provider)
         })?;
         let mut sessions = self.sessions();
-        let state = sessions.entry(account.clone()).or_insert_with(|| SessionState {
-            generation,
-            cancellation: CancellationToken::new(),
-        });
+        let state = sessions
+            .entry(account.clone())
+            .or_insert_with(|| SessionState {
+                generation,
+                cancellation: CancellationToken::new(),
+            });
         if state.generation < generation {
             state.cancellation.cancel();
             state.cancellation = CancellationToken::new();
@@ -158,12 +162,16 @@ impl AccountSessionManager {
 
     /// Release a held lease.
     pub fn release_lease(&self, lease: &AccountLease) -> Result<(), ProviderError> {
-        self.store.release_lease(lease).map_err(store_error_to_provider)
+        self.store
+            .release_lease(lease)
+            .map_err(store_error_to_provider)
     }
 
     /// Verify a lease is still ours before a durable write.
     pub fn ensure_lease(&self, lease: &AccountLease) -> Result<(), ProviderError> {
-        self.store.ensure_lease(lease).map_err(store_error_to_provider)
+        self.store
+            .ensure_lease(lease)
+            .map_err(store_error_to_provider)
     }
 }
 

@@ -189,6 +189,9 @@ mod tests {
         );
         // 1000 px is the layout limit; a Fill height would hit it.
         assert!(node.bounds().height < 100.0, "toast stretched: {node:?}");
-        assert!(node.bounds().width <= 360.0, "toast exceeded the width limit");
+        assert!(
+            node.bounds().width <= 360.0,
+            "toast exceeded the width limit"
+        );
     }
 }

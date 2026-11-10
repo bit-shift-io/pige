@@ -523,7 +523,9 @@ fn pinned_key_policy_card(key: &str, signer: Option<&GeneratedKey>) -> Value {
         "BEGIN:VCARD\nVERSION:4.0\nEMAIL:verify@example.com\nX-PM-ENCRYPT:true\nX-PM-VERIFY:true\nKEY;ENCODING=b:base64,{}\nEND:VCARD",
         STANDARD.encode(key.as_bytes())
     );
-    let signature = signer.map(|signer| sign_card(&vcard, signer)).unwrap_or_default();
+    let signature = signer
+        .map(|signer| sign_card(&vcard, signer))
+        .unwrap_or_default();
     json!({"Type": "CLEAR", "Data": vcard, "Signature": signature})
 }
 
@@ -1426,8 +1428,8 @@ async fn prepared_alias_survives_restart() {
     );
     let mock = ProtonMock::start(state).await;
     let mut req = request(message(vec!["bob@proton.example"], vec![], vec![]));
-    let mut first = ProtonSubmission::new(mock.client(keys.clone()), account())
-        .with_sender_alias(alias);
+    let mut first =
+        ProtonSubmission::new(mock.client(keys.clone()), account()).with_sender_alias(alias);
     req.prepared = Some(first.prepare(&req, &context()).await.expect("prepare"));
 
     // A restarted service has no `with_sender_alias`; the prepared evidence is

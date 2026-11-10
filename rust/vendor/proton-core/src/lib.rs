@@ -89,4 +89,3 @@ pub use transport::{AuthState, Body, Doer, HttpClient, HvResolver, Request, Resp
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
-

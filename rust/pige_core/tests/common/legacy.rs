@@ -24,7 +24,8 @@ impl LegacyV4 {
         store.migrate_to(4).expect("migrate to v4");
         drop(store);
         let conn = Connection::open(path).expect("open raw connection");
-        conn.execute_batch("PRAGMA foreign_keys=OFF;").expect("fk off");
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")
+            .expect("fk off");
         Self {
             conn,
             path: path.to_path_buf(),
@@ -46,7 +47,14 @@ impl LegacyV4 {
         self
     }
 
-    pub fn folder(&self, id: &str, account: &str, name: &str, kind: &str, uidvalidity: u32) -> &Self {
+    pub fn folder(
+        &self,
+        id: &str,
+        account: &str,
+        name: &str,
+        kind: &str,
+        uidvalidity: u32,
+    ) -> &Self {
         self.conn
             .execute(
                 "INSERT INTO folders (
@@ -136,7 +144,14 @@ impl LegacyV4 {
     }
 
     /// Insert a pre-existing FTS row, as the v2 backfill would have.
-    pub fn fts(&self, message_id: &str, account: &str, folder: &str, subject: &str, body: &str) -> &Self {
+    pub fn fts(
+        &self,
+        message_id: &str,
+        account: &str,
+        folder: &str,
+        subject: &str,
+        body: &str,
+    ) -> &Self {
         self.conn
             .execute(
                 "INSERT INTO message_fts (
@@ -191,10 +206,7 @@ impl LegacyV4 {
             }
         }
         {
-            let mut statement = self
-                .conn
-                .prepare("PRAGMA foreign_key_check")
-                .expect("prep");
+            let mut statement = self.conn.prepare("PRAGMA foreign_key_check").expect("prep");
             let mut rows = statement.query([]).expect("query");
             while let Some(row) = rows.next().expect("row") {
                 problems.push(format!("foreign key violation: {row:?}"));

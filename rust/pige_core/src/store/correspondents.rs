@@ -1729,10 +1729,7 @@ fn learning_state_in(
 /// Reject a page that was produced before the account's learning controls last
 /// moved. Clear/rebuild also set the source-specific disabled flags, which the
 /// caller checks separately.
-fn check_learning_write_in(
-    state: &LearningState,
-    expected_epoch: u64,
-) -> Result<(), StoreError> {
+fn check_learning_write_in(state: &LearningState, expected_epoch: u64) -> Result<(), StoreError> {
     if state.epoch != expected_epoch {
         return Err(StoreError::StaleLearningEpoch {
             expected: expected_epoch,

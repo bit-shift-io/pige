@@ -33,9 +33,13 @@ impl Row {
 
     pub(crate) fn subtitle(self) -> &'static str {
         match self {
-            Row::Backup => "Saves accounts and settings to a dated file in Downloads. Passwords are not included.",
+            Row::Backup => {
+                "Saves accounts and settings to a dated file in Downloads. Passwords are not included."
+            }
             Row::Restore => "Replaces accounts and settings with a backup from Downloads.",
-            Row::FactoryReset => "Wipes every account, setting and cached message, after confirmation.",
+            Row::FactoryReset => {
+                "Wipes every account, setting and cached message, after confirmation."
+            }
         }
     }
 
@@ -58,8 +62,7 @@ pub(crate) const NO_BACKUPS: &str = "No backups found in Downloads.";
 
 /// Shown after sending the user to the system "All files access" screen, so a
 /// second press of Restore lists the backups the previous install wrote.
-pub(crate) const NEEDS_ALL_FILES_ACCESS: &str =
-    "pige needs \"All files access\" to read backups from Downloads. Enable it, then press Restore again.";
+pub(crate) const NEEDS_ALL_FILES_ACCESS: &str = "pige needs \"All files access\" to read backups from Downloads. Enable it, then press Restore again.";
 
 /// The toast copy for a finished backup.
 pub(crate) fn backup_message(result: &Result<String, String>) -> String {
@@ -96,9 +99,7 @@ pub(crate) fn view(_app: &App) -> Element<'_, Message> {
         Message::CloseAdvanced,
     ));
 
-    let mut body = column![]
-        .spacing(palette.space.md)
-        .width(Fill);
+    let mut body = column![].spacing(palette.space.md).width(Fill);
     for row in rows() {
         body = body.push(components::action_card(
             row.label(),
@@ -204,7 +205,10 @@ mod tests {
             warnings: Vec::new(),
         };
         let message = restore_message(&Ok(outcome), "a.json");
-        assert!(message.contains("Config restored from a.json."), "{message}");
+        assert!(
+            message.contains("Config restored from a.json."),
+            "{message}"
+        );
         assert!(message.to_lowercase().contains("password"), "{message}");
 
         assert_eq!(

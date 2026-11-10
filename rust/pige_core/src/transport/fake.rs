@@ -205,7 +205,8 @@ impl MailTransport for FakeTransport {
         // UIDVALIDITY, and the very next `select`/`list_uids` sees the new one.
         self.history_fetches += 1;
         if self.rotate_after_history_fetches == Some(self.history_fetches) {
-            self.messages.extend(std::mem::take(&mut self.rotated_messages));
+            self.messages
+                .extend(std::mem::take(&mut self.rotated_messages));
             self.states.extend(std::mem::take(&mut self.rotated_states));
             self.rotate_after_history_fetches = None;
         }

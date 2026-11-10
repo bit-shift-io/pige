@@ -105,7 +105,8 @@ impl MailboxService for ProtonMailbox {
                 let verify = sender_verification_keys(&http, &message.meta.sender.address).await;
                 ctx.ensure_active()?;
                 let (bytes, verdict) = decrypt_body(&self.client, &message, &verify)?;
-                let (plain, html) = split_body(&String::from_utf8_lossy(&bytes), &message.mime_type);
+                let (plain, html) =
+                    split_body(&String::from_utf8_lossy(&bytes), &message.mime_type);
                 (plain, html, signature_status(verdict))
             }
         };
@@ -138,9 +139,10 @@ impl MailboxService for ProtonMailbox {
         if attachment.size > MAX_ATTACHMENT_BYTES {
             return Err(too_large("attachment"));
         }
-        let key_packets = attachment.key_packets.as_deref().ok_or_else(|| {
-            ProviderError::unsupported("an unencrypted native Proton attachment")
-        })?;
+        let key_packets = attachment
+            .key_packets
+            .as_deref()
+            .ok_or_else(|| ProviderError::unsupported("an unencrypted native Proton attachment"))?;
         let data = http.finish(api::attachments::get_attachment(&http, id.as_str()).await)?;
         if data.len() as u64 > MAX_ENCRYPTED_ATTACHMENT_BYTES {
             return Err(too_large("encrypted attachment"));
@@ -358,9 +360,7 @@ async fn sender_verification_keys(http: &ProtonHttp, email: &str) -> Vec<String>
     if email.trim().is_empty() {
         return Vec::new();
     }
-    match http
-        .finish(api::keys::get_all_public_keys(http, email).await)
-    {
+    match http.finish(api::keys::get_all_public_keys(http, email).await) {
         Ok(keys) => keys
             .keys
             .into_iter()
@@ -435,10 +435,11 @@ fn decrypt_body(
             )
             .with_source_detail(last_error.unwrap_or_default()));
         }
-        Err(
-            ProviderError::new(ErrorKind::Unsupported, "decrypting this Proton message body")
-                .with_source_detail(last_error.unwrap_or_default()),
+        Err(ProviderError::new(
+            ErrorKind::Unsupported,
+            "decrypting this Proton message body",
         )
+        .with_source_detail(last_error.unwrap_or_default()))
     })?
 }
 

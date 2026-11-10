@@ -1140,11 +1140,7 @@ async fn google_other_kind_plumbing_sweeps_a_completed_people_snapshot() {
         color: None,
     };
     document.accounts.push(account.clone());
-    pige_core::config::save(
-        &pige_core::config::document_path(&config_dir),
-        &document,
-    )
-    .unwrap();
+    pige_core::config::save(&pige_core::config::document_path(&config_dir), &document).unwrap();
 
     api::reset_for_tests();
     api::init(Config {

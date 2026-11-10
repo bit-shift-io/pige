@@ -234,10 +234,12 @@ async fn uidvalidity_change_drops_stale_messages_and_refetches() {
     let folders = store.folders(&account.id).unwrap();
     let messages = store.messages(&folders[0].id, 20, None).unwrap();
     assert_eq!(messages.len(), 2);
-    assert!(messages.iter().all(|m| store
-        .imap_coords(&m.id)
-        .unwrap()
-        .is_some_and(|coords| coords.uidvalidity == 2)));
+    assert!(messages.iter().all(|m| {
+        store
+            .imap_coords(&m.id)
+            .unwrap()
+            .is_some_and(|coords| coords.uidvalidity == 2)
+    }));
     let subjects: Vec<&str> = messages.iter().map(|m| m.header.subject.as_str()).collect();
     assert!(subjects.contains(&"fresh-one"));
     assert!(subjects.contains(&"fresh-two"));
@@ -285,7 +287,10 @@ async fn flag_changes_are_reconciled_without_refetching_headers() {
 
     let folders = store.folders(&account.id).unwrap();
     let messages = store.messages(&folders[0].id, 20, None).unwrap();
-    let seen = messages.iter().find(|m| uid_of(&store, m) == Uid(1)).unwrap();
+    let seen = messages
+        .iter()
+        .find(|m| uid_of(&store, m) == Uid(1))
+        .unwrap();
     assert!(seen.flags.seen);
 
     // Headers were not refetched for already-cached UIDs.
@@ -380,7 +385,10 @@ async fn newest_snippets_are_filled_without_fetching_full_bodies() {
     let stored = store.messages(&folders[0].id, 200, None).unwrap();
     assert_eq!(stored.len(), 100);
     for message in &stored {
-        assert_eq!(message.snippet, format!("snippet {}", uid_of(&store, message).0));
+        assert_eq!(
+            message.snippet,
+            format!("snippet {}", uid_of(&store, message).0)
+        );
     }
 
     // Full bodies were never fetched.

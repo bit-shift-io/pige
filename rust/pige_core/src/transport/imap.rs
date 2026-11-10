@@ -189,7 +189,11 @@ impl MailTransport for ImapTransport {
     }
 
     async fn list_uids(&mut self) -> Result<Vec<Uid>, TransportError> {
-        let uids = self.session.uid_search("ALL").await.map_err(transport_err)?;
+        let uids = self
+            .session
+            .uid_search("ALL")
+            .await
+            .map_err(transport_err)?;
         let mut uids: Vec<Uid> = uids.into_iter().map(Uid).collect();
         // UIDs are sparse; sort for a deterministic, ascending view. Never
         // densify the set.

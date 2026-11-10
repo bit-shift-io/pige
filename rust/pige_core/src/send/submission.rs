@@ -225,24 +225,49 @@ pub async fn flush_provider_outbox_with_observer(
 
         match entry.state {
             SubmissionState::Queued => {
-                process_queued(store, account, &from, service, ctx, &entry, observer, &mut report)
-                    .await?;
+                process_queued(
+                    store,
+                    account,
+                    &from,
+                    service,
+                    ctx,
+                    &entry,
+                    observer,
+                    &mut report,
+                )
+                .await?;
             }
             SubmissionState::Preparing => {
-                recover_preparing(store, account, &from, service, ctx, &entry, observer, &mut report)
-                    .await?;
+                recover_preparing(
+                    store,
+                    account,
+                    &from,
+                    service,
+                    ctx,
+                    &entry,
+                    observer,
+                    &mut report,
+                )
+                .await?;
             }
             SubmissionState::Submitting => {
-                recover_submitting(store, account, &from, service, ctx, &entry, observer, &mut report)
-                    .await?;
+                recover_submitting(
+                    store,
+                    account,
+                    &from,
+                    service,
+                    ctx,
+                    &entry,
+                    observer,
+                    &mut report,
+                )
+                .await?;
             }
             SubmissionState::Accepted => {
                 finalize_accepted(store, account, service, ctx, &entry, &mut report).await?;
             }
             SubmissionState::Uncertain => {}
-            SubmissionState::Draft
-            | SubmissionState::Complete
-            | SubmissionState::Rejected => {}
+            SubmissionState::Draft | SubmissionState::Complete | SubmissionState::Rejected => {}
         }
     }
 
@@ -335,7 +360,10 @@ async fn process_queued(
 
     match service.submit(&request, ctx).await {
         Ok(SubmissionOutcome::Accepted(receipt)) => {
-            finish_accepted(store, entry, service, ctx, &request, receipt, observer, report).await?;
+            finish_accepted(
+                store, entry, service, ctx, &request, receipt, observer, report,
+            )
+            .await?;
         }
         Ok(SubmissionOutcome::Rejected(error)) => {
             reject(store, entry, &error.safe_message, report)?;
@@ -370,7 +398,10 @@ async fn recover_preparing(
     let request = request_from_entry(store, entry, false)?;
     match service.reconcile(&request, ctx).await {
         Ok(ReconcileOutcome::Accepted(receipt)) => {
-            finish_accepted(store, entry, service, ctx, &request, receipt, observer, report).await?;
+            finish_accepted(
+                store, entry, service, ctx, &request, receipt, observer, report,
+            )
+            .await?;
         }
         Ok(ReconcileOutcome::NotAccepted) => {
             // Preparation may have created a remote draft, but no delivery was
@@ -408,7 +439,10 @@ async fn recover_submitting(
     let request = request_from_entry(store, entry, true)?;
     match service.reconcile(&request, ctx).await {
         Ok(ReconcileOutcome::Accepted(receipt)) => {
-            finish_accepted(store, entry, service, ctx, &request, receipt, observer, report).await?;
+            finish_accepted(
+                store, entry, service, ctx, &request, receipt, observer, report,
+            )
+            .await?;
         }
         Ok(ReconcileOutcome::NotAccepted) => {
             // The provider explicitly proved the write did not happen, so a
@@ -478,7 +512,10 @@ async fn finalize_accepted(
         return Ok(());
     }
 
-    match service.finalize_sent(&request, &receipt_of(entry, &request), ctx).await {
+    match service
+        .finalize_sent(&request, &receipt_of(entry, &request), ctx)
+        .await
+    {
         Ok(()) => {
             store.mark_outbox_complete(&entry.id)?;
             report.sent += 1;
@@ -506,11 +543,8 @@ async fn finish_accepted(
 ) -> Result<(), StoreError> {
     // Acceptance, receipt, and the once-only learning marker share a single
     // transaction. The observer fires only for the transition that wins it.
-    let observations = crate::contacts::learn::observe_outgoing(
-        &ctx.account,
-        &entry.message,
-        entry.created_at,
-    );
+    let observations =
+        crate::contacts::learn::observe_outgoing(&ctx.account, &entry.message, entry.created_at);
     // The prepared bytes are what the provider accepted (and what a client
     // Sent-copy append stores), so their normalized header fingerprint is the
     // secondary hint that reconciles a later history/Sent replay.
@@ -585,14 +619,11 @@ fn request_from_entry(
 }
 
 fn receipt_of(entry: &OutboxEntry, request: &SubmissionRequest) -> SubmissionReceipt {
-    entry
-        .receipt
-        .clone()
-        .unwrap_or_else(|| SubmissionReceipt {
-            operation: request.operation.clone(),
-            remote_message: None,
-            remote_thread: None,
-        })
+    entry.receipt.clone().unwrap_or_else(|| SubmissionReceipt {
+        operation: request.operation.clone(),
+        remote_message: None,
+        remote_thread: None,
+    })
 }
 
 fn handle_prepare_error(

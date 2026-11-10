@@ -29,8 +29,8 @@ use crate::contacts::{EvidenceId, LearningOrigin, Observation};
 use crate::mail::{Address, AttachmentDisposition, Flags, Uid};
 use crate::providers::{
     ErrorKind, OperationContext, OperationId, PreparedSubmission, ProviderError, ProviderId,
-    SubmissionAttachment, SubmissionOutcome, SubmissionReceipt, SubmissionRequest,
-    SubmissionService, SentCopyPolicy,
+    SentCopyPolicy, SubmissionAttachment, SubmissionOutcome, SubmissionReceipt, SubmissionRequest,
+    SubmissionService,
 };
 use crate::store::{Store, StoreError, check_generation_in, record_observations_in};
 use crate::transport::{
@@ -702,11 +702,8 @@ pub async fn flush_outbox(
         smtp,
         imap,
     };
-    let ctx = OperationContext::with_timeout(
-        account.id.clone(),
-        0,
-        std::time::Duration::from_secs(30),
-    );
+    let ctx =
+        OperationContext::with_timeout(account.id.clone(), 0, std::time::Duration::from_secs(30));
     super::submission::flush_provider_outbox(store, account, &mut service, &ctx)
         .await
         .map_err(store_error)
@@ -752,8 +749,7 @@ impl SubmissionService for ProtocolSubmission<'_> {
             return Ok(prepared.clone());
         }
         let from = Address::new(
-            Some(self.account.display_name.clone())
-                .filter(|name| !name.trim().is_empty()),
+            Some(self.account.display_name.clone()).filter(|name| !name.trim().is_empty()),
             self.account.email.clone(),
         );
         let raw = build_mime(&from, &request.message)
@@ -777,8 +773,7 @@ impl SubmissionService for ProtocolSubmission<'_> {
             .and_then(|prepared| prepared.raw.clone())
             .ok_or_else(|| ProviderError::new(ErrorKind::Forbidden, "no prepared message"))?;
         let from = Address::new(
-            Some(self.account.display_name.clone())
-                .filter(|name| !name.trim().is_empty()),
+            Some(self.account.display_name.clone()).filter(|name| !name.trim().is_empty()),
             self.account.email.clone(),
         );
         let recipients = request.message.recipients();
@@ -796,10 +791,10 @@ impl SubmissionService for ProtocolSubmission<'_> {
             })),
             // A protocol send that failed after connecting is ambiguous: the
             // server may have accepted DATA before the connection dropped.
-            Err(error) => Err(
-                ProviderError::unknown_write_outcome("SMTP delivery did not complete")
-                    .with_source_detail(error.to_string()),
-            ),
+            Err(error) => Err(ProviderError::unknown_write_outcome(
+                "SMTP delivery did not complete",
+            )
+            .with_source_detail(error.to_string())),
         }
     }
 

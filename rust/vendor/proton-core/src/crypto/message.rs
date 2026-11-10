@@ -49,7 +49,10 @@ impl std::fmt::Display for DecryptFailure {
                 write!(formatter, "decrypted data exceeds the {limit} byte limit")
             }
             Self::Integrity(detail) => {
-                write!(formatter, "encrypted data failed its integrity check: {detail}")
+                write!(
+                    formatter,
+                    "encrypted data failed its integrity check: {detail}"
+                )
             }
             Self::Crypto(detail) => write!(formatter, "decryption failed: {detail}"),
         }
@@ -149,8 +152,13 @@ pub fn decrypt_body<P: PGPProviderSync>(
     verify_pubs_armored: &[String],
     armored_body: &str,
 ) -> Result<(String, Verdict)> {
-    let (bytes, verdict) =
-        decrypt_body_bounded(provider, addr, verify_pubs_armored, armored_body, usize::MAX)?;
+    let (bytes, verdict) = decrypt_body_bounded(
+        provider,
+        addr,
+        verify_pubs_armored,
+        armored_body,
+        usize::MAX,
+    )?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), verdict))
 }
 
@@ -164,8 +172,8 @@ pub fn decrypt_body_bounded<P: PGPProviderSync>(
     armored_body: &str,
     max_output: usize,
 ) -> std::result::Result<(Vec<u8>, Verdict), DecryptFailure> {
-    let privs = import_privs(provider, addr)
-        .map_err(|error| DecryptFailure::Crypto(error.to_string()))?;
+    let privs =
+        import_privs(provider, addr).map_err(|error| DecryptFailure::Crypto(error.to_string()))?;
     let pubs: Vec<P::PublicKey> = verify_pubs_armored
         .iter()
         .filter_map(|a| {
@@ -228,8 +236,8 @@ pub fn decrypt_attachment_bounded<P: PGPProviderSync>(
     data_packet: &[u8],
     max_output: usize,
 ) -> std::result::Result<Vec<u8>, DecryptFailure> {
-    let privs = import_privs(provider, addr)
-        .map_err(|error| DecryptFailure::Crypto(error.to_string()))?;
+    let privs =
+        import_privs(provider, addr).map_err(|error| DecryptFailure::Crypto(error.to_string()))?;
     tracing::debug!(target: "proton_core::crypto", address = %addr.email, data_packet = data_packet.len(), "decrypting attachment (unwrap session key → decrypt data packet)");
     let kp = STANDARD
         .decode(key_packets_b64)
@@ -238,7 +246,9 @@ pub fn decrypt_attachment_bounded<P: PGPProviderSync>(
         .new_decryptor()
         .with_decryption_keys(privs.iter())
         .decrypt_session_key(&kp)
-        .map_err(|e| DecryptFailure::Crypto(format!("attachment session key decrypt failed: {e}")))?;
+        .map_err(|e| {
+            DecryptFailure::Crypto(format!("attachment session key decrypt failed: {e}"))
+        })?;
     let mut reader = provider
         .new_decryptor()
         .with_session_key(sk)

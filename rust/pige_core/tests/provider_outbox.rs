@@ -16,16 +16,18 @@ use common::legacy::LegacyV4;
 use pige_core::{
     Account, AccountId, Address, AuthKind, MailBackend, Security, ServerConfig, Store,
     mail::{AttachmentDisposition, MAX_ATTACHMENT_BYTES},
-    platform::{CredentialStore, fake::{FakeCredentials, FakeTransportFactory}},
+    platform::{
+        CredentialStore,
+        fake::{FakeCredentials, FakeTransportFactory},
+    },
     providers::{
         ErrorKind, IMAP_SMTP_PROVIDER, OperationContext, OperationId, PreparedSubmission,
-        ProviderError, ProviderId, ReconcileOutcome, SentCopyPolicy,
-        SubmissionAttachment, SubmissionOutcome, SubmissionReceipt, SubmissionRequest,
-        SubmissionService,
+        ProviderError, ProviderId, ReconcileOutcome, SentCopyPolicy, SubmissionAttachment,
+        SubmissionOutcome, SubmissionReceipt, SubmissionRequest, SubmissionService,
     },
     send::{
         self, OutboxId, OutgoingMessage, SubmissionObserver, SubmissionState, build_mime,
-        build_mime_with_parts, outbox_entry, queue_submission, queue_send,
+        build_mime_with_parts, outbox_entry, queue_send, queue_submission,
     },
     transport::FakeTransport,
 };
@@ -195,7 +197,10 @@ impl SubmissionService for RecordingSubmission {
         if let Some(error) = &self.reconcile_error {
             return Err(error.clone());
         }
-        Ok(self.reconcile.clone().unwrap_or(ReconcileOutcome::NotAccepted))
+        Ok(self
+            .reconcile
+            .clone()
+            .unwrap_or(ReconcileOutcome::NotAccepted))
     }
 
     async fn finalize_sent(
@@ -288,8 +293,7 @@ async fn killed_submitting_becomes_uncertain() {
     store
         .set_outbox_state(&id, SubmissionState::Submitting, None)
         .unwrap();
-    let mut service =
-        RecordingSubmission::default().reconcile(ReconcileOutcome::Unknown);
+    let mut service = RecordingSubmission::default().reconcile(ReconcileOutcome::Unknown);
 
     let report = send::flush_provider_outbox(&store, &account(), &mut service, &context())
         .await
@@ -390,7 +394,10 @@ async fn killed_preparing_reconciles_draft_before_repeat() {
         .unwrap();
 
     assert_eq!(report.sent, 1);
-    assert_eq!(service.reconcile_calls, 1, "the provider draft is checked first");
+    assert_eq!(
+        service.reconcile_calls, 1,
+        "the provider draft is checked first"
+    );
     assert_eq!(service.prepare_calls, 1);
     assert_eq!(service.submit_calls, 1);
     assert_eq!(
@@ -489,7 +496,10 @@ async fn accepted_learns_once() {
     .await
     .unwrap();
     assert_eq!(observer.receipts.len(), 1);
-    assert_eq!(observer.receipts[0].operation, outbox_entry(&store, &id).unwrap().unwrap().operation_id);
+    assert_eq!(
+        observer.receipts[0].operation,
+        outbox_entry(&store, &id).unwrap().unwrap().operation_id
+    );
 
     send::flush_provider_outbox_with_observer(
         &store,
@@ -564,10 +574,8 @@ async fn prepared_payload_has_no_auth_secret() {
 
     let outgoing = message("No secrets");
     queue_submission(&store, outgoing.clone(), Vec::new()).unwrap();
-    let mut adapter = pige_core::providers::imap::ImapSubmission::new(
-        transports.clone(),
-        account(),
-    );
+    let mut adapter =
+        pige_core::providers::imap::ImapSubmission::new(transports.clone(), account());
 
     send::flush_provider_outbox(&store, &account(), &mut adapter, &context())
         .await
@@ -575,7 +583,10 @@ async fn prepared_payload_has_no_auth_secret() {
 
     let entry = store.outbox_items(Some(&account().id)).unwrap().remove(0);
     let durable = format!("{entry:?}");
-    assert!(!durable.contains(marker), "the outbox must not persist credentials");
+    assert!(
+        !durable.contains(marker),
+        "the outbox must not persist credentials"
+    );
     let prepared = entry.prepared.expect("a prepared artifact is persisted");
     assert!(!format!("{prepared:?}").contains(marker));
     assert!(!serde_json::to_string(&prepared).unwrap().contains(marker));
@@ -757,10 +768,8 @@ async fn sent_copy_append_is_not_repeated_when_evidence_exists() {
             ..FakeTransport::default()
         },
     );
-    let mut service = pige_core::providers::imap::ImapSubmission::new(
-        transports.clone(),
-        account(),
-    );
+    let mut service =
+        pige_core::providers::imap::ImapSubmission::new(transports.clone(), account());
     let request = SubmissionRequest {
         operation: OperationId::new("op-1"),
         message: message("Already copied"),
@@ -808,10 +817,8 @@ async fn sent_copy_is_not_appended_when_evidence_cannot_be_checked() {
             ..FakeTransport::default()
         },
     );
-    let mut service = pige_core::providers::imap::ImapSubmission::new(
-        transports.clone(),
-        account(),
-    );
+    let mut service =
+        pige_core::providers::imap::ImapSubmission::new(transports.clone(), account());
     let request = SubmissionRequest {
         operation: OperationId::new("op-1"),
         message: message("Unverifiable copy"),
@@ -819,9 +826,7 @@ async fn sent_copy_is_not_appended_when_evidence_cannot_be_checked() {
         prepared: Some(PreparedSubmission {
             version: 1,
             backend: ProviderId::from(IMAP_SMTP_PROVIDER),
-            raw: Some(
-                b"Message-ID: <unverifiable@example.com>\r\nSubject: x\r\n\r\nbody".to_vec(),
-            ),
+            raw: Some(b"Message-ID: <unverifiable@example.com>\r\nSubject: x\r\n\r\nbody".to_vec()),
             reference: None,
         }),
     };

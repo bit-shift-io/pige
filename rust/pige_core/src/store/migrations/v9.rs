@@ -31,11 +31,7 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
     add_column(conn, "receipt_remote_thread", "TEXT")?;
     add_column(conn, "retry_count", "INTEGER NOT NULL DEFAULT 0")?;
     add_column(conn, "retry_after", "INTEGER")?;
-    add_column(
-        conn,
-        "acceptance_recorded",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
+    add_column(conn, "acceptance_recorded", "INTEGER NOT NULL DEFAULT 0")?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS outbox_parts (

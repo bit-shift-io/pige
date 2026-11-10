@@ -38,8 +38,10 @@ impl Store {
     pub fn sync_accounts(&self, accounts: &[Account]) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        let keep: std::collections::HashSet<&str> =
-            accounts.iter().map(|account| account.id.0.as_str()).collect();
+        let keep: std::collections::HashSet<&str> = accounts
+            .iter()
+            .map(|account| account.id.0.as_str())
+            .collect();
         for existing in accounts_on(&tx)? {
             if !keep.contains(existing.id.0.as_str()) {
                 tx.execute("DELETE FROM accounts WHERE id = ?1", [&existing.id.0])?;

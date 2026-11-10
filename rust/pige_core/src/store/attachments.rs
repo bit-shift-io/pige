@@ -168,7 +168,8 @@ fn store_attachments_on(
 ) -> Result<(), StoreError> {
     let mut existing = Vec::new();
     {
-        let mut statement = conn.prepare("SELECT part_id FROM attachments WHERE message_id = ?1")?;
+        let mut statement =
+            conn.prepare("SELECT part_id FROM attachments WHERE message_id = ?1")?;
         let mut rows = statement.query([&message_id.0])?;
         while let Some(row) = rows.next()? {
             existing.push(row.get::<_, String>(0)?);

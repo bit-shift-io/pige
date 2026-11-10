@@ -334,10 +334,7 @@ fn encrypt_to_compressed(recipient_public: &str, text: &str) -> String {
 struct RawPacketStream(Vec<u8>);
 
 impl proton_rpgp::pgp::ser::Serialize for RawPacketStream {
-    fn to_writer<W: std::io::Write>(
-        &self,
-        writer: &mut W,
-    ) -> proton_rpgp::pgp::errors::Result<()> {
+    fn to_writer<W: std::io::Write>(&self, writer: &mut W) -> proton_rpgp::pgp::errors::Result<()> {
         writer.write_all(&self.0)?;
         Ok(())
     }
@@ -370,8 +367,7 @@ fn encrypt_with_mismatched_signature(
     };
 
     let (recipient, _) = SignedPublicKey::from_string(recipient_public).expect("recipient key");
-    let (signer_key, _) =
-        SignedSecretKey::from_string(&signer.stored.armored).expect("signer key");
+    let (signer_key, _) = SignedSecretKey::from_string(&signer.stored.armored).expect("signer key");
     let profile = proton_rpgp::Profile::default();
     let session_key = SymmetricKeyAlgorithm::AES256.new_session_key(profile.rng());
     let signature = SignatureConfig::v4(
@@ -500,7 +496,11 @@ fn context() -> OperationContext {
     OperationContext::with_timeout(AccountId::new(), 1, Duration::from_secs(60))
 }
 
-async fn body(mock: &ProtonMock, keys: &KeyStore, id: &str) -> Result<pige_core::providers::BodyContent, ProviderError> {
+async fn body(
+    mock: &ProtonMock,
+    keys: &KeyStore,
+    id: &str,
+) -> Result<pige_core::providers::BodyContent, ProviderError> {
     let mut mailbox = ProtonMailbox::new(mock.client(keys.clone()));
     mailbox.body(&RemoteMessageId::new(id), &context()).await
 }
@@ -642,7 +642,10 @@ async fn flagged_sender_key_is_not_verified() {
 
     for id in ["compromised-key", "no-sign-key"] {
         let content = body(&mock, &keys, id).await.expect("flagged body");
-        assert_eq!(content.plain_text.as_deref(), Some("flagged signature body"));
+        assert_eq!(
+            content.plain_text.as_deref(),
+            Some("flagged signature body")
+        );
         assert_ne!(
             content.signature,
             SignatureStatus::Verified,
@@ -667,12 +670,7 @@ async fn bad_signature_is_invalid() {
             "invalid",
             // The packet integrity is valid, but the signature covers different
             // data, so this is a real tampered-data signature failure.
-            &encrypt_with_mismatched_signature(
-                &me.public,
-                &me,
-                "tampered body",
-                "original body",
-            ),
+            &encrypt_with_mismatched_signature(&me.public, &me, "tampered body", "original body"),
             "text/plain",
             "address-1",
             "me@example.com",
@@ -767,12 +765,9 @@ async fn attachment_packet_integrity_failure_returns_error() {
     let keys = key_store(vec![address.clone()]);
 
     let provider = provider();
-    let uploaded = proton_core::crypto::encrypt_attachment(
-        &provider,
-        &address,
-        b"attachment plaintext",
-    )
-    .expect("encrypt attachment");
+    let uploaded =
+        proton_core::crypto::encrypt_attachment(&provider, &address, b"attachment plaintext")
+            .expect("encrypt attachment");
     let key_packets = STANDARD.encode(&uploaded.key_packet);
     let mut corrupted = uploaded.data_packet.clone();
     let last = corrupted.last_mut().expect("data packet");
@@ -799,16 +794,17 @@ async fn attachment_packet_integrity_failure_returns_error() {
             )],
         ),
     );
-    state
-        .attachments
-        .insert("att-1".to_string(), corrupted);
+    state.attachments.insert("att-1".to_string(), corrupted);
     let mock = ProtonMock::start(state).await;
 
     let content = body(&mock, &keys, "with-attachment")
         .await
         .expect("body with attachment descriptor");
     assert_eq!(content.attachments.len(), 1);
-    assert_eq!(content.attachments[0].content_id.as_deref(), Some("inline-report"));
+    assert_eq!(
+        content.attachments[0].content_id.as_deref(),
+        Some("inline-report")
+    );
     assert_eq!(
         content.attachments[0].disposition,
         AttachmentDisposition::Inline
@@ -900,7 +896,8 @@ async fn compressed_oversize_is_rejected_before_materialization() {
 async fn html_still_passes_sanitizer() {
     let me = generate_key("me@example.com");
     let keys = key_store(vec![address_keys("address-1", "me@example.com", &[&me])]);
-    let html = "<p>Hello</p><script>alert(1)</script><img src=\"https://tracker.example/pixel.png\">";
+    let html =
+        "<p>Hello</p><script>alert(1)</script><img src=\"https://tracker.example/pixel.png\">";
     let mut state = MockState::default();
     state.messages.insert(
         "html".to_string(),
@@ -919,7 +916,10 @@ async fn html_still_passes_sanitizer() {
     let content = body(&mock, &keys, "html").await.expect("html body");
     let html = content.html.expect("adapter returns normalized HTML");
     let document = pige_core::html::parse_html(&html, false);
-    assert!(document.has_remote_images(), "the remote image must be retained as blocked content");
+    assert!(
+        document.has_remote_images(),
+        "the remote image must be retained as blocked content"
+    );
     assert!(document.blocks.iter().any(|block| matches!(
         block,
         pige_core::html::Block::Image {
@@ -983,19 +983,19 @@ async fn contact_names_and_emails_sync_offline() {
 
     let contacts = store.contact_emails(&account.id).unwrap();
     assert!(contacts.iter().any(|contact| {
-        contact.address.email == "alice@example.com"
-            && contact.name.as_deref() == Some("Alice")
+        contact.address.email == "alice@example.com" && contact.name.as_deref() == Some("Alice")
     }));
     assert!(contacts.iter().any(|contact| {
         contact.address.email == "a.alias@example.com"
             && contact.name.as_deref() == Some("Alice Example")
     }));
     assert!(contacts.iter().any(|contact| {
-        contact.address.email == "bob@example.com"
-            && contact.name.as_deref() == Some("Bob Example")
+        contact.address.email == "bob@example.com" && contact.name.as_deref() == Some("Bob Example")
     }));
     assert!(
-        contacts.iter().all(|contact| contact.source.as_str() == SOURCE),
+        contacts
+            .iter()
+            .all(|contact| contact.source.as_str() == SOURCE),
         "only the proton.contacts source is populated"
     );
     drop(dir);
@@ -1016,11 +1016,7 @@ async fn empty_contact_page_before_total_is_transient() {
     let mock = ProtonMock::start(state).await;
     let mut address_book = ProtonAddressBook::new(mock.client(keys));
     let error = address_book
-        .next_page(
-            &ContactSourceId::new(SOURCE),
-            None,
-            &context(),
-        )
+        .next_page(&ContactSourceId::new(SOURCE), None, &context())
         .await
         .expect_err("an empty page before the reported total must not complete");
     assert_eq!(error.kind, ErrorKind::Transient);
@@ -1102,7 +1098,12 @@ async fn contact_delete_does_not_erase_learned_address() {
     );
     assert!(
         store
-            .recipient_candidates(&account.id, "shared", &["shared@example.com".to_string()], 64)
+            .recipient_candidates(
+                &account.id,
+                "shared",
+                &["shared@example.com".to_string()],
+                64
+            )
             .unwrap()
             .iter()
             .any(|candidate| candidate.key == key),

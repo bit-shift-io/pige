@@ -177,7 +177,13 @@ fn backfill_remote(conn: &Connection) -> Result<(), StoreError> {
              FROM messages m JOIN folders f ON f.id = m.folder_id",
         )?;
         stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
         .collect::<Result<_, _>>()?
     };

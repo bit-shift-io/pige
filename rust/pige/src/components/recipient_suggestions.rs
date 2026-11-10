@@ -349,10 +349,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for RecipientField<'_> {
                 iced::widget::text_input::cursor::State::Index(index) => index,
                 iced::widget::text_input::cursor::State::Selection { start, end } => start.max(end),
             };
-            (
-                grapheme_caret_to_byte(&text, grapheme),
-                state.is_focused(),
-            )
+            (grapheme_caret_to_byte(&text, grapheme), state.is_focused())
         };
         let is_pointer = matches!(
             event,

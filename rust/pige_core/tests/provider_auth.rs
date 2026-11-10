@@ -22,7 +22,7 @@ use pige_core::auth::{
 };
 use pige_core::platform::{CredentialStore, fake::FakeCredentials};
 use pige_core::providers::{
-    AuthAttemptId, ErrorKind, OperationContext, ProviderId, IMAP_SMTP_PROVIDER,
+    AuthAttemptId, ErrorKind, IMAP_SMTP_PROVIDER, OperationContext, ProviderId,
 };
 use pige_core::store::Store;
 use tempfile::TempDir;
@@ -107,7 +107,10 @@ fn legacy_password_migrates_without_loss() {
         .sessions
         .context(&account, Duration::from_secs(30))
         .expect("context");
-    harness.secrets.save(&ctx, &loaded).expect("persist envelope");
+    harness
+        .secrets
+        .save(&ctx, &loaded)
+        .expect("persist envelope");
 
     let reloaded = harness
         .secrets
@@ -124,9 +127,8 @@ async fn refresh_is_single_flight() {
     let account = AccountId::new();
     let generation = harness.store.generation(&account).expect("generation");
 
-    let refresher = Arc::new(
-        FakeTokenRefresher::new("fresh-token").delay(Duration::from_millis(50)),
-    );
+    let refresher =
+        Arc::new(FakeTokenRefresher::new("fresh-token").delay(Duration::from_millis(50)));
     let source = CachedTokenSource::new(refresher.clone(), Duration::from_secs(3600));
 
     let ctx = harness
@@ -164,7 +166,11 @@ async fn refresh_is_single_flight() {
         .save(&stale, &rotated)
         .expect_err("a stale generation must not persist a rotated secret");
     assert_eq!(error.kind, ErrorKind::Conflict);
-    let durable = harness.secrets.load(&account).expect("load").expect("present");
+    let durable = harness
+        .secrets
+        .load(&account)
+        .expect("load")
+        .expect("present");
     assert_eq!(
         password_of(&durable),
         "original",
@@ -230,7 +236,11 @@ async fn removed_account_rejects_rotated_secret() {
         .expect_err("stale generation must be rejected");
     assert_eq!(error.kind, ErrorKind::Conflict);
 
-    let durable = harness.secrets.load(&account).expect("load").expect("present");
+    let durable = harness
+        .secrets
+        .load(&account)
+        .expect("load")
+        .expect("present");
     assert_eq!(password_of(&durable), "old-secret");
 
     // A session at the new generation may still save (for example a re-auth).
@@ -277,7 +287,11 @@ async fn stale_refresh_is_rejected_when_invalidate_lands_before_the_write() {
     assert_eq!(error.kind, ErrorKind::Conflict);
     assert_eq!(harness.store.generation(&account).expect("generation"), 2);
 
-    let durable = harness.secrets.load(&account).expect("load").expect("present");
+    let durable = harness
+        .secrets
+        .load(&account)
+        .expect("load")
+        .expect("present");
     assert_eq!(
         password_of(&durable),
         "original",
@@ -367,9 +381,7 @@ async fn session_only_never_writes_sqlite() {
         harness.sessions.clone(),
         harness.store.clone(),
     )
-    .script(
-        FakeAuthScript::password("session-secret").persistence(SecretPersistence::SessionOnly),
-    );
+    .script(FakeAuthScript::password("session-secret").persistence(SecretPersistence::SessionOnly));
 
     let progress = auth
         .begin(harness.request(Some(account.clone())))
@@ -518,7 +530,9 @@ async fn late_attempt_answer_is_rejected() {
         harness.store.clone(),
     )
     .script(FakeAuthScript::password("pw").ttl(Duration::ZERO));
-    let AuthProgress::Challenge { attempt: expired, .. } = expiring
+    let AuthProgress::Challenge {
+        attempt: expired, ..
+    } = expiring
         .begin(harness.request(Some(account)))
         .await
         .expect("begin")
@@ -585,7 +599,13 @@ async fn terminal_attempts_sweep_their_staged_secret() {
             .is_none(),
         "a terminal attempt's staged secret is discarded"
     );
-    assert!(harness.store.pending_auth(&attempt).expect("pending").is_none());
+    assert!(
+        harness
+            .store
+            .pending_auth(&attempt)
+            .expect("pending")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -623,7 +643,13 @@ async fn begin_sweeps_orphaned_pending_auth_rows_and_their_staged_secrets() {
         .await
         .expect("begin");
 
-    assert!(harness.store.pending_auth(&attempt).expect("pending").is_none());
+    assert!(
+        harness
+            .store
+            .pending_auth(&attempt)
+            .expect("pending")
+            .is_none()
+    );
     assert!(
         harness
             .secrets
@@ -712,11 +738,10 @@ fn auth_debug_redacts_all_secret_variants() {
         AuthAnswer::Totp(SecretString::from("answer-totp")),
         AuthAnswer::MailboxPassword(SecretString::from("answer-mailbox")),
     ];
-    for (answer, secret) in answers.iter().zip([
-        "answer-password",
-        "answer-totp",
-        "answer-mailbox",
-    ]) {
+    for (answer, secret) in answers
+        .iter()
+        .zip(["answer-password", "answer-totp", "answer-mailbox"])
+    {
         let rendered = format!("{answer:?}");
         assert!(
             !rendered.contains(secret),
@@ -732,8 +757,8 @@ fn staged_ref_for(attempt: &AuthAttemptId) -> pige_core::auth::StagedSecretRef {
 }
 
 fn assert_dir_lacks(dir: &Path, needle: &[u8]) {
-    let entries = std::fs::read_dir(dir)
-        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
     for entry in entries {
         let entry = entry.expect("dir entry");
         let path = entry.path();

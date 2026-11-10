@@ -695,7 +695,9 @@ fn prefetch_candidates_on(
     });
     let mut result = Vec::new();
     for candidate in candidates {
-        let count = per_account_count.entry(candidate.account.0.clone()).or_insert(0);
+        let count = per_account_count
+            .entry(candidate.account.0.clone())
+            .or_insert(0);
         if *count >= per_account {
             continue;
         }

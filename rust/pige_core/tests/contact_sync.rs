@@ -443,11 +443,7 @@ async fn a_new_snapshot_after_a_delta_sweeps_the_delta_generation() {
 
     // First full snapshot retires the pre-sync row.
     let mut first = ScriptedContacts::new(vec![page(
-        vec![contact_change(
-            "keep",
-            Some("Keep"),
-            &["keep@example.com"],
-        )],
+        vec![contact_change("keep", Some("Keep"), &["keep@example.com"])],
         "s1",
         false,
     )]);
@@ -460,7 +456,12 @@ async fn a_new_snapshot_after_a_delta_sweeps_the_delta_generation() {
     )
     .await
     .unwrap();
-    assert!(!has_contact(&store, &account.id, &source, "stale@example.com"));
+    assert!(!has_contact(
+        &store,
+        &account.id,
+        &source,
+        "stale@example.com"
+    ));
 
     // An incremental delta adds a contact but must not sweep.
     let mut delta = ScriptedContacts::new(vec![delta_page(
@@ -481,7 +482,12 @@ async fn a_new_snapshot_after_a_delta_sweeps_the_delta_generation() {
     )
     .await
     .unwrap();
-    assert!(has_contact(&store, &account.id, &source, "keep@example.com"));
+    assert!(has_contact(
+        &store,
+        &account.id,
+        &source,
+        "keep@example.com"
+    ));
     assert!(has_contact(
         &store,
         &account.id,
@@ -493,11 +499,7 @@ async fn a_new_snapshot_after_a_delta_sweeps_the_delta_generation() {
     // a new generation, so the contact missing from the new listing -- which
     // was previously cached by the delta generation -- is retired.
     let mut restart = ScriptedContacts::new(vec![snapshot_start_page(
-        vec![contact_change(
-            "keep",
-            Some("Keep"),
-            &["keep@example.com"],
-        )],
+        vec![contact_change("keep", Some("Keep"), &["keep@example.com"])],
         "s2",
         false,
     )]);
@@ -510,7 +512,12 @@ async fn a_new_snapshot_after_a_delta_sweeps_the_delta_generation() {
     )
     .await
     .unwrap();
-    assert!(has_contact(&store, &account.id, &source, "keep@example.com"));
+    assert!(has_contact(
+        &store,
+        &account.id,
+        &source,
+        "keep@example.com"
+    ));
     assert!(
         !has_contact(&store, &account.id, &source, "delta-new@example.com"),
         "a snapshot that starts after a delta must sweep the delta generation"
@@ -1056,7 +1063,8 @@ async fn disabling_contact_sync_keeps_cached_contacts() {
 }
 
 #[tokio::test]
-async fn contacts_are_usable_offline_after_restart() {    let _guard = API_LOCK.lock().await;
+async fn contacts_are_usable_offline_after_restart() {
+    let _guard = API_LOCK.lock().await;
     let harness = ApiHarness::new(Arc::new(FakeProviderFactory::new()));
     let account = harness.add_account().await;
     let source = source("saved");
@@ -1191,10 +1199,7 @@ async fn maintenance_deadline_bounds_mail_phase() {
     let result = tokio::time::timeout(Duration::from_secs(2), run)
         .await
         .expect("the pass deadline must bound the mail phase");
-    assert!(
-        result.is_ok(),
-        "a deadline stop is a normal pass exit"
-    );
+    assert!(result.is_ok(), "a deadline stop is a normal pass exit");
     assert_eq!(*calls.lock().unwrap(), 1, "the mail call was reached once");
 }
 
@@ -1215,10 +1220,7 @@ async fn maintenance_cancel_reaches_mail_phase() {
     let result = tokio::time::timeout(Duration::from_secs(2), run)
         .await
         .expect("a WorkManager stop must reach the in-flight mail call");
-    assert!(
-        result.is_ok(),
-        "a WorkManager stop is a normal pass exit"
-    );
+    assert!(result.is_ok(), "a WorkManager stop is a normal pass exit");
     assert_eq!(*calls.lock().unwrap(), 1, "the mail call was reached once");
 }
 
@@ -1238,10 +1240,7 @@ async fn maintenance_stop_before_token_install_is_honored() {
     )
     .await
     .expect("a pre-install stop must not wait for a full pass");
-    assert!(
-        result.is_ok(),
-        "a pre-install stop is a normal pass exit"
-    );
+    assert!(result.is_ok(), "a pre-install stop is a normal pass exit");
     assert_eq!(
         *calls.lock().unwrap(),
         0,
@@ -1310,11 +1309,7 @@ impl pige_core::providers::AddressBookService for OnePageContacts {
         *self.calls.lock().unwrap() += 1;
         self.entered.notify_one();
         Ok(page(
-            vec![contact_change(
-                "share",
-                None,
-                &["share@example.com"],
-            )],
+            vec![contact_change("share", None, &["share@example.com"])],
             "c1",
             false,
         ))
@@ -1387,10 +1382,7 @@ async fn contacts_get_budget_even_when_history_is_slow() {
     let result = tokio::time::timeout(Duration::from_secs(3), run)
         .await
         .expect("slow history must not consume the contact share");
-    assert!(
-        result.is_ok(),
-        "a budget exit is a normal pass exit"
-    );
+    assert!(result.is_ok(), "a budget exit is a normal pass exit");
     assert!(*history_calls.lock().unwrap() > 0, "history ran");
     assert!(
         *contact_calls.lock().unwrap() > 0,
@@ -1428,7 +1420,12 @@ async fn contact_refresh_preserves_completed_until_first_page() {
     )
     .await
     .unwrap();
-    assert!(store.contact_source_state(&account.id, &source).unwrap().complete);
+    assert!(
+        store
+            .contact_source_state(&account.id, &source)
+            .unwrap()
+            .complete
+    );
 
     // Starting the next generation must not flip a synced source to "paused"
     // before any page of the refresh has committed.
@@ -1460,5 +1457,10 @@ async fn contact_refresh_preserves_completed_until_first_page() {
     .await
     .unwrap();
     assert!(!progress.complete);
-    assert!(!store.contact_source_state(&account.id, &source).unwrap().complete);
+    assert!(
+        !store
+            .contact_source_state(&account.id, &source)
+            .unwrap()
+            .complete
+    );
 }
