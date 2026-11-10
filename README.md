@@ -1,6 +1,24 @@
 # pige
 Lightweight rust &amp; iced email client for desktop and mobile
 
+## Native providers
+
+Native Gmail and Proton adapters sit behind the shared provider registry; the
+default IMAP/SMTP account path is unchanged. Deterministic verification never
+uses credentials or sends mail:
+
+```sh
+bash scripts/verify-providers.sh default   # no provider features
+bash scripts/verify-providers.sh all       # every provider feature
+```
+
+Release evidence, including the PASS/FAIL/BLOCKED live and on-device matrix, is
+in [`docs/provider-release-verification.md`](docs/provider-release-verification.md).
+Maintenance, migration, and local-plaintext limits are in
+[`docs/provider-maintenance.md`](docs/provider-maintenance.md); the extension
+recipe for a new backend is
+[`docs/adding-a-mail-provider.md`](docs/adding-a-mail-provider.md).
+
 ## Releasing
 
 The version lives in `rust/Cargo.toml` (`[workspace.package] version`, `YYYY.MM.DD`,

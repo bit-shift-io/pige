@@ -224,6 +224,14 @@ cargo test -p pige_core --features provider-google --test live_google \
 The contacts-denial case also requires `PIGE_TEST_GOOGLE_CONTACTS_DENIED=1` and
 a token without People scopes. Tokens and response bodies are never printed.
 
+The ordinary deterministic gate is `bash scripts/verify-providers.sh all`; it
+never reads these credentials, never runs an ignored live test, and never sends
+mail. It checks formatting, tests, clippy, every provider feature, and the
+dependency/license boundary. Release status and prerequisites are recorded in
+[`provider-release-verification.md`](provider-release-verification.md); live
+Google rows stay BLOCKED until the console registrations and disposable account
+above are actually used.
+
 ## Recorded coverage still required from a live account
 
 Cold resume, sync/delta, contacts denial, offline autocomplete, send, revoke, and

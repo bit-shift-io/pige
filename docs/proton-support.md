@@ -131,3 +131,11 @@ fails clearly when its env is missing.
 
 Missing prerequisites are BLOCKED evidence, not a success. Do not use a
 personal or production mailbox for these checks.
+
+The deterministic release gate is `bash scripts/verify-providers.sh all`
+(formatting, tests, clippy, every provider feature, dependency/license gate); it
+never reads Proton credentials and never sends mail. Current live and on-device
+status is recorded in
+[`provider-release-verification.md`](provider-release-verification.md). The
+extension/SDK-replacement recipe, including the Proton fork upgrade checks, is
+[`adding-a-mail-provider.md`](adding-a-mail-provider.md).

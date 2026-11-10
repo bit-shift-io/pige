@@ -209,3 +209,51 @@ from the old generation is rejected.
 5. Treat the local cache as plaintext when assessing device backup and
    compromise risk; factory reset is the documented way to remove all local
    mail data.
+
+## Privacy regression suite
+
+`tests/provider_privacy.rs` is the repeatable guard for the boundaries above.
+It uses synthetic markers and asserts:
+
+- logs, `ProviderError` `Display`/`Debug`, configuration, and backups never
+  contain a stored secret or provider `source_detail`;
+- a configuration backup contains account settings but no synced contact names,
+  contact addresses, or learned correspondent addresses;
+- clearing learned recipients survives a simulated process restart with history
+  and cache backfill still disabled, and a later foreground request does not
+  open the provider;
+- removing an account cascades its contact, correspondent, recipient-index,
+  learning-state, contact-source-state, job, and pending-auth rows;
+- the outbox and its prepared artifact contain no session token or private key;
+- a forbidden contact scope disables only that source and is not retried by the
+  background scheduler.
+
+These tests do not claim that cached mail is encrypted at rest or that a
+logical clear is a secure erase. They prove that private payloads do not cross a
+log/config/backup/outbox boundary.
+
+## Deterministic verification and release evidence
+
+Run the release gate from the repository root:
+
+```sh
+bash scripts/verify-providers.sh default
+bash scripts/verify-providers.sh all
+```
+
+The script checks formatting, the workspace tests, clippy, every provider
+feature combination, `--no-default-features`, and the dependency/license
+boundary gate. It uses `--locked`, never reads credentials, never runs an
+ignored live test, and refuses `PIGE_TEST_ALLOW_SEND=1`. Building the desktop
+and Android release artifacts is a separate authorized step; see
+[`provider-release-verification.md`](provider-release-verification.md) for the
+PASS/FAIL/BLOCKED matrix and the current device/live status.
+
+## Adding or replacing a provider
+
+[`adding-a-mail-provider.md`](adding-a-mail-provider.md) is the extension
+recipe: capability advertisement, versioned remote ids and cursors, initial/
+delta/history recovery, Sent-copy and unknown-outcome policy, shared tests,
+auth/privacy/license checks, and safe SDK replacement. It also documents the
+Proton fork upgrade checks and the OAuth signing/consent upkeep that a release
+requires.
