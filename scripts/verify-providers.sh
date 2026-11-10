@@ -56,14 +56,18 @@ done
 echo "==> cargo check -p pige_core --all-features"
 cargo check --locked -p pige_core --all-features
 
-# Dependency and license boundary gate. The resolved graph is inspected with
-# every provider feature enabled, and cargo tree is a second, independent view
-# of which optional backend features actually build.
+# Dependency and license boundary gate. Inspect the *resolved Android graph*
+# with every provider feature enabled: an unfiltered cargo metadata still lists
+# inactive optional dependencies such as gopenpgp-sys and would false-positive
+# the gate. cargo tree is a second, independent view of which optional backend
+# features actually build.
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-echo "==> cargo metadata/tree + provider dependency gate"
-cargo metadata --locked --format-version 1 --all-features > "$TMP/metadata.json"
-cargo tree --locked --all-features --edges features > "$TMP/tree.txt"
+echo "==> cargo metadata/tree + provider dependency gate (Android graph)"
+cargo metadata --locked --format-version 1 --all-features \
+    --filter-platform aarch64-linux-android > "$TMP/metadata.json"
+cargo tree --locked --all-features --target aarch64-linux-android \
+    --edges features > "$TMP/tree.txt"
 python3 "$ROOT/scripts/check-provider-boundaries.py" \
     --metadata "$TMP/metadata.json" --tree "$TMP/tree.txt"
 
