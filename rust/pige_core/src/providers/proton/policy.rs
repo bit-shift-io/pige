@@ -39,6 +39,12 @@ const MAX_CONTACT_CARD_BYTES: usize = 512 * 1024;
 const CONTACT_PAGE_SIZE: u32 = 100;
 const MAX_CONTACT_PAGES: u32 = 1_000;
 
+/// How long a completed contact-policy snapshot may authorize a send before the
+/// adapter re-enumerates the address book. Short on purpose: a mandatory policy
+/// the user just added must not be missed for long, but a burst of sends must
+/// not each rescan every contact.
+const CONTACT_POLICY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How a recipient's copy will be protected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeliverySecurity {
@@ -82,6 +88,9 @@ struct StoreState {
     snapshot: Vec<ContactMaterial>,
     snapshot_active: bool,
     complete: bool,
+    /// When the current completed materials were fetched. `None` means no
+    /// usable snapshot exists yet.
+    refreshed_at: Option<std::time::Instant>,
 }
 
 /// Adapter-private cache shared by [`super::ProtonAddressBook`] and the
@@ -115,6 +124,7 @@ impl ContactPolicyStore {
             state.materials = std::mem::take(&mut state.snapshot);
             state.complete = true;
             state.snapshot_active = false;
+            state.refreshed_at = Some(std::time::Instant::now());
         }
         // An incomplete snapshot keeps accumulating: the next page must not
         // start a fresh snapshot that would drop the already-seen pages (and
@@ -128,6 +138,21 @@ impl ContactPolicyStore {
         let mut state = self.lock();
         state.materials = materials;
         state.complete = true;
+        state.refreshed_at = Some(std::time::Instant::now());
+    }
+
+    /// A completed snapshot no older than `max_age`, if one exists. Callers
+    /// fall back to a fresh enumeration when this returns `None`, so a stale or
+    /// missing snapshot can never authorize a send.
+    pub(crate) fn snapshot_if_fresh(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Option<Vec<ContactMaterial>> {
+        let state = self.lock();
+        let fresh = state
+            .refreshed_at
+            .is_some_and(|refreshed| refreshed.elapsed() <= max_age);
+        (state.complete && fresh).then(|| state.materials.clone())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, StoreState> {
@@ -153,6 +178,9 @@ pub struct ProtonRecipientPolicy {
     contacts: Arc<ContactPolicyStore>,
     sender_alias: Option<String>,
     resolved: HashMap<String, RecipientMaterial>,
+    /// How long a completed contact enumeration is reused before this policy
+    /// re-lists the address book.
+    contact_ttl: std::time::Duration,
 }
 
 impl ProtonRecipientPolicy {
@@ -169,6 +197,7 @@ impl ProtonRecipientPolicy {
             contacts,
             sender_alias: None,
             resolved: HashMap::new(),
+            contact_ttl: CONTACT_POLICY_TTL,
         }
     }
 
@@ -217,10 +246,19 @@ impl ProtonRecipientPolicy {
             return Err(ProviderError::forbidden("the message has no recipients"));
         }
 
-        // A failed contact snapshot means we cannot affirm ordinary external
-        // delivery, so it blocks the operation rather than degrading.
-        let materials = self.fetch_contact_materials(ctx).await?;
-        self.contacts.replace_completed(materials.clone());
+        // Reuse a completed enumeration for a short window; otherwise fetch one
+        // now. A failed fetch means we cannot affirm ordinary external
+        // delivery, so it blocks the operation rather than degrading. Delivery
+        // policy is never read from the address-book cache beyond this TTL, so
+        // a newly added mandatory requirement is honored within it.
+        let materials = match self.contacts.snapshot_if_fresh(self.contact_ttl) {
+            Some(materials) => materials,
+            None => {
+                let materials = self.fetch_contact_materials(ctx).await?;
+                self.contacts.replace_completed(materials.clone());
+                materials
+            }
+        };
 
         let mut seen = HashSet::new();
         let mut deliveries = Vec::new();

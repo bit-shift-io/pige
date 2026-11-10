@@ -177,6 +177,27 @@ impl OperationContext {
         }
         Ok(())
     }
+
+    /// Race an in-flight provider call against cancellation and the deadline.
+    ///
+    /// Checking [`Self::ensure_active`] before a call is not enough: a stalled
+    /// network request would keep holding its account slot past the budget. Any
+    /// fallible provider future must run through this so a hung call is bounded.
+    pub async fn bound<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, ProviderError>>,
+    ) -> Result<T, ProviderError> {
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => {
+                Err(ProviderError::cancelled("operation cancelled"))
+            }
+            _ = tokio::time::sleep_until(self.deadline) => {
+                Err(ProviderError::transient("operation deadline exceeded"))
+            }
+            result = future => result,
+        }
+    }
 }
 
 /// Which message mutations a provider supports. Booleans are individual so a

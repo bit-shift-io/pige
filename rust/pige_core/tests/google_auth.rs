@@ -920,6 +920,53 @@ async fn refresh_rotation_saved_before_reuse() {
 }
 
 #[tokio::test]
+async fn hung_token_refresh_is_bounded_by_context_deadline() {
+    // A stalled token endpoint must not outlive the operation context: a
+    // provider request cannot pin its account slot indefinitely.
+    let body = serde_json::json!({
+        "access_token": "access-late",
+        "refresh_token": "refresh-late",
+        "expires_in": 3600,
+        "scope": GMAIL_MODIFY_SCOPE,
+        "token_type": "Bearer",
+    })
+    .to_string();
+    let mock = MockServer::start(vec![MockResponse::delayed_json(
+        200,
+        &body,
+        Duration::from_secs(5),
+    )])
+    .await;
+    let harness = Harness::new();
+    let account = AccountId::new();
+    let seed = harness.context(&account);
+    harness
+        .secrets
+        .save(
+            &seed,
+            &SecretEnvelope::google(GoogleSessionSecret {
+                access_token: Some(SecretString::from("stale-access")),
+                refresh_token: Some(SecretString::from("refresh-1")),
+                expires_at_ms: Some(1),
+                scopes: vec![GMAIL_MODIFY_SCOPE.to_string()],
+            }),
+        )
+        .expect("seed token");
+
+    let refresher = GoogleTokenRefresher::new(harness.secrets.clone(), harness.oauth(mock.url()));
+    let ctx = OperationContext::with_timeout(account, 1, Duration::from_millis(50));
+    let outcome = tokio::time::timeout(Duration::from_secs(2), refresher.refresh(&ctx)).await;
+    assert!(
+        outcome.is_ok(),
+        "a hung token refresh must be bounded by the context deadline"
+    );
+    let error = outcome
+        .expect("checked above")
+        .expect_err("an expired deadline is an error");
+    assert_eq!(error.kind, ErrorKind::Transient, "got {error:?}");
+}
+
+#[tokio::test]
 async fn refresh_token_is_not_returned_before_rotation_is_persisted() {
     let mock = MockServer::start(vec![token_ok(
         "rotated-access",
@@ -1261,6 +1308,9 @@ struct HttpRequest {
 struct MockResponse {
     status: u16,
     body: String,
+    /// Hold the connection open this long before answering, to model a stalled
+    /// token endpoint.
+    delay: Duration,
 }
 
 impl MockResponse {
@@ -1268,6 +1318,15 @@ impl MockResponse {
         Self {
             status,
             body: body.to_string(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn delayed_json(status: u16, body: &str, delay: Duration) -> Self {
+        Self {
+            status,
+            body: body.to_string(),
+            delay,
         }
     }
 }
@@ -1315,6 +1374,9 @@ impl MockServer {
                         .expect("response queue")
                         .pop_front()
                         .unwrap_or(MockResponse::json(500, r#"{"error":"unexpected"}"#));
+                    if !response.delay.is_zero() {
+                        tokio::time::sleep(response.delay).await;
+                    }
                     let head = format!(
                         "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         response.status,

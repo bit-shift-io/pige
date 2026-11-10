@@ -128,10 +128,18 @@ pub struct GoogleTokenClient {
     oauth: GoogleOAuthConfig,
 }
 
+/// A finite ceiling on any single token-endpoint request, so a stalled
+/// connection cannot hang a sign-in or refresh indefinitely. The caller's
+/// [`OperationContext`] deadline is usually shorter and is enforced separately.
+const TOKEN_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl GoogleTokenClient {
     pub fn new(oauth: GoogleOAuthConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(TOKEN_HTTP_TIMEOUT)
+                .build()
+                .expect("the Google token HTTP client builds"),
             oauth,
         }
     }
@@ -377,19 +385,25 @@ impl TokenRefresher for GoogleTokenRefresher {
         let refresh_token = secret.refresh_token.ok_or_else(|| {
             ProviderError::reauthenticate("Google sign-in has expired; sign in again")
         })?;
-        let fresh = match &self.refresh_endpoint {
-            Some(endpoint) => {
-                self.tokens
-                    .refresh_with(
-                        endpoint.token_url.clone(),
-                        &endpoint.client_id,
-                        None,
-                        &refresh_token,
-                    )
-                    .await?
-            }
-            None => self.tokens.refresh(&refresh_token).await?,
-        };
+        // Race the network refresh against cancellation and the deadline: a
+        // stalled token endpoint must not hold the account past its budget.
+        let fresh = ctx
+            .bound(async {
+                match &self.refresh_endpoint {
+                    Some(endpoint) => {
+                        self.tokens
+                            .refresh_with(
+                                endpoint.token_url.clone(),
+                                &endpoint.client_id,
+                                None,
+                                &refresh_token,
+                            )
+                            .await
+                    }
+                    None => self.tokens.refresh(&refresh_token).await,
+                }
+            })
+            .await?;
         ctx.ensure_active()?;
 
         let scopes = if fresh.scopes.is_empty() {
@@ -472,7 +486,10 @@ impl TokenSource for GoogleAndroidTokenSource {
         {
             return Ok(token.clone());
         }
-        let result = self.host.acquire(&self.account, &self.scopes).await?;
+        // A hung platform consent host must not outlive the operation context.
+        let result = ctx
+            .bound(self.host.acquire(&self.account, &self.scopes))
+            .await?;
         result.validate()?;
         ctx.ensure_active()?;
         let token = result.access_token.clone();
@@ -962,8 +979,21 @@ impl AuthenticationService for GoogleAuthentication {
             return Err(error);
         }
 
-        let tokens = GoogleTokenClient::new(self.oauth.clone())
-            .exchange_code(&code, verifier.expose_secret(), &redirect_uri)
+        // A stalled exchange must not outlive the attempt's operation context;
+        // the code is single-use, so the attempt ends either way.
+        let exchange_ctx = self
+            .attempts
+            .get(attempt)
+            .map(|state| state.ctx.clone())
+            .ok_or_else(|| {
+                ProviderError::not_found("the authentication attempt is no longer active")
+            })?;
+        let tokens = exchange_ctx
+            .bound(GoogleTokenClient::new(self.oauth.clone()).exchange_code(
+                &code,
+                verifier.expose_secret(),
+                &redirect_uri,
+            ))
             .await;
         let tokens = match tokens {
             Ok(tokens) => tokens,
@@ -1161,8 +1191,20 @@ impl GoogleAuthentication {
                             "Google sign-in did not return offline access; sign in again",
                         ));
                     };
-                    let exchanged = GoogleTokenClient::new(self.oauth.clone())
-                        .exchange_server_auth_code(&code, &offline)
+                    let exchange_ctx = self
+                        .attempts
+                        .get(&result.attempt)
+                        .map(|state| state.ctx.clone())
+                        .ok_or_else(|| {
+                            ProviderError::not_found(
+                                "the authentication attempt is no longer active",
+                            )
+                        })?;
+                    let exchanged = exchange_ctx
+                        .bound(
+                            GoogleTokenClient::new(self.oauth.clone())
+                                .exchange_server_auth_code(&code, &offline),
+                        )
                         .await;
                     let exchanged = match exchanged {
                         Ok(exchanged) => exchanged,

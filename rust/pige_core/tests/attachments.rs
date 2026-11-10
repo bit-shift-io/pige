@@ -237,6 +237,7 @@ async fn harness(thread: &str) -> Harness {
             name: "INBOX".to_string(),
             delimiter: Some("/".to_string()),
             kind: FolderKind::Inbox,
+            selectable: true,
         }],
         states: HashMap::from([(
             "INBOX".to_string(),

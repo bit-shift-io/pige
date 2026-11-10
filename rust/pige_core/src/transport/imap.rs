@@ -158,10 +158,18 @@ impl MailTransport for ImapTransport {
             let decoded = decode_modified_utf7(name.name());
             let attributes: Vec<&str> = name.attributes().iter().map(attribute_str).collect();
             let kind = classify_folder(&decoded, &attributes);
+            // A non-selectable container (`\NoSelect`, or the RFC 5258
+            // `\NonExistent`) holds no messages: callers must skip it without
+            // confusing it with a genuine SELECT failure.
+            let selectable = !attributes.iter().any(|attribute| {
+                attribute.eq_ignore_ascii_case("\\NoSelect")
+                    || attribute.eq_ignore_ascii_case("\\NonExistent")
+            });
             folders.push(RemoteFolder {
                 name: decoded,
                 delimiter: name.delimiter().map(str::to_string),
                 kind,
+                selectable,
             });
         }
         Ok(folders)

@@ -143,6 +143,7 @@ fn inbox_transport(messages: Vec<RemoteMessage>) -> FakeTransport {
             name: "INBOX".to_string(),
             delimiter: Some("/".to_string()),
             kind: FolderKind::Inbox,
+            selectable: true,
         }],
         messages: HashMap::from([("INBOX".to_string(), messages)]),
         states: HashMap::from([(
@@ -1421,16 +1422,19 @@ async fn seed_prefetch(harness: &Harness, raw: &[u8]) -> AccountId {
                     name: "INBOX".to_string(),
                     delimiter: Some("/".to_string()),
                     kind: FolderKind::Inbox,
+                    selectable: true,
                 },
                 RemoteFolder {
                     name: "Archive".to_string(),
                     delimiter: Some("/".to_string()),
                     kind: FolderKind::Archive,
+                    selectable: true,
                 },
                 RemoteFolder {
                     name: "Trash".to_string(),
                     delimiter: Some("/".to_string()),
                     kind: FolderKind::Trash,
+                    selectable: true,
                 },
             ],
             bodies: HashMap::from([("INBOX".into(), HashMap::from([(Uid(1), raw.to_vec())]))]),
@@ -1539,6 +1543,7 @@ async fn prefetch_opens_one_session_for_the_whole_account_batch() {
                 name: "INBOX".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: FolderKind::Inbox,
+                selectable: true,
             }],
             bodies: HashMap::from([("INBOX".to_string(), bodies)]),
             ..FakeTransport::default()
@@ -1633,16 +1638,19 @@ async fn delayed_mutation_of_a_does_not_cancel_a_newer_open_of_b() {
                         name: "INBOX".to_string(),
                         delimiter: Some("/".to_string()),
                         kind: FolderKind::Inbox,
+                        selectable: true,
                     },
                     RemoteFolder {
                         name: "Archive".to_string(),
                         delimiter: Some("/".to_string()),
                         kind: FolderKind::Archive,
+                        selectable: true,
                     },
                     RemoteFolder {
                         name: "Trash".to_string(),
                         delimiter: Some("/".to_string()),
                         kind: FolderKind::Trash,
+                        selectable: true,
                     },
                 ],
                 bodies: HashMap::from([(
@@ -1873,6 +1881,7 @@ Content-Type: text/html; charset=utf-8\r\n\r\n\
             name: "INBOX".to_string(),
             delimiter: Some("/".to_string()),
             kind: FolderKind::Inbox,
+            selectable: true,
         }],
         states: HashMap::from([(
             "INBOX".to_string(),
@@ -2286,11 +2295,13 @@ async fn opening_an_other_folder_syncs_it_when_no_cache_exists() {
                 name: "INBOX".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: FolderKind::Inbox,
+                selectable: true,
             },
             RemoteFolder {
                 name: "Work".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: FolderKind::Other,
+                selectable: true,
             },
         ],
         messages: HashMap::from([

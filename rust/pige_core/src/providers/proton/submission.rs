@@ -345,10 +345,10 @@ impl ProtonSubmission {
         ctx: &OperationContext,
     ) -> Result<HashMap<String, super::policy::RecipientMaterial>, ProviderError> {
         // The adapter-private store is shared with the address book so raw card
-        // material survives a snapshot, but delivery policy is deliberately not
-        // read from it: `resolve` performs a complete fresh enumeration on every
-        // submit. Cached material must never authorize a send after a contact
-        // added a mandatory requirement.
+        // material survives a snapshot. `resolve` reuses a completed
+        // enumeration only for a short TTL, then re-lists the address book, so
+        // a contact that just added a mandatory requirement is honored; stale
+        // material can never authorize a send past that window.
         let deliveries = self.policy.resolve(&request.message, ctx).await?;
         let mut materials = HashMap::new();
         for delivery in deliveries {

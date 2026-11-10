@@ -266,12 +266,29 @@ impl proton_core::transport::Doer for ProtonHttp {
         // Never let the vendored client attempt its own rotating refresh.
         let mut request = request;
         request.skip_refresh = true;
-        match self.http.do_raw(request.clone()).await {
-            Err(proton_core::Error::Unauthorized) => {
-                self.refresh_after_unauthorized().await?;
-                self.http.do_raw(request).await
+        let call = async move {
+            match self.http.do_raw(request.clone()).await {
+                Err(proton_core::Error::Unauthorized) => {
+                    self.refresh_after_unauthorized().await?;
+                    self.http.do_raw(request).await
+                }
+                other => other,
             }
-            other => other,
+        };
+        // The vendored `Doer` can only return vendor errors, so a bound that
+        // fires records the typed failure for `finish` to prefer while giving
+        // the vendor a non-commit error.
+        tokio::select! {
+            biased;
+            _ = self.ctx.cancellation.cancelled() => {
+                self.record_failure(ProviderError::cancelled("operation cancelled"));
+                Err(proton_core::Error::Other("operation cancelled".to_string()))
+            }
+            _ = tokio::time::sleep_until(self.ctx.deadline) => {
+                self.record_failure(ProviderError::transient("operation deadline exceeded"));
+                Err(proton_core::Error::Other("operation deadline exceeded".to_string()))
+            }
+            result = call => result,
         }
     }
 

@@ -2317,6 +2317,7 @@ async fn sync_folder_inner(id: &FolderId) -> Result<ModelSnapshot, String> {
                 name: folder.name.clone(),
                 delimiter: folder.delimiter.clone(),
                 kind: folder.kind,
+                selectable: true,
             };
             let mut threads = ThreadAssigner::from_messages(
                 &store
@@ -3571,6 +3572,7 @@ async fn backfill_older(
         name: folder.name.clone(),
         delimiter: folder.delimiter.clone(),
         kind: folder.kind,
+        selectable: true,
     };
     let state = transport
         .select(&remote)

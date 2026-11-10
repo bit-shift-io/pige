@@ -179,6 +179,13 @@ impl SyncService for ImapSync {
             .list_folders()
             .await
             .map_err(transport_error)?;
+        // A `\NoSelect` container is not a mailbox: it holds no messages, so it
+        // is skipped by LIST rather than selected (the server would reject the
+        // SELECT). Any *other* SELECT failure below is a genuine error.
+        let folders: Vec<RemoteFolder> = folders
+            .into_iter()
+            .filter(|folder| folder.selectable)
+            .collect();
         let mut changes = Vec::new();
 
         // Collection membership: a name that did not exist in the cursor is a
@@ -231,15 +238,18 @@ impl SyncService for ImapSync {
         to_sync.sort_by_key(|folder| sync_order(folder.kind).unwrap_or(usize::MAX));
 
         for folder in to_sync {
-            // A long run of unselectable folders must still honor a cancel.
+            // A long run of folders must still honor a cancel.
             ctx.ensure_active()?;
             let name = folder.name.clone();
-            let folder_state = match self.transport.select(&folder).await {
-                Ok(folder_state) => folder_state,
-                // A mailbox we cannot select is skipped so one bad folder never
-                // wedges the whole account.
-                Err(_) => continue,
-            };
+            // A genuine SELECT failure (expired auth, TLS, transient server
+            // error) must abort the page so the scheduler retries. Swallowing
+            // it would report a successful sync that silently omits the
+            // folder's mail.
+            let folder_state = self
+                .transport
+                .select(&folder)
+                .await
+                .map_err(transport_error)?;
 
             // Report the server's total message count so the application can
             // tell whether older mail remains on the server (paging) even after

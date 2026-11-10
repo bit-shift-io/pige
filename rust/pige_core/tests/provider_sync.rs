@@ -593,6 +593,7 @@ async fn partial_window_does_not_sweep_older_messages() {
                 name: "INBOX".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: FolderKind::Inbox,
+                selectable: true,
             }],
             states: HashMap::from([(
                 "INBOX".to_string(),
@@ -1199,4 +1200,39 @@ async fn interactive_wait_is_bounded_by_deadline() {
 
     release.notify_one();
     holder.await.unwrap().unwrap();
+}
+
+/// A provider page that never returns must not outlive the operation context's
+/// deadline: a stalled network call cannot pin the account gate forever.
+#[tokio::test]
+async fn hung_provider_page_is_bounded_by_context_deadline() {
+    let account = imap_account("acc-hung-page");
+    let (_dir, store) = open_store(&account);
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut session = provider_session(
+        ScriptedSync::pages(Vec::new()).gate(entered.clone(), release.clone()),
+        IMAP_SMTP_PROVIDER,
+    );
+    let ctx = OperationContext::with_timeout(account.id.clone(), 1, Duration::from_millis(50));
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        provider::sync_account(&store, &mut session, &ctx, budget(4)),
+    )
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a hung provider page must be bounded by the context deadline"
+    );
+    let report = outcome
+        .expect("checked above")
+        .expect("a deadline is reported, not fatal");
+    assert!(
+        report.errors.iter().any(|error| error.contains("deadline")),
+        "the deadline must be surfaced, got {:?}",
+        report.errors
+    );
+
+    release.notify_one();
 }

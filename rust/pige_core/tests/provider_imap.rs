@@ -5,7 +5,7 @@
 //! [`MailboxService`](pige_core::providers::MailboxService) boundary, so the
 //! assertions are about behavior, not protocol internals.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,6 +76,17 @@ fn folder(name: &str, kind: FolderKind) -> RemoteFolder {
         name: name.to_string(),
         delimiter: Some("/".to_string()),
         kind,
+        selectable: true,
+    }
+}
+
+/// A `\NoSelect` container as LIST reports it: listed, but not selectable.
+fn container(name: &str, kind: FolderKind) -> RemoteFolder {
+    RemoteFolder {
+        name: name.to_string(),
+        delimiter: Some("/".to_string()),
+        kind,
+        selectable: false,
     }
 }
 
@@ -1080,6 +1091,173 @@ async fn gmail_remove_label_never_uses_source_uid() {
     // Label *addition* is implemented (COPY into the label folder), so label
     // management is advertised even though removal stays unsupported.
     assert!(session.capabilities.mutations.labels);
+}
+
+#[tokio::test]
+async fn mutation_rejects_target_from_stale_uidvalidity_epoch() {
+    // The mailbox's live UIDVALIDITY advanced past the epoch named by the cached
+    // remote id, so the same UID may now name a different message. A permanent
+    // delete must be rejected without touching the server.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![folder("INBOX", FolderKind::Inbox)],
+            states: HashMap::from([("INBOX".to_string(), state(2, 3))]),
+            messages: HashMap::from([("INBOX".to_string(), vec![message(1, "new message")])]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let stale = identity::message_remote_id("INBOX", 1, Uid(1));
+    let mut session = open(transports.clone()).await;
+    let result = session
+        .mutation_service()
+        .unwrap()
+        .apply(
+            request(MutationAction::DeletePermanently, vec![stale]),
+            &context(),
+        )
+        .await
+        .expect("delete request");
+
+    assert!(
+        matches!(
+            &result.items[0].outcome,
+            MutationOutcome::Rejected(error) if error.kind == ErrorKind::Conflict
+        ),
+        "a stale UIDVALIDITY epoch must be rejected, not acted on: {:?}",
+        result.items[0].outcome
+    );
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert!(
+        transport.delete_calls.is_empty(),
+        "no expunge may run against a different epoch: {:?}",
+        transport.delete_calls
+    );
+}
+
+#[tokio::test]
+async fn select_failure_is_reported_not_treated_as_an_empty_folder() {
+    // A genuine SELECT failure (expired auth, TLS, transient server error) is
+    // indistinguishable from an empty mailbox if it is swallowed. It must abort
+    // the page so the scheduler retries, not report a complete sync that omits
+    // the folder.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                folder("Sent", FolderKind::Sent),
+            ],
+            states: HashMap::from([
+                ("INBOX".to_string(), state(1, 2)),
+                ("Sent".to_string(), state(1, 2)),
+            ]),
+            fail_select: HashSet::from(["Sent".to_string()]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let mut session = open(transports.clone()).await;
+    let result = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await;
+
+    assert!(
+        matches!(&result, Err(error) if error.kind == ErrorKind::Transient),
+        "a transient SELECT failure must surface, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn history_select_failure_is_not_silently_skipped() {
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![folder("INBOX", FolderKind::Inbox)],
+            states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+            messages: HashMap::from([("INBOX".to_string(), vec![message(1, "one")])]),
+            fail_select: HashSet::from(["INBOX".to_string()]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let mut session = open(transports.clone()).await;
+    let result = session
+        .mailbox_service()
+        .unwrap()
+        .history(
+            HistoryRequest {
+                cursor: None,
+                page_size: 10,
+            },
+            &context(),
+        )
+        .await;
+
+    assert!(
+        matches!(&result, Err(error) if error.kind == ErrorKind::Transient),
+        "a transient SELECT failure during history must surface, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn unselectable_folder_is_not_selected() {
+    // `\NoSelect` is known from LIST: Pige must skip the container without
+    // issuing a SELECT (which the server would reject), and without treating the
+    // skip as a failure.
+    let transports = Arc::new(FakeTransportFactory::default());
+    let account = account();
+    transports.add_transport(
+        account.id.clone(),
+        FakeTransport {
+            folders: vec![
+                folder("INBOX", FolderKind::Inbox),
+                container("Sent", FolderKind::Sent),
+            ],
+            states: HashMap::from([("INBOX".to_string(), state(1, 2))]),
+            messages: HashMap::from([("INBOX".to_string(), vec![message(1, "one")])]),
+            // Even if the server would reject it, the adapter must never ask.
+            fail_select: HashSet::from(["Sent".to_string()]),
+            ..FakeTransport::default()
+        },
+    );
+
+    let mut session = open(transports.clone()).await;
+    let page = session
+        .sync_service()
+        .unwrap()
+        .next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 100,
+            },
+            &context(),
+        )
+        .await
+        .expect("an unselectable container must not fail the sync");
+
+    assert_eq!(upserted(&page).len(), 1, "only INBOX mail is reported");
+    let transport = transports.transport(&account.id).await.expect("transport");
+    assert!(
+        transport.select_calls.iter().all(|name| name != "Sent"),
+        "a \\NoSelect folder must never be selected: {:?}",
+        transport.select_calls
+    );
 }
 
 #[tokio::test]

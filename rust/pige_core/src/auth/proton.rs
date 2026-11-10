@@ -99,22 +99,27 @@ impl TokenRefresher for ProtonTokenRefresher {
 
         use proton_core::transport::{Doer, HttpClient, Request};
         let http = HttpClient::new(self.endpoints.as_str(), PROTON_APP_VERSION);
-        let response: RefreshResponse = http
-            .decode(
-                Request::post("/auth/v4/refresh")
-                    .json(serde_json::json!({
-                        "UID": uid,
-                        "RefreshToken": refresh_token.expose_secret(),
-                        "ResponseType": "token",
-                        "GrantType": "refresh_token",
-                        "RedirectURI": "https://protonmail.ch",
-                        "State": "0",
-                    }))
-                    .no_refresh()
-                    .omit_auth(),
-            )
-            .await
-            .map_err(map_proton_error)?;
+        // Race the network refresh against cancellation and the deadline: a
+        // stalled endpoint must not hold the account past its budget.
+        let response: RefreshResponse = ctx
+            .bound(async {
+                http.decode(
+                    Request::post("/auth/v4/refresh")
+                        .json(serde_json::json!({
+                            "UID": uid,
+                            "RefreshToken": refresh_token.expose_secret(),
+                            "ResponseType": "token",
+                            "GrantType": "refresh_token",
+                            "RedirectURI": "https://protonmail.ch",
+                            "State": "0",
+                        }))
+                        .no_refresh()
+                        .omit_auth(),
+                )
+                .await
+                .map_err(map_proton_error)
+            })
+            .await?;
 
         // A removal/invalidation that landed while the network waited must not
         // be able to persist a rotated token.

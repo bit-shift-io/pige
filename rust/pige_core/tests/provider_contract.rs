@@ -331,11 +331,13 @@ impl ImapHarness {
                 name: "INBOX".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: FolderKind::Inbox,
+                selectable: true,
             },
             RemoteFolder {
                 name: "Sent".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: FolderKind::Sent,
+                selectable: true,
             },
         ];
         let states = [

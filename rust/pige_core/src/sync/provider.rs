@@ -163,7 +163,12 @@ async fn sync_account_leased(
             initial_limit: budget.page_size.max(1),
         };
 
-        let page = match session.sync_service()?.next_page(request, ctx).await {
+        // The page may hit the network, so race it against cancellation and the
+        // deadline: a stalled provider call must not outlive this pass.
+        let page = match ctx
+            .bound(session.sync_service()?.next_page(request, ctx))
+            .await
+        {
             Ok(page) => page,
             // A cursor the adapter cannot read restarts a scoped reconciliation
             // from no cursor; the same transaction will then overwrite the bad

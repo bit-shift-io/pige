@@ -308,6 +308,7 @@ fn remote_folder(name: &str, kind: FolderKind) -> RemoteFolder {
         name: name.to_string(),
         delimiter: Some("/".to_string()),
         kind,
+        selectable: true,
     }
 }
 

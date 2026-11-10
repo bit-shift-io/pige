@@ -179,6 +179,7 @@ impl SubmissionService for ImapSubmission {
             name: folder.name.clone(),
             delimiter: folder.delimiter.clone(),
             kind: folder.kind,
+            selectable: true,
         };
         imap.select(&remote)
             .await

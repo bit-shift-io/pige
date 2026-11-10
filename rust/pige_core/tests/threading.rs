@@ -397,6 +397,7 @@ async fn sync_merges_bridged_threads_and_updates_every_message() {
             name: "INBOX".to_string(),
             delimiter: Some("/".to_string()),
             kind: FolderKind::Inbox,
+            selectable: true,
         }],
         messages: HashMap::from([(
             "INBOX".to_string(),
@@ -556,6 +557,7 @@ fn sync_transport(message_id: &str, date: i64) -> FakeTransport {
             name: "INBOX".to_string(),
             delimiter: Some("/".to_string()),
             kind: FolderKind::Inbox,
+            selectable: true,
         }],
         messages: HashMap::from([(
             "INBOX".to_string(),
@@ -683,6 +685,7 @@ Content-Type: text/html; charset=utf-8\r\n\r\n\
                 name: "INBOX".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: FolderKind::Inbox,
+                selectable: true,
             }],
             states: HashMap::from([(
                 "INBOX".to_string(),

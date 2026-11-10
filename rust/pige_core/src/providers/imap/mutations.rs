@@ -62,20 +62,26 @@ impl MutationService for ImapMutations {
     ) -> Result<MutationResult, ProviderError> {
         ctx.ensure_active()?;
 
-        // Group the targets by the mailbox that names their identity: one
-        // SELECT then one transport call per mailbox. `request.source` is
-        // advisory: the explicit remote id already names the message's mailbox,
-        // so it is the authoritative folder to act on.
-        let mut groups: Vec<(String, Vec<(Uid, RemoteMessageId)>)> = Vec::new();
+        // Group the targets by the identity that names them: `(mailbox,
+        // UIDVALIDITY)` — one SELECT then one transport call per epoch.
+        // `request.source` is advisory: the explicit remote id already names the
+        // message's mailbox, so it is the authoritative folder to act on. The
+        // epoch is part of the identity: after a UIDVALIDITY reset the same UID
+        // may name a different message, so a target from a stale epoch must
+        // never share a SELECT/act group with the live one.
+        let mut groups: Vec<(String, u32, Vec<(Uid, RemoteMessageId)>)> = Vec::new();
         let mut items = Vec::new();
         for target in &request.targets {
             match identity::decode_message(target) {
-                Some(coords) => match groups
-                    .iter_mut()
-                    .find(|(mailbox, _)| mailbox == &coords.mailbox)
-                {
-                    Some((_, entries)) => entries.push((coords.uid, target.clone())),
-                    None => groups.push((coords.mailbox, vec![(coords.uid, target.clone())])),
+                Some(coords) => match groups.iter_mut().find(|(mailbox, uidvalidity, _)| {
+                    mailbox == &coords.mailbox && *uidvalidity == coords.uidvalidity
+                }) {
+                    Some((_, _, entries)) => entries.push((coords.uid, target.clone())),
+                    None => groups.push((
+                        coords.mailbox,
+                        coords.uidvalidity,
+                        vec![(coords.uid, target.clone())],
+                    )),
                 },
                 None => items.push(MutationItemResult {
                     message: target.clone(),
@@ -86,10 +92,12 @@ impl MutationService for ImapMutations {
             }
         }
 
-        for (mailbox, entries) in &groups {
+        for (mailbox, uidvalidity, entries) in &groups {
             ctx.ensure_active()?;
             let uids: Vec<Uid> = entries.iter().map(|(uid, _)| *uid).collect();
-            let outcome = self.apply_group(mailbox, &uids, &request.action).await;
+            let outcome = self
+                .apply_group(mailbox, *uidvalidity, &uids, &request.action)
+                .await;
             for (_, message) in entries {
                 items.push(MutationItemResult {
                     message: message.clone(),
@@ -103,14 +111,16 @@ impl MutationService for ImapMutations {
 }
 
 impl ImapMutations {
-    /// Apply `action` to `uids`, all currently named by `mailbox`.
+    /// Apply `action` to `uids`, all currently named by `mailbox` under
+    /// `uidvalidity`.
     async fn apply_group(
         &mut self,
         mailbox: &str,
+        uidvalidity: u32,
         uids: &[Uid],
         action: &MutationAction,
     ) -> MutationOutcome {
-        match self.attempt(mailbox, uids, action).await {
+        match self.attempt(mailbox, uidvalidity, uids, action).await {
             Ok(()) => MutationOutcome::Applied,
             Err(error) if error.kind == ErrorKind::UnknownWriteOutcome => MutationOutcome::Unknown,
             Err(error) => MutationOutcome::Rejected(error),
@@ -120,6 +130,7 @@ impl ImapMutations {
     async fn attempt(
         &mut self,
         mailbox: &str,
+        uidvalidity: u32,
         uids: &[Uid],
         action: &MutationAction,
     ) -> Result<(), ProviderError> {
@@ -129,7 +140,7 @@ impl ImapMutations {
                     seen: true,
                     ..Flags::default()
                 };
-                self.select(mailbox).await?;
+                self.select(mailbox, uidvalidity).await?;
                 self.store(uids, flag_op(*read, flags)).await
             }
             MutationAction::SetStar(star) => {
@@ -137,13 +148,13 @@ impl ImapMutations {
                     flagged: true,
                     ..Flags::default()
                 };
-                self.select(mailbox).await?;
+                self.select(mailbox, uidvalidity).await?;
                 self.store(uids, flag_op(*star, flags)).await
             }
             MutationAction::AddLabel(label) => {
                 // Adding a label is a COPY into the label's folder: the source
                 // membership is untouched.
-                self.select(mailbox).await?;
+                self.select(mailbox, uidvalidity).await?;
                 self.copy(uids, label.as_str()).await
             }
             MutationAction::RemoveLabel(_label) => {
@@ -161,9 +172,12 @@ impl ImapMutations {
                     "removing a label on this mail server",
                 ))
             }
-            MutationAction::Move(dest) => self.move_to(mailbox, uids, dest.as_str()).await,
-            MutationAction::Archive => self.archive(mailbox, uids).await,
-            MutationAction::Trash => self.trash(mailbox, uids).await,
+            MutationAction::Move(dest) => {
+                self.move_to(mailbox, uidvalidity, uids, dest.as_str())
+                    .await
+            }
+            MutationAction::Archive => self.archive(mailbox, uidvalidity, uids).await,
+            MutationAction::Trash => self.trash(mailbox, uidvalidity, uids).await,
             MutationAction::DeletePermanently => {
                 if self.capabilities.gmail {
                     // The source UID names the source label, not
@@ -176,7 +190,7 @@ impl ImapMutations {
                         "permanently deleting a Gmail message",
                     ));
                 }
-                self.select(mailbox).await?;
+                self.select(mailbox, uidvalidity).await?;
                 self.remove(uids).await
             }
         }
@@ -189,10 +203,11 @@ impl ImapMutations {
     async fn move_to(
         &mut self,
         mailbox: &str,
+        uidvalidity: u32,
         uids: &[Uid],
         dest: &str,
     ) -> Result<(), ProviderError> {
-        self.select(mailbox).await?;
+        self.select(mailbox, uidvalidity).await?;
         if self.capabilities.gmail {
             self.copy(uids, dest).await?;
             // All Mail (the `Archive`-kind folder) is implicit membership:
@@ -214,31 +229,41 @@ impl ImapMutations {
 
     /// Gmail: remove the source label only. Generic: move into the Archive
     /// folder.
-    async fn archive(&mut self, mailbox: &str, uids: &[Uid]) -> Result<(), ProviderError> {
+    async fn archive(
+        &mut self,
+        mailbox: &str,
+        uidvalidity: u32,
+        uids: &[Uid],
+    ) -> Result<(), ProviderError> {
         if self.capabilities.gmail {
-            self.select(mailbox).await?;
+            self.select(mailbox, uidvalidity).await?;
             return self.remove(uids).await;
         }
         let archive = self
             .special_folder(FolderKind::Archive)
             .await?
             .ok_or_else(|| ProviderError::unsupported("archiving without an Archive folder"))?;
-        self.relocate(mailbox, uids, &archive).await
+        self.relocate(mailbox, uidvalidity, uids, &archive).await
     }
 
     /// Gmail: copy to the Trash label then remove the source label. Generic:
     /// move into the Trash folder.
-    async fn trash(&mut self, mailbox: &str, uids: &[Uid]) -> Result<(), ProviderError> {
+    async fn trash(
+        &mut self,
+        mailbox: &str,
+        uidvalidity: u32,
+        uids: &[Uid],
+    ) -> Result<(), ProviderError> {
         let trash = self
             .special_folder(FolderKind::Trash)
             .await?
             .ok_or_else(|| ProviderError::unsupported("moving to Trash without a Trash folder"))?;
         if self.capabilities.gmail {
-            self.select(mailbox).await?;
+            self.select(mailbox, uidvalidity).await?;
             self.copy(uids, &trash).await?;
             return self.remove(uids).await;
         }
-        self.relocate(mailbox, uids, &trash).await
+        self.relocate(mailbox, uidvalidity, uids, &trash).await
     }
 
     /// A generic relocation to `dest`: `MOVE` where available, COPY + delete
@@ -246,10 +271,11 @@ impl ImapMutations {
     async fn relocate(
         &mut self,
         mailbox: &str,
+        uidvalidity: u32,
         uids: &[Uid],
         dest: &str,
     ) -> Result<(), ProviderError> {
-        self.select(mailbox).await?;
+        self.select(mailbox, uidvalidity).await?;
         if self.capabilities.move_ext {
             self.move_messages(uids, dest).await
         } else {
@@ -271,17 +297,30 @@ impl ImapMutations {
             .map(|folder| folder.name))
     }
 
-    async fn select(&mut self, mailbox: &str) -> Result<(), ProviderError> {
+    /// SELECT `mailbox` and verify it is still the epoch the target was named
+    /// under. `expected == 0` is a legacy id with no recorded epoch; it cannot
+    /// be verified and is allowed (the UID is the only identity available).
+    async fn select(&mut self, mailbox: &str, expected: u32) -> Result<(), ProviderError> {
         let folder = RemoteFolder {
             name: mailbox.to_string(),
             delimiter: None,
             kind: FolderKind::Other,
+            selectable: true,
         };
-        self.transport
+        let state: FolderState = self
+            .transport
             .select(&folder)
             .await
-            .map(|_state: FolderState| ())
-            .map_err(transport_error)
+            .map_err(transport_error)?;
+        if expected != 0 && state.uidvalidity != expected {
+            // The mailbox was renumbered since this message was cached: the same
+            // UID may now name a different message. Reject rather than act on a
+            // foreign epoch; a resync re-identifies the message.
+            return Err(ProviderError::conflict(
+                "the mailbox changed since this message was cached; refresh and try again",
+            ));
+        }
+        Ok(())
     }
 
     /// A flag change is idempotent, so a failure is a definite rejection.

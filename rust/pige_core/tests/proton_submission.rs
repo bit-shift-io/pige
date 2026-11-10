@@ -870,6 +870,42 @@ async fn ordinary_external_is_explicitly_classified() {
 }
 
 #[tokio::test]
+async fn fresh_contact_snapshot_is_reused_between_resolves() {
+    // A completed contact enumeration must be reused for a short window rather
+    // than re-listing the whole address book on every send. Fail-closed policy
+    // is still enforced; only the expensive enumeration is cached.
+    let me = generate_key(SENDER);
+    let keys = key_store(vec![address_keys("address-1", SENDER, &[&me])]);
+
+    let mut state = MockState::default();
+    state.contacts = vec![contact("c1", "one@example.com", Vec::new())];
+    state.recipient_keys.insert(
+        "one@example.com".to_string(),
+        external_keys("one@example.com", &[]),
+    );
+    let mock = ProtonMock::start(state).await;
+    let mut policy = ProtonRecipientPolicy::new(mock.client(keys));
+    let outgoing = message(vec!["one@example.com"], vec![], vec![]);
+
+    for _ in 0..2 {
+        let deliveries = policy.resolve(&outgoing, &context()).await.expect("policy");
+        assert_eq!(deliveries[0].security, DeliverySecurity::ExternalOrdinary);
+    }
+
+    let contact_hits = mock.snapshot(|state| {
+        state
+            .requests
+            .iter()
+            .filter(|request| request.path == "/contacts/v4/contacts")
+            .count()
+    });
+    assert_eq!(
+        contact_hits, 1,
+        "a fresh snapshot must be reused across sends, not re-listed"
+    );
+}
+
+#[tokio::test]
 async fn mixed_to_cc_bcc_packages_do_not_leak_bcc() {
     let me = generate_key(SENDER);
     let bob = generate_key("bob@proton.example");

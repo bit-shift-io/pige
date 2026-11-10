@@ -28,7 +28,7 @@ use super::{identity, transport_error};
 
 /// Cursor payload version for [`ImapMailbox::history`]. A cursor from another
 /// version is rejected as [`crate::providers::ErrorKind::CursorInvalid`].
-const HISTORY_CURSOR_VERSION: u32 = 1;
+const HISTORY_CURSOR_VERSION: u32 = 2;
 
 /// Fallback page size when a caller asks for zero.
 const HISTORY_MIN_PAGE: u32 = 1;
@@ -73,6 +73,7 @@ impl ImapMailbox {
             name: mailbox.to_string(),
             delimiter: None,
             kind: FolderKind::Other,
+            selectable: true,
         };
         self.transport
             .select(&folder)
@@ -113,7 +114,12 @@ impl ImapMailbox {
             .map_err(transport_error)?;
         Ok(ImapHistoryState {
             v: HISTORY_CURSOR_VERSION,
-            mailboxes: folders.into_iter().map(|folder| folder.name).collect(),
+            // A `\NoSelect` container holds no messages; never crawl into it.
+            mailboxes: folders
+                .into_iter()
+                .filter(|folder| folder.selectable)
+                .map(|folder| folder.name)
+                .collect(),
             index: 0,
             uidvalidity: 0,
             before_uid: None,
@@ -137,6 +143,9 @@ impl MailboxService for ImapMailbox {
             .map_err(transport_error)?;
         Ok(folders
             .into_iter()
+            // A `\NoSelect` container is not a mailbox and is never offered as
+            // a collection.
+            .filter(|folder| folder.selectable)
             .map(|folder| CollectionRecord {
                 remote_id: identity::collection_remote_id(&folder.name),
                 name: folder.name,
@@ -207,17 +216,11 @@ impl MailboxService for ImapMailbox {
             // `attachment`/`collections` call) may leave a different mailbox
             // selected; `list_uids` and `fetch_learning_headers` act on the
             // currently selected folder, so we must re-establish the cursor's.
-            let folder_state = match self.select_mailbox(&mailbox).await {
-                Ok(folder_state) => folder_state,
-                Err(_) => {
-                    // A mailbox we cannot select (for example \NoSelect) is
-                    // skipped so one bad folder never wedges the crawl.
-                    state.index += 1;
-                    state.uidvalidity = 0;
-                    state.before_uid = None;
-                    continue;
-                }
-            };
+            // A genuine SELECT failure aborts the page: a `\NoSelect` container
+            // was already excluded from the crawl list, so a failure here is an
+            // auth/TLS/transient error that must surface, not silently drop the
+            // mailbox's mail from coverage.
+            let folder_state = self.select_mailbox(&mailbox).await?;
 
             // Compare the live epoch with the cursor's on every page. A UID
             // only names a message inside its UIDVALIDITY epoch: after a reset

@@ -81,6 +81,9 @@ struct MockState {
     /// Artificial latency on the decorative counts endpoint, so a test can let
     /// the operation deadline expire while counts are in flight.
     count_delay: Option<Duration>,
+    /// Artificial latency on the message-listing endpoint, to model a network
+    /// call that never returns.
+    page_delay: Option<Duration>,
     requests: Vec<RecordedRequest>,
 }
 
@@ -291,11 +294,15 @@ fn respond(state: &mut MockState, request: &Request) -> ResponseTemplate {
         let total = matching.len();
         let start = (page * page_size).min(total);
         let end = (start + page_size).min(total);
-        return ResponseTemplate::new(200).set_body_json(json!({
+        let response = ResponseTemplate::new(200).set_body_json(json!({
             "Code": 1000,
             "Total": total,
             "Messages": matching[start..end],
         }));
+        return match state.page_delay {
+            Some(delay) => response.set_delay(delay),
+            None => response,
+        };
     }
 
     if path == "/core/v4/events/latest" && request.method.as_str() == "GET" {
@@ -1848,5 +1855,80 @@ async fn collections_honors_deadline_after_decorative_counts() {
         .collections(&ctx)
         .await
         .expect_err("an expired deadline must fail collections");
+    assert_eq!(error.kind, ErrorKind::Transient);
+}
+
+#[tokio::test]
+async fn sweep_checkpoint_does_not_grow_with_the_mailbox() {
+    // The sweep accumulates every observed message id. Keeping that set in the
+    // durable cursor makes each page re-encode the whole mailbox (O(n^2) work).
+    // The cursor must stay bounded while the adapter retains the baseline
+    // locally.
+    let mut state = default_state();
+    for index in 0..600 {
+        state.put_message(message(
+            &format!("m{index}"),
+            "c1",
+            "swept",
+            &["0"],
+            "sender@example.com",
+            "alice@example.com",
+            1_700_000_000 + i64::from(index),
+        ));
+    }
+    let mock = ProtonMock::start(state).await;
+    let mut sync = ProtonSync::new(mock.client(Arc::new(StaticTokens)));
+
+    let pages = drive_sync(&mut sync, &context(), 25, 40).await;
+    assert_eq!(upserts(&pages).len(), 600, "every message is swept once");
+
+    let largest = pages
+        .iter()
+        .map(|page| page.checkpoint.payload.len())
+        .max()
+        .expect("at least one page");
+    assert!(
+        largest < 2048,
+        "the sweep cursor must not carry the whole baseline; largest was {largest} bytes"
+    );
+}
+
+#[tokio::test]
+async fn hung_listing_page_is_bounded_by_context_deadline() {
+    // A listing request that never returns must not outlive the operation
+    // context: a provider call cannot pin its account slot indefinitely.
+    let mut state = default_state();
+    state.put_message(message(
+        "m1",
+        "c1",
+        "one",
+        &["0"],
+        "sender@example.com",
+        "alice@example.com",
+        1_700_000_000,
+    ));
+    state.page_delay = Some(Duration::from_secs(5));
+    let mock = ProtonMock::start(state).await;
+    let mut sync = ProtonSync::new(mock.client(Arc::new(StaticTokens)));
+    let ctx = OperationContext::with_timeout(AccountId::new(), 1, Duration::from_millis(50));
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        sync.next_page(
+            SyncRequest {
+                cursor: None,
+                initial_limit: 10,
+            },
+            &ctx,
+        ),
+    )
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a hung listing must be bounded by the context deadline"
+    );
+    let error = outcome
+        .expect("checked above")
+        .expect_err("an expired deadline is an error");
     assert_eq!(error.kind, ErrorKind::Transient);
 }

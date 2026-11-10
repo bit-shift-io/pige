@@ -191,8 +191,11 @@ impl HttpClient {
 
     /// Create a client sharing the given auth state (so refresh updates propagate).
     pub fn with_state(base_url: impl Into<String>, auth: Arc<RwLock<AuthState>>) -> Self {
+        // A finite timeout so a stalled connection can never hang a caller that
+        // does not supply its own deadline.
         let client = reqwest::Client::builder()
             .cookie_store(true)
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest client");
         HttpClient {
@@ -413,6 +416,8 @@ impl Doer for HttpClient {
                 }
                 Detected::Api(e) if e.http_status == 401 => return Err(Error::Unauthorized),
                 Detected::Api(e) if e.http_status == 429 && !rate_limited => {
+                    // `retry::parse_retry_after` already caps the value at
+                    // `MAX_RATE_LIMIT_WAIT` (30s), so the wait is bounded.
                     let wait = resp.retry_after.unwrap_or(0);
                     tracing::debug!(target: "proton_core::http", wait_s = wait, "429 rate-limited — backing off then retrying");
                     if wait > 0 {

@@ -567,6 +567,7 @@ async fn prepared_payload_has_no_auth_secret() {
                 name: "Sent".to_string(),
                 delimiter: Some("/".to_string()),
                 kind: pige_core::FolderKind::Sent,
+                selectable: true,
             }],
             ..FakeTransport::default()
         },
@@ -759,6 +760,7 @@ async fn sent_copy_append_is_not_repeated_when_evidence_exists() {
         name: "Sent".to_string(),
         delimiter: Some("/".to_string()),
         kind: pige_core::FolderKind::Sent,
+        selectable: true,
     };
     transports.add_transport(
         account().id,
@@ -808,6 +810,7 @@ async fn sent_copy_is_not_appended_when_evidence_cannot_be_checked() {
         name: "Sent".to_string(),
         delimiter: Some("/".to_string()),
         kind: pige_core::FolderKind::Sent,
+        selectable: true,
     };
     transports.add_transport(
         account().id,

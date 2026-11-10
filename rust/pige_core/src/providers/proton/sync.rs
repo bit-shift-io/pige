@@ -21,7 +21,7 @@
 //! delta page, never for snapshot/history/reconciliation or for mail replayed
 //! from the bootstrap anchor.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,11 @@ use super::mailbox::{
 };
 use super::normalize;
 
-const SYNC_CURSOR_VERSION: u32 = 2;
+const SYNC_CURSOR_VERSION: u32 = 3;
+
+/// Adapter-local baseline of the last completed sweep, used to retire records
+/// after an event retention gap. Never serialized into the cursor.
+const EVENTS_BASELINE: &str = "events";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ProtonCursor {
@@ -50,24 +54,29 @@ enum ProtonCursor {
     /// Bounded recent-window enumeration, advanced by collection id.
     Snapshot(SweepState),
     /// Event replay (`catch_up` means the bootstrap anchor is still being
-    /// replayed, so additions are historical, not live notifications).
-    Events {
-        event_id: String,
-        catch_up: bool,
-        /// Ids from the last completed sweep, retained so a reset-driven
-        /// reconciliation can retire records that disappeared during an event
-        /// retention gap.
-        #[serde(default)]
-        known: Vec<String>,
-    },
+    /// replayed, so additions are historical, not live notifications). The
+    /// last completed sweep's ids are held adapter-locally under
+    /// [`EVENTS_BASELINE`], not in this cursor.
+    Events { event_id: String, catch_up: bool },
     /// A fully consumed event stream.
-    Complete {
-        event_id: String,
-        #[serde(default)]
-        known: Vec<String>,
-    },
+    Complete { event_id: String },
     /// Post-reset reconciliation sweep.
     Reconcile(SweepState),
+}
+
+/// The accumulator for one snapshot/reconciliation sweep, held adapter-locally
+/// (not in the durable cursor).
+///
+/// `known` is the previous completed sweep's ids; `seen` is the union of ids
+/// observed so far. Keeping these out of [`SweepState`] is what bounds the
+/// cursor: serializing the whole set on every page would make a large mailbox
+/// re-encode megabytes per page (O(n^2) over the sweep). The set lives only for
+/// the lifetime of the sweep in this process; a process restart loses it, and
+/// the sweep then fails safe by not retiring anything.
+#[derive(Debug, Clone, Default)]
+struct SweepBaseline {
+    known: Vec<String>,
+    seen: Vec<String>,
 }
 
 /// Mutable state of one snapshot/reconciliation sweep.
@@ -76,14 +85,18 @@ enum ProtonCursor {
 /// be deleted between pages, which shifts every later offset and would make a
 /// positional cursor skip the collection that slid into the consumed slot.
 ///
-/// The checkpoint is stateless, so `known`/`seen` are re-encoded into every
-/// page cursor. That is the unavoidable cost of keeping the baseline in the
-/// cursor; the payload is bounded by the scoped window's distinct message ids
-/// (and by the collection count for `scope`/`done`).
+/// The cursor carries only a handle (`sweep`) into the adapter-local
+/// [`SweepBaseline`]; the baseline itself is never serialized into the
+/// checkpoint, so the payload stays bounded regardless of mailbox size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SweepState {
     anchor: String,
     observed: String,
+    /// Handle into the adapter-local sweep baseline. Empty only for a cursor
+    /// that escaped without a baseline (a restart mid-sweep); such a sweep
+    /// fails safe by never retiring.
+    #[serde(default)]
+    sweep: String,
     /// Collections this sweep planned to enumerate when it started. Compared
     /// with the live set on every page.
     #[serde(default)]
@@ -113,23 +126,111 @@ struct SweepState {
     /// labels while still existing under an aggregate view.
     #[serde(default)]
     scope_changed: bool,
-    /// Ids from the last completed sweep. Once a new sweep completes, ids in
-    /// this set that were not observed are retired.
-    #[serde(default)]
-    known: Vec<String>,
-    /// Ids observed so far in this sweep (union across every collection).
-    #[serde(default)]
-    seen: Vec<String>,
 }
 
 /// Proton sync service.
 pub struct ProtonSync {
     client: ProtonClient,
+    /// Adapter-local sweep baselines, keyed by [`SweepState::sweep`]. Entries
+    /// live only while a sweep is in flight.
+    baselines: HashMap<String, SweepBaseline>,
+    /// Monotonic handle source for a sweep baseline.
+    sweep_seq: u64,
 }
 
 impl ProtonSync {
     pub fn new(client: ProtonClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            baselines: HashMap::new(),
+            sweep_seq: 0,
+        }
+    }
+
+    /// Register a new sweep baseline and return its handle. Any abandoned
+    /// sweep entry is dropped: only one sweep is ever in flight per session.
+    fn begin_sweep(&mut self, known: Vec<String>) -> String {
+        self.baselines.retain(|key, _| key == EVENTS_BASELINE);
+        self.sweep_seq = self.sweep_seq.saturating_add(1);
+        let handle = format!("sweep-{}", self.sweep_seq);
+        self.baselines.insert(
+            handle.clone(),
+            SweepBaseline {
+                known,
+                seen: Vec::new(),
+            },
+        );
+        handle
+    }
+
+    /// The last completed sweep's ids, for seeding a reconciliation. Missing
+    /// after a process restart means an empty baseline: the reconcile then
+    /// retires nothing (fail safe) until the next sweep rebuilds it.
+    fn events_known(&self) -> Vec<String> {
+        self.baselines
+            .get(EVENTS_BASELINE)
+            .map(|baseline| baseline.known.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace the last completed sweep's ids.
+    fn set_events_baseline(&mut self, known: Vec<String>) {
+        self.baselines.insert(
+            EVENTS_BASELINE.to_string(),
+            SweepBaseline {
+                known,
+                seen: Vec::new(),
+            },
+        );
+    }
+
+    /// Close a fully enumerated sweep and record its baseline adapter-locally.
+    ///
+    /// Retirement only happens when the live collection set matched the scope
+    /// this sweep started with. When a label appeared or disappeared mid-sweep,
+    /// the baseline is merged instead: `known` and `seen` are both retained, so
+    /// a later stable sweep can still retire a record deleted during an event
+    /// gap. Set membership is checked with a `HashSet`, not a repeated `Vec`
+    /// scan. The baseline never enters the durable cursor.
+    fn finish_sweep(
+        &mut self,
+        anchor: String,
+        known: &[String],
+        seen: Vec<String>,
+        scope_changed: bool,
+        mut changes: Vec<MailChange>,
+    ) -> Result<(Vec<MailChange>, ProtonCursor), ProviderError> {
+        if scope_changed {
+            let mut baseline = known.to_vec();
+            baseline.extend(seen);
+            baseline.sort_unstable();
+            baseline.dedup();
+            self.set_events_baseline(baseline);
+            return Ok((
+                changes,
+                ProtonCursor::Events {
+                    event_id: anchor,
+                    // Mail created while the bounded snapshot ran is historical
+                    // import, not a live notification.
+                    catch_up: true,
+                },
+            ));
+        }
+
+        let observed: HashSet<&str> = seen.iter().map(String::as_str).collect();
+        for id in known {
+            if !observed.contains(id.as_str()) {
+                changes.push(MailChange::RemoveMessage(RemoteMessageId::new(id.clone())));
+            }
+        }
+        self.set_events_baseline(seen);
+        Ok((
+            changes,
+            ProtonCursor::Events {
+                event_id: anchor,
+                catch_up: true,
+            },
+        ))
     }
 
     async fn bootstrap_page(
@@ -144,6 +245,7 @@ impl ProtonSync {
         } else {
             anchor
         };
+        let sweep = self.begin_sweep(Vec::new());
         // The first snapshot page is produced in the same call so a bounded
         // mailbox does not spend a round trip on an empty bootstrap step.
         self.snapshot_page(
@@ -151,6 +253,7 @@ impl ProtonSync {
             SweepState {
                 anchor: anchor.clone(),
                 observed: anchor,
+                sweep,
                 scope: None,
                 done: Vec::new(),
                 current: None,
@@ -159,8 +262,6 @@ impl ProtonSync {
                 churned: false,
                 page_size: initial_limit.clamp(1, PROTON_MAX_PAGE),
                 scope_changed: false,
-                known: Vec::new(),
-                seen: Vec::new(),
             },
             false,
             ctx,
@@ -184,6 +285,18 @@ impl ProtonSync {
         let mut changes = collection_changes(&labels, &counts);
         let syncable = normalize::syncable_collections(&labels);
         let live_scope: Vec<String> = syncable.iter().map(|id| id.as_str().to_string()).collect();
+
+        // Take the sweep baseline out of the table for the duration of this
+        // page. It is never serialized into the cursor. A missing entry means
+        // the process restarted mid-sweep: earlier seen ids are gone, so this
+        // sweep must not retire anything.
+        let mut baseline = match self.baselines.remove(&sweep.sweep) {
+            Some(baseline) => baseline,
+            None => {
+                sweep.scope_changed = true;
+                SweepBaseline::default()
+            }
+        };
 
         // Freeze the scope on the first page. Any later difference means a
         // label appeared or disappeared mid-sweep: keep enumerating the live
@@ -222,10 +335,10 @@ impl ProtonSync {
             // Nothing left to enumerate. Either the sweep genuinely finished or
             // the scope shrank to empty; `finish_sweep` only retires when the
             // scope held still.
-            let (changes, next) = finish_sweep(
+            let (changes, next) = self.finish_sweep(
                 sweep.anchor.clone(),
-                &sweep.known,
-                std::mem::take(&mut sweep.seen),
+                &baseline.known,
+                std::mem::take(&mut baseline.seen),
                 sweep.scope_changed,
                 changes,
             )?;
@@ -252,7 +365,7 @@ impl ProtonSync {
         let mut total = 0u32;
         let mut ids = HashSet::new();
         let mut last_page_ids: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = sweep.seen.iter().cloned().collect();
+        let mut seen: HashSet<String> = baseline.seen.iter().cloned().collect();
         for number in first_page..=sweep.page {
             // A fenced/cancelled context must not fetch or emit another page.
             ctx.ensure_active()?;
@@ -312,7 +425,7 @@ impl ProtonSync {
             sweep.churned = churned;
             sweep.current = Some(collection_id.as_str().to_string());
         }
-        sweep.seen = {
+        baseline.seen = {
             let mut seen: Vec<String> = seen.into_iter().collect();
             seen.sort_unstable();
             seen
@@ -328,10 +441,10 @@ impl ProtonSync {
             // Retire records that were known after the previous completed
             // sweep but did not appear anywhere in this one. This is the only
             // place a snapshot emits removals; one bounded page never does.
-            let (changes, next) = finish_sweep(
+            let (changes, next) = self.finish_sweep(
                 sweep.anchor.clone(),
-                &sweep.known,
-                std::mem::take(&mut sweep.seen),
+                &baseline.known,
+                std::mem::take(&mut baseline.seen),
                 sweep.scope_changed,
                 changes,
             )?;
@@ -343,6 +456,8 @@ impl ProtonSync {
             });
         }
 
+        // Keep accumulating this sweep's baseline under the same handle.
+        self.baselines.insert(sweep.sweep.clone(), baseline);
         let next = if reconcile {
             ProtonCursor::Reconcile(sweep)
         } else {
@@ -360,11 +475,11 @@ impl ProtonSync {
         &mut self,
         event_id: String,
         catch_up: bool,
-        known: Vec<String>,
         page_size: u32,
         ctx: &OperationContext,
     ) -> Result<ChangePage, ProviderError> {
         let http = self.client.request_http(ctx).await?;
+        let known = self.events_known();
         let batch = match http.finish(api::events::get_events(&http, &event_id).await) {
             Ok(batch) => batch,
             // An event id older than the server's retention window is a reset,
@@ -394,12 +509,10 @@ impl ProtonSync {
             ProtonCursor::Events {
                 event_id: batch.event_id,
                 catch_up,
-                known,
             }
         } else {
             ProtonCursor::Complete {
                 event_id: batch.event_id,
-                known,
             }
         };
         ctx.ensure_active()?;
@@ -415,7 +528,7 @@ impl ProtonSync {
     /// recent window; absent records are retired only when that scoped sweep
     /// completes, so cached messages survive a short event retention gap.
     async fn reset_page(
-        &self,
+        &mut self,
         http: &ProtonHttp,
         mut changes: Vec<MailChange>,
         known: Vec<String>,
@@ -432,11 +545,13 @@ impl ProtonSync {
             .iter()
             .map(|id| id.as_str().to_string())
             .collect();
+        let sweep = self.begin_sweep(known);
         Ok(ChangePage {
             changes,
             checkpoint: encode_cursor(&ProtonCursor::Reconcile(SweepState {
                 observed: anchor.clone(),
                 anchor,
+                sweep,
                 scope: Some(scope),
                 done: Vec::new(),
                 current: None,
@@ -445,8 +560,6 @@ impl ProtonSync {
                 churned: false,
                 page_size: page_size.clamp(1, PROTON_MAX_PAGE),
                 scope_changed: false,
-                known,
-                seen: Vec::new(),
             }))?,
             has_more: true,
         })
@@ -491,17 +604,13 @@ impl SyncService for ProtonSync {
                 }
                 self.snapshot_page(http, sweep, false, ctx).await
             }
-            ProtonCursor::Events {
-                event_id,
-                catch_up,
-                known,
-            } => {
-                self.event_page(event_id, catch_up, known, requested_page_size, ctx)
+            ProtonCursor::Events { event_id, catch_up } => {
+                self.event_page(event_id, catch_up, requested_page_size, ctx)
                     .await
             }
-            ProtonCursor::Complete { event_id, known } => {
+            ProtonCursor::Complete { event_id } => {
                 // A delta after the bootstrap is live mail.
-                self.event_page(event_id, false, known, requested_page_size, ctx)
+                self.event_page(event_id, false, requested_page_size, ctx)
                     .await
             }
             ProtonCursor::Reconcile(sweep) => {
@@ -723,53 +832,6 @@ fn event_changes(messages: &[MessageEvent], live: bool) -> (Vec<MailChange>, boo
 /// record: doing so would erase membership the event did not mention.
 fn is_complete_metadata(message: &proton_core::model::MessageMetadata) -> bool {
     !message.id.is_empty() && message.time > 0 && !message.label_ids.is_empty()
-}
-
-/// Close a fully enumerated sweep.
-///
-/// Retirement only happens when the live collection set matched the scope this
-/// sweep started with. When a label appeared or disappeared mid-sweep, the
-/// baseline is merged instead: `known` and `seen` are both still present, so a
-/// later stable sweep can still retire a record deleted during an event gap.
-/// Set membership is checked with a `HashSet`, not a repeated `Vec` scan.
-fn finish_sweep(
-    anchor: String,
-    known: &[String],
-    seen: Vec<String>,
-    scope_changed: bool,
-    mut changes: Vec<MailChange>,
-) -> Result<(Vec<MailChange>, ProtonCursor), ProviderError> {
-    if scope_changed {
-        let mut baseline = known.to_vec();
-        baseline.extend(seen);
-        baseline.sort_unstable();
-        baseline.dedup();
-        return Ok((
-            changes,
-            ProtonCursor::Events {
-                event_id: anchor,
-                // Mail created while the bounded snapshot ran is historical
-                // import, not a live notification.
-                catch_up: true,
-                known: baseline,
-            },
-        ));
-    }
-
-    let observed: HashSet<&str> = seen.iter().map(String::as_str).collect();
-    for id in known {
-        if !observed.contains(id.as_str()) {
-            changes.push(MailChange::RemoveMessage(RemoteMessageId::new(id.clone())));
-        }
-    }
-    Ok((
-        changes,
-        ProtonCursor::Events {
-            event_id: anchor,
-            catch_up: true,
-            known: seen,
-        },
-    ))
 }
 
 fn encode_cursor(cursor: &ProtonCursor) -> Result<ProviderCursor, ProviderError> {

@@ -142,6 +142,7 @@ fn mutation_transport(capabilities: Capabilities) -> FakeTransport {
         name: name.to_string(),
         delimiter: Some("/".to_string()),
         kind,
+        selectable: true,
     };
     FakeTransport {
         capabilities,

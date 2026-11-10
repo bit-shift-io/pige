@@ -18,6 +18,10 @@ pub struct RemoteFolder {
     pub name: String,
     pub delimiter: Option<String>,
     pub kind: FolderKind,
+    /// Whether the server allows SELECT on this mailbox. A `\NoSelect`
+    /// (or `\NonExistent`) container holds no messages and must never be
+    /// treated as a failed selection when it is skipped.
+    pub selectable: bool,
 }
 
 /// Server state for a selected folder.
