@@ -71,8 +71,8 @@ fn header(rfc_id: Option<&str>, subject: &str) -> MessageHeader {
         from: vec![pige_core::Address::new(None, "sender@example.com")],
         to: Vec::new(),
         cc: Vec::new(),
-    reply_to: Vec::new(),
-    bcc: Vec::new(),
+        reply_to: Vec::new(),
+        bcc: Vec::new(),
         date: 1_700_000_000,
         size: 128,
     }
@@ -136,15 +136,7 @@ fn v4_ids_and_dependents_survive() {
         )
         // No RFC Message-ID at all.
         .message(
-            "msg-3",
-            "acc-1",
-            "inbox",
-            3,
-            7,
-            None,
-            "Third",
-            "thread-3",
-            3,
+            "msg-3", "acc-1", "inbox", 3, 7, None, "Third", "thread-3", 3,
         )
         .body("msg-1", "unique body alpha")
         .body("msg-3", "unique body gamma")
@@ -192,24 +184,31 @@ fn v4_ids_and_dependents_survive() {
             .as_deref(),
         Some("unique body alpha")
     );
-    assert_eq!(store.attachments(&MessageId("msg-2".to_string())).unwrap().len(), 1);
-    assert!(store.body(&MessageId("msg-2".to_string())).unwrap().is_none());
+    assert_eq!(
+        store
+            .attachments(&MessageId("msg-2".to_string()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .body(&MessageId("msg-2".to_string()))
+            .unwrap()
+            .is_none()
+    );
 
     // FTS still finds the same content under the same ids.
-    let hits = pige_core::search::search(
-        &store,
-        "alpha",
-        &pige_core::SearchScope::AllAccounts,
-        10,
-    )
-    .unwrap();
+    let hits = pige_core::search::search(&store, "alpha", &pige_core::SearchScope::AllAccounts, 10)
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].thread_id, ThreadId("thread-1".to_string()));
 
     // Timestamps and outbox rows are untouched.
     let conn = raw(&path);
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get::<_, i64>(0))
+        conn.query_row("SELECT COUNT(*) FROM outbox", [], |row| row
+            .get::<_, i64>(0))
             .unwrap(),
         outbox_before
     );
@@ -221,9 +220,15 @@ fn v4_ids_and_dependents_survive() {
         )
         .unwrap();
     assert_eq!(has_old_folder, 0, "messages must no longer carry folder_id");
-    assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+    assert_eq!(
+        conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
     let violations: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(violations, 0);
 }
@@ -239,8 +244,28 @@ fn same_remote_id_across_accounts_is_distinct() {
         .account("acc-2", "grace@example.com", 1)
         .folder("inbox-1", "acc-1", "INBOX", "inbox", 1)
         .folder("inbox-2", "acc-2", "INBOX", "inbox", 1)
-        .message("a-1", "acc-1", "inbox-1", 1, 1, Some("<shared@example.com>"), "A", "ta", 1)
-        .message("b-1", "acc-2", "inbox-2", 1, 1, Some("<shared@example.com>"), "B", "tb", 2);
+        .message(
+            "a-1",
+            "acc-1",
+            "inbox-1",
+            1,
+            1,
+            Some("<shared@example.com>"),
+            "A",
+            "ta",
+            1,
+        )
+        .message(
+            "b-1",
+            "acc-2",
+            "inbox-2",
+            1,
+            1,
+            Some("<shared@example.com>"),
+            "B",
+            "tb",
+            2,
+        );
 
     let store = fixture.into_store();
     store.migrate().unwrap();
@@ -311,6 +336,7 @@ fn two_labels_share_one_native_message() {
                 checkpoint: ProviderCursor::new(1, "page-1"),
                 has_more: false,
             },
+            None,
         )
         .unwrap();
 
@@ -359,6 +385,7 @@ fn two_labels_share_one_native_message() {
                 checkpoint: ProviderCursor::new(1, "page-2"),
                 has_more: false,
             },
+            None,
         )
         .unwrap();
 
@@ -427,7 +454,10 @@ fn same_rfc_id_is_not_identity() {
     assert_eq!(store.messages(&folder, 10, None).unwrap().len(), 2);
     for id in ["m-1", "m-2"] {
         let stored = store.message(&MessageId(id.to_string())).unwrap().unwrap();
-        assert_eq!(stored.header.message_id.as_deref(), Some("<same@example.com>"));
+        assert_eq!(
+            stored.header.message_id.as_deref(),
+            Some("<same@example.com>")
+        );
     }
 }
 
@@ -440,7 +470,17 @@ fn migration_rollback_reopens_v4() {
     fixture
         .account("acc-1", "ada@example.com", 0)
         .folder("inbox", "acc-1", "INBOX", "inbox", 7)
-        .message("msg-1", "acc-1", "inbox", 1, 7, Some("<a@example.com>"), "One", "t1", 1)
+        .message(
+            "msg-1",
+            "acc-1",
+            "inbox",
+            1,
+            7,
+            Some("<a@example.com>"),
+            "One",
+            "t1",
+            1,
+        )
         .body("msg-1", "rollback body")
         .attachment("att-1", "msg-1", "2", "file.bin");
 
@@ -448,7 +488,10 @@ fn migration_rollback_reopens_v4() {
     let store = fixture.into_store();
     let result = store.migrate();
     clear_migration_fault();
-    assert!(result.is_err(), "the injected fault must fail the migration");
+    assert!(
+        result.is_err(),
+        "the injected fault must fail the migration"
+    );
 
     // The v4 schema and its data are intact: same version, old columns, same
     // body and attachment, all through the raw v4 connection.
@@ -461,7 +504,10 @@ fn migration_rollback_reopens_v4() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(still_folder_id, 1, "rollback must restore the old messages table");
+    assert_eq!(
+        still_folder_id, 1,
+        "rollback must restore the old messages table"
+    );
     let messages: i64 = conn
         .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
         .unwrap();
@@ -496,7 +542,7 @@ fn newer_schema_rejected() {
         let conn = raw(&path);
         conn.execute(
             "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-            [ (SCHEMA_VERSION + 1).to_string() ],
+            [(SCHEMA_VERSION + 1).to_string()],
         )
         .unwrap();
     }
@@ -595,6 +641,7 @@ fn page_and_cursor_commit_atomically() {
                 checkpoint: ProviderCursor::new(1, "cp-1"),
                 has_more: true,
             },
+            None,
         )
         .unwrap();
 
@@ -630,6 +677,7 @@ fn page_and_cursor_commit_atomically() {
             checkpoint: ProviderCursor::new(1, "cp-bad"),
             has_more: false,
         },
+        None,
     );
     assert!(matches!(
         failed,
@@ -637,7 +685,11 @@ fn page_and_cursor_commit_atomically() {
     ));
     assert!(
         store
-            .remote_message_for(&account.id, GMAIL_PROVIDER, &RemoteMessageId::new("native-x"))
+            .remote_message_for(
+                &account.id,
+                GMAIL_PROVIDER,
+                &RemoteMessageId::new("native-x")
+            )
             .unwrap()
             .is_none(),
         "the rolled-back upsert must not persist"
@@ -671,11 +723,16 @@ fn page_and_cursor_commit_atomically() {
                 checkpoint: ProviderCursor::new(1, "cp-2"),
                 has_more: false,
             },
+            None,
         )
         .unwrap();
     assert!(
         store
-            .remote_message_for(&account.id, GMAIL_PROVIDER, &RemoteMessageId::new("native-x"))
+            .remote_message_for(
+                &account.id,
+                GMAIL_PROVIDER,
+                &RemoteMessageId::new("native-x")
+            )
             .unwrap()
             .is_some()
     );
@@ -734,6 +791,7 @@ fn collection_upsert_preserves_folder_state() {
                 checkpoint: ProviderCursor::new(1, "cp-1"),
                 has_more: false,
             },
+            None,
         )
         .unwrap();
 
@@ -745,7 +803,11 @@ fn collection_upsert_preserves_folder_state() {
         .expect("folder survives a collection upsert");
     assert_eq!(folder.unread, 5, "omitted unread must preserve the rollup");
     assert_eq!(folder.total, 9, "omitted total must preserve the rollup");
-    assert_eq!(folder.uidvalidity, Some(42), "UIDVALIDITY must not be reset");
+    assert_eq!(
+        folder.uidvalidity,
+        Some(42),
+        "UIDVALIDITY must not be reset"
+    );
     assert_eq!(folder.uidnext, Some(100), "UIDNEXT must not be cleared");
 
     // Counters reported: they update, but the IMAP epoch is still untouched.
@@ -756,10 +818,15 @@ fn collection_upsert_preserves_folder_state() {
             IMAP_SMTP_PROVIDER,
             Some(&ProviderCursor::new(1, "cp-1")),
             &ChangePage {
-                changes: vec![MailChange::UpsertCollection(record("INBOX", Some(2), Some(3)))],
+                changes: vec![MailChange::UpsertCollection(record(
+                    "INBOX",
+                    Some(2),
+                    Some(3),
+                ))],
                 checkpoint: ProviderCursor::new(1, "cp-2"),
                 has_more: false,
             },
+            None,
         )
         .unwrap();
     let folder = store
@@ -770,7 +837,11 @@ fn collection_upsert_preserves_folder_state() {
         .unwrap();
     assert_eq!(folder.unread, 2);
     assert_eq!(folder.total, 3);
-    assert_eq!(folder.uidvalidity, Some(42), "UIDVALIDITY must not be reset");
+    assert_eq!(
+        folder.uidvalidity,
+        Some(42),
+        "UIDVALIDITY must not be reset"
+    );
     assert_eq!(folder.uidnext, Some(100), "UIDNEXT must not be cleared");
 }
 

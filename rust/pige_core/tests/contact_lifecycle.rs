@@ -13,17 +13,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use pige_core::Store;
+use pige_core::StoreError;
 use pige_core::account::{Account, AccountId, Security, ServerConfig};
 use pige_core::api::{self, Config, DB_FILE_NAME};
 use pige_core::contacts::{
-    normalize_address, AddressKey, EvidenceId, HeaderRole, LearningOrigin, Observation,
-    ObservationTrust,
+    AddressKey, EvidenceId, HeaderRole, LearningOrigin, Observation, ObservationTrust,
+    normalize_address,
 };
 use pige_core::mail::{Address, Flags, MessageHeader};
+use pige_core::platform::BackupStore;
 use pige_core::platform::fake::{
     FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
 };
-use pige_core::platform::BackupStore;
 use pige_core::providers::fake::FakeProviderFactory;
 use pige_core::providers::{
     ChangePage, HistoryCoverage, HistoryPage, JobKey, JobKind, MailChange, MessageRecord,
@@ -32,8 +34,6 @@ use pige_core::providers::{
 use pige_core::store::{HistoryProgress, history_job};
 use pige_core::sync::history::{background_budget, learn_account_slice};
 use pige_core::sync::scheduler::AccountScheduler;
-use pige_core::Store;
-use pige_core::StoreError;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -207,7 +207,7 @@ fn clear_then_resync_does_not_restore_history() {
         has_more: false,
     };
     store
-        .apply_change_page(&context, &key, "imap-smtp", None, &change)
+        .apply_change_page(&context, &key, "imap-smtp", None, &change, None)
         .unwrap();
     assert!(!learned(&store, &account.id, old));
 }

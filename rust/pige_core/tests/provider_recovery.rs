@@ -45,10 +45,11 @@ use pige_core::platform::fake::{
     FakeBackupStore, FakeCredentials, FakeNotifier, FakeOpener, FakeTransportFactory,
 };
 use pige_core::providers::{
-    AuthAttemptId, IMAP_SMTP_PROVIDER, OperationContext, PreparedSubmission, ProviderCursor,
-    ProviderError, ProviderFactory, ProviderId, ReconcileOutcome, RemoteCollectionId,
-    RemoteMessageId, SentCopyPolicy, SubmissionOutcome, SubmissionReceipt, SubmissionRequest,
-    SubmissionService, fake::FakeProviderFactory,
+    AuthAttemptId, ChangePage, CollectionRecord, IMAP_SMTP_PROVIDER, MailChange, MessageRecord,
+    OperationContext, PreparedSubmission, ProviderCursor, ProviderError, ProviderFactory,
+    ProviderId, ReconcileOutcome, RemoteCollectionId, RemoteMessageId, SentCopyPolicy,
+    SubmissionOutcome, SubmissionReceipt, SubmissionRequest, SubmissionService,
+    fake::FakeProviderFactory,
 };
 use pige_core::send::{
     OutgoingMessage, SubmissionState, flush_provider_outbox, outbox_entry, queue_submission,
@@ -154,6 +155,44 @@ fn cached_message(account: &AccountId, folder: &Folder, subject: &str) -> Stored
         thread_id: ThreadId("cached-thread".to_string()),
         snippet: subject.to_string(),
         has_attachments: false,
+    }
+}
+
+fn provider_record(remote: &str, collections: &[&str], snippet: String) -> MessageRecord {
+    MessageRecord {
+        remote_id: RemoteMessageId::new(remote),
+        remote_thread: None,
+        header: MessageHeader {
+            message_id: Some(format!("<{remote}@example.com>")),
+            in_reply_to: None,
+            references: Vec::new(),
+            subject: format!("Subject {remote}"),
+            from: vec![Address::new(None, "sender@example.com")],
+            to: Vec::new(),
+            cc: Vec::new(),
+            reply_to: Vec::new(),
+            bcc: Vec::new(),
+            date: 1,
+            size: 64,
+        },
+        flags: Flags::default(),
+        collections: collections
+            .iter()
+            .map(|remote| RemoteCollectionId::new(*remote))
+            .collect(),
+        snippet,
+        has_attachments: false,
+    }
+}
+
+fn inbox_collection() -> CollectionRecord {
+    CollectionRecord {
+        remote_id: RemoteCollectionId::new("INBOX"),
+        name: "INBOX".to_string(),
+        kind: FolderKind::Inbox,
+        delimiter: Some("/".to_string()),
+        total: None,
+        unread: None,
     }
 }
 
@@ -451,6 +490,81 @@ fn v1_to_latest_config_and_v4_cache_recover() {
     assert_eq!(hits[0].thread_id, ThreadId("thread-1".to_string()));
 }
 
+/// The separate tests above migrate the document and the cache in isolation.
+/// This exercises the real startup sequence with both at once: a v1
+/// configuration document and a v4 cache in the same data directory must come
+/// up together, and a process reopen must find the same account, cache, and
+/// cached body.
+#[tokio::test]
+async fn v1_config_and_v4_cache_reopen_together() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = RecoveryHarness::imap_only();
+
+    let config_path = pige_core::config::document_path(&harness.dir.path().join("config"));
+    std::fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
+    std::fs::write(&config_path, V1_CONFIG).expect("write v1 config");
+
+    let fixture = LegacyV4::create(&harness.db_path());
+    fixture
+        .account("acct-1", "ada@example.com", 4)
+        .folder("inbox", "acct-1", "INBOX", "inbox", 7)
+        .message(
+            "msg-1",
+            "acct-1",
+            "inbox",
+            1,
+            7,
+            Some("<one@example.com>"),
+            "Startup survives",
+            "thread-1",
+            1,
+        )
+        .body("msg-1", "cached before the upgrade")
+        .outbox("out-1", "acct-1", "draft");
+    drop(fixture);
+
+    harness.init();
+
+    let account = api::account(&AccountId("acct-1".to_string())).expect("v1 account");
+    let (username, imap, smtp, _) = account.imap_smtp().expect("migrated to IMAP");
+    assert_eq!(username, "ada-user");
+    assert_eq!(imap.host, "imap.custom.example");
+    assert_eq!(imap.port, 1993);
+    assert_eq!(smtp.host, "smtp.custom.example");
+    assert_eq!(smtp.port, 2587);
+
+    let snapshot = api::snapshot();
+    assert!(
+        snapshot
+            .conversations
+            .iter()
+            .any(|conversation| conversation.thread_id == ThreadId("thread-1".to_string())),
+        "the v4 cached conversation must appear after startup"
+    );
+
+    // Reopen exactly as the next process would: drop the API state without
+    // touching the data or config directories, then init again.
+    harness.restart();
+    assert_eq!(
+        api::account(&AccountId("acct-1".to_string()))
+            .expect("account after reopen")
+            .imap_smtp()
+            .expect("still IMAP")
+            .1
+            .host,
+        "imap.custom.example"
+    );
+    let opened = api::open_conversation(&ThreadId("thread-1".to_string()))
+        .await
+        .expect("cached reader after reopen");
+    let detail = opened.selected_conversation.expect("selected conversation");
+    assert_eq!(detail.messages.len(), 1);
+    match detail.messages[0].body.clone().expect("cached body") {
+        pige_core::api::MessageBody::Document(_) => {}
+        other => panic!("expected the cached document, got {other:?}"),
+    }
+}
+
 #[test]
 fn every_outbox_state_survives_upgrade() {
     let dir = TempDir::new().expect("temp dir");
@@ -645,6 +759,149 @@ fn migration_fault_before_swap_rolls_back() {
             .expect("messages")
             .len(),
         1
+    );
+}
+
+/// A disk-full write must not be mistaken for cross-process contention and
+/// must not delete or partially apply user state. The job stays on its last
+/// committed checkpoint and the identical page commits once space is
+/// available, exactly the retry a scheduled sync performs.
+#[test]
+fn database_full_preserves_state_and_recovers_after_limit_raised() {
+    let dir = TempDir::new().expect("temp dir");
+    let database = dir.path().join(DB_FILE_NAME);
+    let store = Store::open(&database).expect("open store");
+    store.migrate().expect("migrate");
+    let account = imap_account("db-full");
+    store.upsert_account(&account).expect("account");
+    let key = account_job(&account.id);
+    let ctx = OperationContext::with_timeout(account.id.clone(), 1, Duration::from_secs(30));
+
+    // Establish durable state and a committed checkpoint.
+    let first = ChangePage {
+        changes: vec![
+            MailChange::UpsertCollection(inbox_collection()),
+            MailChange::UpsertMessage {
+                message: provider_record("kept", &["INBOX"], "existing".to_string()),
+                is_new_arrival: false,
+            },
+        ],
+        checkpoint: ProviderCursor::new(1, "cp-1"),
+        has_more: false,
+    };
+    store
+        .apply_change_page(&ctx, &key, IMAP_SMTP_PROVIDER, None, &first, None)
+        .expect("seed page");
+    let kept = store
+        .remote_message_for(
+            &account.id,
+            IMAP_SMTP_PROVIDER,
+            &RemoteMessageId::new("kept"),
+        )
+        .expect("mapping")
+        .expect("existing message mapped");
+
+    // Cap the database at its current size. The next page cannot allocate even
+    // one more page, so SQLite reports SQLITE_FULL on a genuine write.
+    let cap = store
+        .limit_database_size_for_test()
+        .expect("lower page cap");
+    assert!(cap > 0);
+
+    let too_big = ChangePage {
+        changes: vec![MailChange::UpsertMessage {
+            message: provider_record("too-big", &["INBOX"], "x".repeat(8 * 1024 * 1024)),
+            is_new_arrival: false,
+        }],
+        checkpoint: ProviderCursor::new(1, "cp-2"),
+        has_more: false,
+    };
+    let error = store
+        .apply_change_page(
+            &ctx,
+            &key,
+            IMAP_SMTP_PROVIDER,
+            Some(&ProviderCursor::new(1, "cp-1")),
+            &too_big,
+            None,
+        )
+        .expect_err("a full database must fail the write");
+    assert!(
+        matches!(error, StoreError::Sqlite(_)),
+        "a disk-full write must surface as a genuine error, not contention: {error:?}"
+    );
+
+    // Existing content, mappings, and the checkpoint are untouched.
+    assert!(store.message(&kept).expect("read kept message").is_some());
+    assert!(
+        store
+            .remote_message_for(
+                &account.id,
+                IMAP_SMTP_PROVIDER,
+                &RemoteMessageId::new("too-big"),
+            )
+            .expect("lookup failed page")
+            .is_none(),
+        "a failed page must not leave a remote mapping"
+    );
+    assert_eq!(
+        store.job_checkpoint(&key).expect("checkpoint"),
+        Some(ProviderCursor::new(1, "cp-1")),
+        "a failed page must not advance the cursor"
+    );
+    let conn = Connection::open(&database).expect("raw connection");
+    assert_eq!(
+        conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    drop(conn);
+
+    // Raise the limit: the same page now commits, proving the job was left
+    // retryable rather than poisoned.
+    let raised = store
+        .set_max_page_count_for_test(u32::MAX)
+        .expect("raise page cap");
+    assert!(raised > cap);
+    store
+        .apply_change_page(
+            &ctx,
+            &key,
+            IMAP_SMTP_PROVIDER,
+            Some(&ProviderCursor::new(1, "cp-1")),
+            &too_big,
+            None,
+        )
+        .expect("retry after space is available");
+    assert_eq!(
+        store.job_checkpoint(&key).expect("checkpoint after retry"),
+        Some(ProviderCursor::new(1, "cp-2"))
+    );
+    assert!(store.message(&kept).expect("kept after retry").is_some());
+    assert!(
+        store
+            .remote_message_for(
+                &account.id,
+                IMAP_SMTP_PROVIDER,
+                &RemoteMessageId::new("too-big"),
+            )
+            .expect("retried mapping")
+            .is_some()
+    );
+
+    // A reopened process sees the recovered state too.
+    drop(store);
+    let reopened = Store::open(&database).expect("reopen");
+    reopened.migrate().expect("reopen migrate");
+    assert_eq!(
+        reopened.job_checkpoint(&key).expect("reopened checkpoint"),
+        Some(ProviderCursor::new(1, "cp-2"))
+    );
+    assert!(
+        reopened
+            .message(&kept)
+            .expect("reopened existing message")
+            .is_some()
     );
 }
 
@@ -962,8 +1219,9 @@ async fn worker_kill_after_submission_never_resends() {
         SubmissionState::Uncertain
     );
 
-    // A second process reopen sees the same terminal state and still does not
-    // resend it.
+    // A reopened `Store` (same process, fresh connection and migrated state)
+    // sees the same terminal state and still does not resend it. The genuine
+    // kill above is the cross-process evidence; this reopen proves durability.
     drop(store);
     let reopened = Store::open(&database).expect("reopen");
     reopened.migrate().expect("reopen migrate");
@@ -1020,6 +1278,7 @@ fn lease_child_process() {
             IMAP_SMTP_PROVIDER,
             None,
             &lease_child_page(),
+            Some(&lease),
         )
         .expect("child page");
     // Exit without releasing the lease: this models a process that died while
@@ -1077,7 +1336,7 @@ async fn two_process_leases_do_not_regress_cursor() {
         has_more: false,
     };
     assert!(matches!(
-        store.apply_change_page(&ctx, &key, IMAP_SMTP_PROVIDER, None, &stale),
+        store.apply_change_page(&ctx, &key, IMAP_SMTP_PROVIDER, None, &stale, None),
         Err(StoreError::StalePage)
     ));
     assert_eq!(
@@ -1105,12 +1364,108 @@ async fn two_process_leases_do_not_regress_cursor() {
         .expect("takeover after the crashed lease is released");
     assert_eq!(takeover.fencing, 2);
     assert!(matches!(
-        store.apply_change_page(&ctx, &key, IMAP_SMTP_PROVIDER, None, &stale),
+        store.apply_change_page(
+            &ctx,
+            &key,
+            IMAP_SMTP_PROVIDER,
+            None,
+            &stale,
+            Some(&takeover)
+        ),
         Err(StoreError::StalePage)
     ));
     assert_eq!(
         store.job_checkpoint(&key).expect("final checkpoint"),
         Some(ProviderCursor::new(1, "child-cursor"))
+    );
+}
+
+/// The checkpoint compare-and-swap alone does not stop a writer that lost the
+/// cross-process account gate: its previous cursor can still match while
+/// another process has already done remote work. The lease/fencing check must
+/// reject the commit in the same transaction as the write.
+#[test]
+fn change_page_commit_rejects_a_lease_lost_before_the_write() {
+    let dir = TempDir::new().expect("temp dir");
+    let database = dir.path().join(DB_FILE_NAME);
+    let store = Store::open(&database).expect("open store");
+    store.migrate().expect("migrate");
+    let account = imap_account("lease-fence");
+    store.upsert_account(&account).expect("account");
+    let key = account_job(&account.id);
+    let ctx = OperationContext::with_timeout(account.id.clone(), 1, Duration::from_secs(30));
+
+    let first = ChangePage {
+        changes: vec![MailChange::UpsertCollection(inbox_collection())],
+        checkpoint: ProviderCursor::new(1, "cp-1"),
+        has_more: false,
+    };
+    let owner = store
+        .acquire_lease(&account.id, "writer-process", Duration::from_secs(60))
+        .expect("writer lease");
+    store
+        .apply_change_page(&ctx, &key, IMAP_SMTP_PROVIDER, None, &first, Some(&owner))
+        .expect("first page under a live lease");
+
+    // The writer crashes/abandons its pass; a new process takes over and the
+    // fencing token advances. The old handle must no longer be able to write.
+    store.release_lease(&owner).expect("release writer lease");
+    let takeover = store
+        .acquire_lease(&account.id, "new-process", Duration::from_secs(60))
+        .expect("takeover");
+    assert_eq!(takeover.fencing, owner.fencing + 1);
+
+    let second = ChangePage {
+        changes: vec![MailChange::UpsertMessage {
+            message: provider_record("fenced", &["INBOX"], "must not land".to_string()),
+            is_new_arrival: false,
+        }],
+        checkpoint: ProviderCursor::new(1, "cp-2"),
+        has_more: false,
+    };
+    let stale_lease = owner.clone();
+    let error = store
+        .apply_change_page(
+            &ctx,
+            &key,
+            IMAP_SMTP_PROVIDER,
+            Some(&ProviderCursor::new(1, "cp-1")),
+            &second,
+            Some(&stale_lease),
+        )
+        .expect_err("a stale lease must not commit");
+    assert!(matches!(error, StoreError::LeaseLost), "{error:?}");
+    assert_eq!(
+        store.job_checkpoint(&key).expect("checkpoint after reject"),
+        Some(ProviderCursor::new(1, "cp-1")),
+        "the rejected page must not advance the cursor"
+    );
+    assert!(
+        store
+            .remote_message_for(
+                &account.id,
+                IMAP_SMTP_PROVIDER,
+                &RemoteMessageId::new("fenced"),
+            )
+            .expect("lookup fenced message")
+            .is_none(),
+        "the rejected page must not persist content"
+    );
+
+    // The current holder can commit the same page.
+    store
+        .apply_change_page(
+            &ctx,
+            &key,
+            IMAP_SMTP_PROVIDER,
+            Some(&ProviderCursor::new(1, "cp-1")),
+            &second,
+            Some(&takeover),
+        )
+        .expect("current lease commits");
+    assert_eq!(
+        store.job_checkpoint(&key).expect("final checkpoint"),
+        Some(ProviderCursor::new(1, "cp-2"))
     );
 }
 

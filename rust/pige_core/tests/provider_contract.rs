@@ -561,13 +561,21 @@ mod google_contract {
     }
 
     #[test]
-    fn the_synthetic_gmail_scope_is_the_mail_scope() {
-        // Keep the contract fixture tied to the scope the adapter actually
-        // requests; a suite that passed under a broader scope would hide a
-        // capability regression.
-        assert_eq!(
-            GMAIL_MODIFY_SCOPE,
-            "https://www.googleapis.com/auth/gmail.modify"
+    fn gmail_requests_the_mail_scope_without_contacts_by_default() {
+        // Check the scopes the adapter actually requests, not just the
+        // constant: a mail-only session must ask for the modify scope and no
+        // contact scope, while enabling contacts adds only the read-only pair.
+        let mail = pige_core::providers::google::requested_scopes(false);
+        assert_eq!(mail.first().map(String::as_str), Some(GMAIL_MODIFY_SCOPE));
+        assert!(
+            !mail.iter().any(|scope| scope.contains("contacts")),
+            "mail-only sync must not request contacts: {mail:?}"
+        );
+        let with_contacts = pige_core::providers::google::requested_scopes(true);
+        assert!(
+            with_contacts
+                .contains(&pige_core::providers::google::CONTACTS_READONLY_SCOPE.to_string()),
+            "{with_contacts:?}"
         );
     }
 }

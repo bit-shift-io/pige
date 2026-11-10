@@ -632,7 +632,10 @@ async fn uid_epoch_change_replays_without_duplicate_evidence() {
         assert!(progress.paused, "an incomplete slice must report paused");
     }
 
-    assert!(progress.complete, "history must continue past the rebaseline page");
+    assert!(
+        progress.complete,
+        "history must continue past the rebaseline page"
+    );
     assert_eq!(
         evidence_count(&store, &account.id, "alice@example.com"),
         1,
@@ -680,7 +683,14 @@ async fn new_arrival_during_crawl_is_not_lost() {
         has_more: false,
     };
     store
-        .apply_change_page(&context, &sync_job, IMAP_SMTP_PROVIDER, None, &arrival)
+        .apply_change_page(
+            &context,
+            &sync_job,
+            IMAP_SMTP_PROVIDER,
+            None,
+            &arrival,
+            None,
+        )
         .unwrap();
 
     let progress = run_to_completion(&store, &mut mailbox, &context).await;
@@ -1041,16 +1051,14 @@ async fn foreground_slices_respect_two_account_cap() {
     let release_one = Arc::new(Notify::new());
     let entered_two = Arc::new(Notify::new());
     let release_two = Arc::new(Notify::new());
-    let mailbox_one =
-        ScriptedMailbox::new(unique_messages(150)).gate(PageGate {
-            entered: entered_one.clone(),
-            release: release_one.clone(),
-        });
-    let mailbox_two =
-        ScriptedMailbox::new(unique_messages(150)).gate(PageGate {
-            entered: entered_two.clone(),
-            release: release_two.clone(),
-        });
+    let mailbox_one = ScriptedMailbox::new(unique_messages(150)).gate(PageGate {
+        entered: entered_one.clone(),
+        release: release_one.clone(),
+    });
+    let mailbox_two = ScriptedMailbox::new(unique_messages(150)).gate(PageGate {
+        entered: entered_two.clone(),
+        release: release_two.clone(),
+    });
     let mailbox_three = ScriptedMailbox::new(unique_messages(150));
     let third_log = mailbox_three.log();
 

@@ -1339,6 +1339,7 @@ async fn history_unknown_ids_are_idempotent() {
                 checkpoint: cursor.clone(),
                 has_more: false,
             },
+            None,
         )
         .expect("bootstrap applies");
     assert!(
@@ -1400,6 +1401,7 @@ async fn history_unknown_ids_are_idempotent() {
                 checkpoint: page.checkpoint,
                 has_more: page.has_more,
             },
+            None,
         )
         .expect("unknown remote ids apply idempotently");
 }

@@ -691,7 +691,7 @@ fn only_confirmed_new_arrivals_train_live() {
         has_more: false,
     };
     store
-        .apply_change_page(&context, &key, "imap-smtp", None, &replay)
+        .apply_change_page(&context, &key, "imap-smtp", None, &replay, None)
         .unwrap();
     assert_eq!(
         evidence_count(&store, &account.id, "replay@example.com"),
@@ -719,6 +719,7 @@ fn only_confirmed_new_arrivals_train_live() {
             "imap-smtp",
             Some(&ProviderCursor::new(1, "cp-1")),
             &arrival,
+            None,
         )
         .unwrap();
     assert_eq!(evidence_count(&store, &account.id, "alice@example.com"), 1);

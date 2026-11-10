@@ -93,6 +93,31 @@ pub(crate) fn check_generation_in(
     Ok(())
 }
 
+/// Verify a caller's lease inside a caller-owned transaction, so the check
+/// cannot be split from the write it fences. The lease must still be held by
+/// the same holder at the same fencing token and must not have expired.
+pub(crate) fn check_lease_in(
+    conn: &rusqlite::Connection,
+    lease: &AccountLease,
+) -> Result<(), StoreError> {
+    let now = now_ms();
+    let row: Option<(String, i64, i64)> = conn
+        .query_row(
+            "SELECT holder, fencing, expires_at FROM account_lease WHERE account_id = ?1",
+            [&lease.account.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match row {
+        Some((holder, fencing, expires_at))
+            if holder == lease.holder && fencing as u64 == lease.fencing && expires_at > now =>
+        {
+            Ok(())
+        }
+        _ => Err(StoreError::LeaseLost),
+    }
+}
+
 /// Store a job cursor inside a caller-owned transaction, re-checking the
 /// generation and refusing to regress an existing checkpoint. Factored out so
 /// [`Store::apply_change_page`](crate::store::Store::apply_change_page) can
@@ -340,25 +365,8 @@ impl Store {
     /// Verify `lease` is still the live holder's lease before a durable write.
     /// Fails with [`StoreError::LeaseLost`] otherwise.
     pub fn ensure_lease(&self, lease: &AccountLease) -> Result<(), StoreError> {
-        let now = now_ms();
-        let row: Option<(String, i64, i64)> = self
-            .connection()
-            .query_row(
-                "SELECT holder, fencing, expires_at FROM account_lease WHERE account_id = ?1",
-                [&lease.account.0],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        match row {
-            Some((holder, fencing, expires_at))
-                if holder == lease.holder
-                    && fencing as u64 == lease.fencing
-                    && expires_at > now =>
-            {
-                Ok(())
-            }
-            _ => Err(StoreError::LeaseLost),
-        }
+        let conn = self.connection();
+        check_lease_in(&conn, lease)
     }
 
     /// Acquire the account lease and verify `expected_generation` *in one

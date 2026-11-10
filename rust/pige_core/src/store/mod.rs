@@ -36,11 +36,11 @@ pub use bodies::Body;
 pub use contacts::{
     CachedContactEmail, ContactPageOutcome, ContactSourceState, ContactSyncStart, contacts_job,
 };
+pub(crate) use correspondents::record_observations_in;
 pub use correspondents::{
     ExistingCachePage, HISTORY_SOURCE, HistoryProgress, HistoryState, LearnedAddress,
     LearningState, history_job,
 };
-pub(crate) use correspondents::record_observations_in;
 pub(crate) use jobs::check_generation_in;
 pub use jobs::{AccountLease, INITIAL_GENERATION, PendingAuthRecord};
 pub use lifecycle::SwitchIntent;
@@ -245,9 +245,7 @@ impl Store {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _guard = gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         f()
     }
 
@@ -318,6 +316,32 @@ impl Store {
             rusqlite::params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Test-only: cap SQLite page growth on this store's connection at the
+    /// current page count, so the next allocation fails with `SQLITE_FULL` and
+    /// the disk-full path can be exercised deterministically. Returns the cap.
+    #[doc(hidden)]
+    pub fn limit_database_size_for_test(&self) -> Result<u32, StoreError> {
+        let conn = self.connection();
+        let page_count: u32 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let applied: u32 = conn.query_row(
+            &format!("PRAGMA max_page_count = {page_count}"),
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(applied)
+    }
+
+    /// Test-only: raise the page cap set by
+    /// [`Store::limit_database_size_for_test`] so a failed write can be retried.
+    #[doc(hidden)]
+    pub fn set_max_page_count_for_test(&self, max: u32) -> Result<u32, StoreError> {
+        self.connection()
+            .query_row(&format!("PRAGMA max_page_count = {max}"), [], |row| {
+                row.get(0)
+            })
+            .map_err(StoreError::from)
     }
 
     /// Remove one `meta` value. Used when a setting moves to the configuration

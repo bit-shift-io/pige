@@ -29,6 +29,7 @@ use pige_core::sync::provider::{self, WorkBudget};
 use pige_core::sync::scheduler::{AccountScheduler, SchedulerError};
 use pige_core::transport::{FakeTransport, FolderState, RemoteFolder, RemoteMessage};
 use pige_core::{FolderId, MessageId, Store, StoreError, ThreadId, Uid};
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use tokio::sync::Notify;
 
@@ -482,6 +483,7 @@ async fn late_page_after_mutation_cannot_revert_flags() {
                 checkpoint: ProviderCursor::new(1, "cp-1"),
                 has_more: false,
             },
+            None,
         )
         .unwrap();
     let id = store
@@ -694,6 +696,7 @@ async fn stale_checkpoint_cas_rejected() {
         IMAP_SMTP_PROVIDER,
         Some(&ProviderCursor::new(1, "cp-0")),
         &page("cp-2"),
+        None,
     );
     assert!(matches!(stale, Err(StoreError::StalePage)));
     // A missing expectation against an existing checkpoint is stale too.
@@ -703,6 +706,7 @@ async fn stale_checkpoint_cas_rejected() {
         IMAP_SMTP_PROVIDER,
         None,
         &page("cp-2"),
+        None,
     );
     assert!(matches!(unanchored, Err(StoreError::StalePage)));
     assert_eq!(store.job_checkpoint(&key).unwrap(), Some(cp1.clone()));
@@ -716,6 +720,7 @@ async fn stale_checkpoint_cas_rejected() {
             IMAP_SMTP_PROVIDER,
             Some(&cp1),
             &page("cp-2"),
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -733,6 +738,7 @@ async fn stale_checkpoint_cas_rejected() {
         IMAP_SMTP_PROVIDER,
         Some(&ProviderCursor::new(1, "cp-2")),
         &page("cp-3"),
+        None,
     );
     assert!(matches!(
         stale_generation,
@@ -741,6 +747,151 @@ async fn stale_checkpoint_cas_rejected() {
     assert_eq!(
         store.job_checkpoint(&key).unwrap(),
         Some(ProviderCursor::new(1, "cp-2"))
+    );
+}
+
+/// The sync orchestrator takes the durable cross-process lease, not just the
+/// in-process scheduler gate: another process syncing the same account means
+/// this pass does no remote work, and a finished pass releases the lease so the
+/// next process can take over.
+#[tokio::test]
+async fn sync_requires_and_releases_the_durable_account_lease() {
+    let account = imap_account("acc-lease-sync");
+    let (_dir, store) = open_store(&account);
+    let key = provider::account_job(&account.id);
+    let page = || ChangePage {
+        changes: vec![
+            MailChange::UpsertCollection(collection(
+                "LeaseLabel",
+                "Lease Label",
+                FolderKind::Other,
+            )),
+            message_change("imap:1", "LeaseLabel", "leased", false, Flags::default()),
+        ],
+        checkpoint: ProviderCursor::new(1, "cp-1"),
+        has_more: false,
+    };
+    let other = store
+        .acquire_lease(&account.id, "other-process", Duration::from_secs(60))
+        .expect("other process lease");
+
+    let mut session = provider_session(
+        ScriptedSync::pages(vec![(None, page())]),
+        IMAP_SMTP_PROVIDER,
+    );
+    let report = provider::sync_account(&store, &mut session, &ctx(&account.id, 1), budget(4))
+        .await
+        .expect("a busy account is not a sync failure");
+    assert_eq!(report.errors.len(), 0);
+    assert_eq!(
+        store.job_checkpoint(&key).unwrap(),
+        None,
+        "a process without the lease must not advance the cursor"
+    );
+    assert!(
+        store
+            .remote_collection_for(
+                &account.id,
+                IMAP_SMTP_PROVIDER,
+                &RemoteCollectionId::new("LeaseLabel"),
+            )
+            .unwrap()
+            .is_none(),
+        "a process without the lease must not write"
+    );
+    store
+        .ensure_lease(&other)
+        .expect("sync must not steal the other process's lease");
+
+    // Once the other process releases, a pass applies the page normally.
+    store.release_lease(&other).expect("release other lease");
+    let mut session = provider_session(
+        ScriptedSync::pages(vec![(None, page())]),
+        IMAP_SMTP_PROVIDER,
+    );
+    provider::sync_account(&store, &mut session, &ctx(&account.id, 1), budget(4))
+        .await
+        .expect("sync after release");
+    assert_eq!(
+        store.job_checkpoint(&key).unwrap(),
+        Some(ProviderCursor::new(1, "cp-1"))
+    );
+
+    // The completed pass released its own lease: another process can take over
+    // immediately instead of waiting for the TTL.
+    let next = store
+        .acquire_lease(&account.id, "next-process", Duration::from_secs(60))
+        .expect("next process takes over");
+    assert_eq!(next.fencing, other.fencing + 2);
+}
+
+/// Acquiring the lease is not enough: the commit must re-check the fencing
+/// token after the network wait. Here another process takes the lease while
+/// this pass is waiting for its page; the page is still based on the matching
+/// checkpoint, so only the durable lease can reject it.
+#[tokio::test]
+async fn sync_commit_rechecks_the_lease_after_the_network() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("pige.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    let account = imap_account("acc-lease-takeover");
+    store.upsert_account(&account).unwrap();
+    let key = provider::account_job(&account.id);
+
+    let page = ChangePage {
+        changes: vec![MailChange::UpsertCollection(collection(
+            "TakenOver",
+            "Taken Over",
+            FolderKind::Other,
+        ))],
+        checkpoint: ProviderCursor::new(1, "cp-1"),
+        has_more: false,
+    };
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sync = ScriptedSync::pages(vec![(None, page)]).gate(entered.clone(), release.clone());
+    let mut session = provider_session(sync, IMAP_SMTP_PROVIDER);
+
+    let sync_ctx = ctx(&account.id, 1);
+    let sync_fut = provider::sync_account(&store, &mut session, &sync_ctx, budget(4));
+    let account_id = account.id.0.clone();
+    let takeover_db = db_path.clone();
+    let takeover = async move {
+        entered.notified().await;
+        // Advance the fencing token and change the holder while the sync pass
+        // is paused inside `next_page`. No transaction is open here.
+        let conn = Connection::open(takeover_db).unwrap();
+        conn.execute(
+            "UPDATE account_lease
+             SET holder = 'intruder-process', fencing = fencing + 1, expires_at = ?1
+             WHERE account_id = ?2",
+            params![i64::MAX, account_id],
+        )
+        .unwrap();
+        release.notify_one();
+    };
+    let (result, ()) = tokio::join!(sync_fut, takeover);
+
+    assert!(
+        matches!(result, Err(SyncError::Store(StoreError::LeaseLost))),
+        "a page whose lease was taken over must be rejected, got {result:?}"
+    );
+    assert_eq!(
+        store.job_checkpoint(&key).unwrap(),
+        None,
+        "the taken-over pass must not advance the cursor"
+    );
+    assert!(
+        store
+            .remote_collection_for(
+                &account.id,
+                IMAP_SMTP_PROVIDER,
+                &RemoteCollectionId::new("TakenOver"),
+            )
+            .unwrap()
+            .is_none(),
+        "the taken-over pass must not write"
     );
 }
 
@@ -836,8 +987,14 @@ async fn cross_process_contention_is_a_lost_race_not_an_abort() {
     inject_page_contention_hook(move || {
         writer.set_meta("process-b", "committed").unwrap();
     });
-    let direct =
-        store.apply_change_page(&ctx(&account.id, 1), &key, IMAP_SMTP_PROVIDER, None, &page);
+    let direct = store.apply_change_page(
+        &ctx(&account.id, 1),
+        &key,
+        IMAP_SMTP_PROVIDER,
+        None,
+        &page,
+        None,
+    );
     clear_page_contention_hook();
     assert!(
         matches!(direct, Err(StoreError::StalePage)),

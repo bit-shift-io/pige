@@ -26,7 +26,10 @@ use crate::providers::{
 };
 
 use super::correspondents::record_observations_in;
-use super::messages::{delete_messages_on, merge_threads_on, messages_for_account_on, upsert_message_on};
+use super::jobs::AccountLease;
+use super::messages::{
+    delete_messages_on, merge_threads_on, messages_for_account_on, upsert_message_on,
+};
 use super::{Store, StoreError};
 
 thread_local! {
@@ -121,6 +124,12 @@ impl Store {
     /// [`StoreError::StalePage`] rather than a raw SQLite error, so the caller
     /// discards the page and reconciles from the durable checkpoint instead of
     /// aborting the account pass. Genuine failures are not masked this way.
+    ///
+    /// `lease` is the caller's durable cross-process account lease. The sync
+    /// path always passes one, and the lease is re-checked inside this same
+    /// transaction so a writer that lost the account gate cannot commit.
+    /// `None` is only for callers that already hold the account gate and do not
+    /// represent a cross-process sync (for example scoped test fixtures).
     pub fn apply_change_page(
         &self,
         ctx: &OperationContext,
@@ -128,8 +137,9 @@ impl Store {
         transport: &str,
         expected_previous: Option<&ProviderCursor>,
         page: &ChangePage,
+        lease: Option<&AccountLease>,
     ) -> Result<(), StoreError> {
-        self.apply_change_page_in(ctx, key, transport, expected_previous, page)
+        self.apply_change_page_in(ctx, key, transport, expected_previous, page, lease)
             .map_err(|error| {
                 // A SQLite lock/snapshot conflict is the cross-process form of
                 // losing the checkpoint race: another writer held the write lock
@@ -154,10 +164,17 @@ impl Store {
         transport: &str,
         expected_previous: Option<&ProviderCursor>,
         page: &ChangePage,
+        lease: Option<&AccountLease>,
     ) -> Result<(), StoreError> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         super::jobs::check_generation_in(&tx, &ctx.account, ctx.generation)?;
+        if let Some(lease) = lease {
+            // The leaseless generation check above is not enough: another
+            // process may have taken the account gate without invalidating the
+            // generation, and its remote reads could already be ahead of ours.
+            super::jobs::check_lease_in(&tx, lease)?;
+        }
         super::jobs::check_checkpoint_in(&tx, key, expected_previous)?;
         // The read snapshot is now established; a test may invalidate it here to
         // simulate a second process committing before this transaction writes.
@@ -174,7 +191,10 @@ impl Store {
                 MailChange::RemoveCollection(remote) => {
                     remove_collection_on(&tx, &ctx.account, transport, remote)?;
                 }
-                MailChange::UpsertMessage { message, is_new_arrival } => {
+                MailChange::UpsertMessage {
+                    message,
+                    is_new_arrival,
+                } => {
                     upsert_remote_message_on(&tx, &ctx.account, transport, &mut threads, message)?;
                     if *is_new_arrival {
                         // Only the adapter's explicit new-arrival signal trains

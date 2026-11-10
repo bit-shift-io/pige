@@ -12,15 +12,43 @@
 //! advance) and makes a page that arrives after a concurrent mutation
 //! discardable instead of destructive (the checkpoint moved).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use crate::account::AccountId;
 use crate::mail::sender_display;
 use crate::providers::{
     ChangePage, ErrorKind, JobKey, JobKind, MailChange, OperationContext, ProviderSession,
     SyncRequest,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{AccountLease, Store, StoreError};
 
 use super::{NewMailSummary, SyncError, SyncReport};
+
+/// Identifies this process's sync passes in the durable account lease. A
+/// counter distinguishes overlapping passes in one process; the process id
+/// distinguishes processes.
+static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn lease_holder() -> String {
+    format!(
+        "sync-{}-{}",
+        std::process::id(),
+        LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Grace period beyond the pass deadline so a slow final page cannot lose its
+/// lease mid-commit. The lease is renewed before each page anyway.
+const LEASE_GRACE: Duration = Duration::from_secs(30);
+
+fn lease_ttl(budget: &WorkBudget) -> Duration {
+    budget
+        .deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .saturating_add(LEASE_GRACE)
+        .max(LEASE_GRACE)
+}
 
 /// The durable job source for an account's whole-mailbox sync. Provider paging
 /// is account-wide (one cursor covers every collection), so a single job key
@@ -86,6 +114,29 @@ pub async fn sync_account(
     // pass was queued; the in-transaction check fences the actual writes.
     store.check_generation(&ctx.account, ctx.generation)?;
 
+    // Android's WorkManager sync can run in a separate process from the UI, so
+    // the in-process scheduler gate is not enough. Take the durable account
+    // lease for the whole pass and hand it to every page commit; another
+    // process holding it means this pass simply has no work to do.
+    let lease = match store.acquire_lease(&ctx.account, &lease_holder(), lease_ttl(&budget)) {
+        Ok(lease) => lease,
+        Err(StoreError::LeaseHeld) => return Ok(SyncReport::default()),
+        Err(error) => return Err(SyncError::Store(error)),
+    };
+    let result = sync_account_leased(store, session, ctx, budget, &lease).await;
+    // The lease row stays behind with a past expiry, so the fencing token keeps
+    // increasing across hand-offs even when a process dies mid-pass.
+    let _ = store.release_lease(&lease);
+    result
+}
+
+async fn sync_account_leased(
+    store: &Store,
+    session: &mut ProviderSession,
+    ctx: &OperationContext,
+    budget: WorkBudget,
+    lease: &AccountLease,
+) -> Result<SyncReport, SyncError> {
     let key = account_job(&ctx.account);
     let transport = session.provider.as_str().to_string();
     let mut report = SyncReport::default();
@@ -132,7 +183,17 @@ pub async fn sync_account(
             }
         };
 
-        match store.apply_change_page(ctx, &key, &transport, stored.as_ref(), &page) {
+        // A page may have taken a long time on the network. Renew before the
+        // write so the lease is live throughout the commit. If the lease was
+        // lost, still attempt the commit: its in-transaction generation check
+        // reports the more specific reason (for example, the account was
+        // removed) before its lease check rejects a genuine takeover.
+        match store.renew_lease(lease, lease_ttl(&budget)) {
+            Ok(_) | Err(StoreError::LeaseLost) => {}
+            Err(error) => return Err(SyncError::Store(error)),
+        }
+
+        match store.apply_change_page(ctx, &key, &transport, stored.as_ref(), &page, Some(lease)) {
             Ok(()) => {
                 pages += 1;
                 pending_reset = false;
