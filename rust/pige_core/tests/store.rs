@@ -422,7 +422,10 @@ fn body_state_roundtrip_and_missing_message() {
     // outcome rewrites it.
     let m = message(&inbox, 1, 7, 1);
     store.upsert_message(&m).unwrap();
-    assert_eq!(store.body_state(&m.id).unwrap(), Some("headers".to_string()));
+    assert_eq!(
+        store.body_state(&m.id).unwrap(),
+        Some("headers".to_string())
+    );
     store.set_body_state(&m.id, "none").unwrap();
     assert_eq!(store.body_state(&m.id).unwrap(), Some("none".to_string()));
 }
