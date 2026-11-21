@@ -253,6 +253,7 @@ fn collect_notifications(
             .unwrap_or_default();
         report.new_inbox.push(NewMailSummary {
             account_id: key.account.clone(),
+            message_id: id.clone(),
             folder_id,
             thread_id: stored.thread_id,
             from: sender_display(&stored.header.from),

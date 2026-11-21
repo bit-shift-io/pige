@@ -404,3 +404,25 @@ fn migration_repairs_stale_previews_from_cached_bodies() {
     );
     assert_eq!(store.message(&stale.id).unwrap().unwrap().snippet, "");
 }
+
+#[test]
+fn body_state_roundtrip_and_missing_message() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    let inbox = folder(&account.id);
+    store.upsert_account(&account).unwrap();
+    store.upsert_folder(&inbox).unwrap();
+
+    // A message that does not exist has no body state at all.
+    let missing = MessageId("m-body-state-missing".into());
+    assert_eq!(store.body_state(&missing).unwrap(), None);
+
+    // A fresh message starts in the 'headers' state; a recorded fetch
+    // outcome rewrites it.
+    let m = message(&inbox, 1, 7, 1);
+    store.upsert_message(&m).unwrap();
+    assert_eq!(store.body_state(&m.id).unwrap(), Some("headers".to_string()));
+    store.set_body_state(&m.id, "none").unwrap();
+    assert_eq!(store.body_state(&m.id).unwrap(), Some("none".to_string()));
+}

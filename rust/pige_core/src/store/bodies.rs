@@ -27,6 +27,20 @@ impl Store {
         Ok(())
     }
 
+    /// Read a message's body state ('headers', 'none'), if the message
+    /// exists. Lets prefetch skip a message whose fetch already happened and
+    /// produced no readable text.
+    pub fn body_state(&self, id: &MessageId) -> Result<Option<String>, StoreError> {
+        self.connection()
+            .query_row(
+                "SELECT body_state FROM messages WHERE id = ?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Read the cached body for a message, if one has been stored.
     pub fn body(&self, message_id: &MessageId) -> Result<Option<Body>, StoreError> {
         let conn = self.connection();

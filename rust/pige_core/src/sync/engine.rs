@@ -34,6 +34,9 @@ pub enum SyncError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewMailSummary {
     pub account_id: AccountId,
+    /// The stored message the summary names, so a sync pass can prefetch its
+    /// body right after notifying.
+    pub message_id: MessageId,
     pub folder_id: FolderId,
     pub thread_id: ThreadId,
     pub from: String,
@@ -394,6 +397,7 @@ pub(crate) async fn sync_folder(
         .into_iter()
         .map(|(_, m)| NewMailSummary {
             account_id: account_id.clone(),
+            message_id: m.id.clone(),
             folder_id: folder_id.clone(),
             thread_id: m.thread_id.clone(),
             from: sender_display(&m.header.from),
