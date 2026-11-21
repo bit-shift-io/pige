@@ -23,6 +23,24 @@ use crate::theme;
 /// How long scrollbars stay visible after the last real scroll.
 pub(crate) const SCROLLBAR_IDLE: Duration = Duration::from_millis(800);
 
+/// The committed 256 px render of the app icon, embedded at compile time.
+pub(crate) const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app_icon_256.png");
+
+/// The desktop window icon. A decode failure returns `None` rather than
+/// blocking startup; Android ignores window icons and takes its launcher
+/// icon from the manifest, so this stays `None` there.
+#[cfg(not(target_os = "android"))]
+pub(crate) fn window_icon() -> Option<iced::window::Icon> {
+    let decoded = image::load_from_memory(APP_ICON_PNG).ok()?.to_rgba8();
+    let (width, height) = decoded.dimensions();
+    iced::window::icon::from_rgba(decoded.to_vec(), width, height).ok()
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn window_icon() -> Option<iced::window::Icon> {
+    None
+}
+
 /// One folder row in an account group, carrying the id navigation needs to
 /// select it without re-resolving the snapshot.
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +173,7 @@ impl App {
     pub fn new() -> (Self, Task<Message>) {
         let (_id, open) = window::open(window::Settings {
             size: Size::new(900.0, 700.0),
+            icon: window_icon(),
             ..Default::default()
         });
         let (snapshot, init_error) = initialize_api();

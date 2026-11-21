@@ -4695,6 +4695,7 @@ dependencies = [
  "futures",
  "iced",
  "iced_android",
+ "image",
  "jni 0.21.1",
  "log",
  "pige_core",

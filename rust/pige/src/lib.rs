@@ -76,6 +76,16 @@ mod tests {
 
     use iced::window;
 
+    /// The committed icon decodes to the exact RGBA buffer the window gets.
+    #[test]
+    fn window_icon_decodes_the_embedded_png() {
+        use crate::app::window_icon;
+        let icon = window_icon().expect("embedded icon decodes");
+        let (rgba, size) = icon.into_raw();
+        assert_eq!((size.width, size.height), (256_u32, 256_u32));
+        assert_eq!(rgba.len(), 256 * 256 * 4);
+    }
+
     /// Lays the real shell out at each breakpoint, including the drawer
     /// overlay. Marked ignored because it needs a headless wgpu adapter.
     #[test]
