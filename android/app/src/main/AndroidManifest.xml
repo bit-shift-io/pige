@@ -11,6 +11,7 @@
     <!-- Reading config backups written by a previous install in Downloads. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
     <application
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:allowBackup="false"
         android:usesCleartextTraffic="false">
