@@ -729,6 +729,10 @@ impl ProtonAuthentication {
     ) -> Result<AuthProgress, ProviderError> {
         match outcome {
             LoginOutcome::Authenticated(login) => {
+                log::info!(
+                    "proton auth: login accepted (password_mode {})",
+                    login.password_mode
+                );
                 if login.password_mode == 2 {
                     if let Some(state) = self.attempts.get_mut(attempt_id) {
                         state.password = Some(password);
@@ -878,8 +882,13 @@ impl ProtonAuthentication {
 
         let http = authenticated_http(&self.endpoints, &uid, login.tokens.access.clone()).await;
 
+        log::info!("proton auth: fetching key material (salts, user, addresses)");
         let salts = fetch_salts(&http).await?;
         let (user, addresses) = fetch_user_and_addresses(&http).await?;
+        log::info!(
+            "proton auth: key material fetched ({} address keys)",
+            addresses.len()
+        );
 
         // Key unlock is CPU-heavy; run it on the blocking pool, not the async/UI
         // executor. The password moves into the worker and is dropped there.
@@ -890,6 +899,7 @@ impl ProtonAuthentication {
         .await
         .map_err(|_| ProviderError::transient("the Proton key-unlock worker stopped"))?;
         let (keys, skp) = unlocked.map_err(map_proton_error)?;
+        log::info!("proton auth: mailbox keys unlocked");
 
         // A cancellation/invalidation that landed while the worker ran must not
         // leave unlocked material installed or stage a credential.
@@ -923,6 +933,7 @@ impl ProtonAuthentication {
             login.tokens.refresh,
             skp,
         );
+        log::info!("proton auth: staging credential (platform credential store write)");
         let staged = match self.secrets.stage(attempt_id, &envelope) {
             Ok(staged) => staged,
             Err(error) => {
@@ -931,6 +942,7 @@ impl ProtonAuthentication {
                 return Err(error);
             }
         };
+        log::info!("proton auth: credential staged");
         if let Err(error) = self.store.insert_pending_auth(&PendingAuthRecord {
             attempt: attempt_id.clone(),
             account: Some(account_id.clone()),

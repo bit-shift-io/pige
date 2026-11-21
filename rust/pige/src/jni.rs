@@ -21,11 +21,9 @@ use pige_core::mail::{FolderKind, ThreadId};
 use pige_core::platform::android::{self, BRIDGE_CLASS};
 
 fn init_logging() {
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_tag("pige")
-            .with_max_level(log::LevelFilter::Info),
-    );
+    // The JNI entry points race on a cold start; `logging::init` is
+    // idempotent and installs the shared subscriber (logcat writer).
+    crate::logging::init();
 }
 
 static API_INIT: Mutex<()> = Mutex::new(());

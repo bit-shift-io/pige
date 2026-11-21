@@ -11,6 +11,7 @@ pub mod icons;
 #[cfg(target_os = "android")]
 mod jni;
 pub mod layout;
+mod logging;
 pub mod message;
 mod platform;
 pub mod screens;
@@ -26,6 +27,9 @@ pub use message::Message;
 /// Starts the shell. Called from `main` on desktop and from `android_main` on
 /// Android.
 pub fn run() -> iced::Result {
+    // One subscriber per process, shared by both entry points; `try_init`
+    // makes a repeat call (JNI racing a cold start) a no-op.
+    logging::init();
     let mut daemon = iced::daemon(App::new, App::update, App::view)
         .title(|_: &App, _| "pige".into())
         .theme(|app: &App, _| {
@@ -58,11 +62,7 @@ pub fn run() -> iced::Result {
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: iced_android::AndroidApp) {
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_tag("pige")
-            .with_max_level(log::LevelFilter::Info),
-    );
+    logging::init();
     log::info!("pige schema version {}", pige_core::SCHEMA_VERSION);
     iced_android::init(app);
     if let Err(error) = run() {

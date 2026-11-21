@@ -532,3 +532,83 @@ fn xdg_dir(variable: &str, fallback: &str) -> std::path::PathBuf {
         .join(leaf)
         .join("pige")
 }
+
+/// TEMPORARY DIAGNOSTIC (delete after debugging): drive the real production
+/// Proton auth path with isolated XDG dirs. Step 1 is purely local; step 2
+/// performs one deliberately failed login against the real Proton API.
+#[cfg(all(test, target_os = "linux", feature = "provider-proton"))]
+mod proton_hang_diagnostic {
+    use std::time::{Duration, Instant};
+
+    use pige_core::auth::{AuthAnswer, AuthChallenge, AuthProgress};
+    use pige_core::providers::{PROTON_PROVIDER, ProviderId};
+
+    #[test]
+    #[ignore = "diagnostic: touches the real Proton API with one failed login"]
+    fn proton_begin_and_wrong_password_answer_are_bounded() {
+        let dir = std::env::temp_dir().join(format!("pige-diag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).expect("data dir");
+        // Single-threaded, explicitly-run diagnostic; no other threads read env.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir.join("data"));
+            std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+            std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        }
+
+        let config = crate::platform::config();
+        println!(
+            "config built; proton auth registered: {:?}",
+            config.auth.is_some()
+        );
+        pige_core::api::init(config).expect("api init");
+
+        let available = pige_core::api::provider_available(PROTON_PROVIDER).expect("available");
+        println!("proton provider available: {available}");
+        assert!(available, "proton provider must be registered");
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        let begin_started = Instant::now();
+        let progress = runtime.block_on(async {
+            pige_core::api::begin_auth_with_username(
+                ProviderId::from(PROTON_PROVIDER),
+                "pige-diagnostic@example.com".to_string(),
+                None,
+                false,
+            )
+            .await
+        });
+        println!(
+            "begin_auth_with_username took {:?}",
+            begin_started.elapsed()
+        );
+        let (attempt, challenge) = match progress.expect("begin must not fail") {
+            AuthProgress::Challenge { attempt, challenge } => (attempt, challenge),
+            other => panic!("expected a challenge, got {other:?}"),
+        };
+        println!("challenge: {challenge:?}");
+        assert!(matches!(challenge, AuthChallenge::Password { .. }));
+
+        let answer_started = Instant::now();
+        let result = runtime.block_on(async {
+            pige_core::api::answer_auth(
+                &attempt,
+                AuthAnswer::Password(pige_core::auth::secrecy::SecretString::from(
+                    "definitely-not-the-password",
+                )),
+            )
+            .await
+        });
+        println!("wrong-password answer took {:?}", answer_started.elapsed());
+        match result {
+            Ok(AuthProgress::Challenge { challenge, .. }) => {
+                println!("unexpected second challenge: {challenge:?}")
+            }
+            Ok(other) => println!("unexpected progress: {other:?}"),
+            Err(error) => println!("expected login failure: {error}"),
+        }
+        let _ = runtime.shutdown_timeout(Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

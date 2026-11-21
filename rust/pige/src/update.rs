@@ -1609,7 +1609,9 @@ async fn proton_finish(
     authenticated: pige_core::auth::AuthenticatedAccount,
     enable_contacts: bool,
 ) -> Result<Option<ModelSnapshot>, String> {
+    log::info!("proton auth: committing the authenticated account");
     let (id, snapshot) = api::finish_auth_with_contacts(authenticated, enable_contacts).await?;
+    log::info!("proton auth: account committed; running the first sync");
     let snapshot = match api::sync_account(&id).await {
         Ok(synced) => synced,
         Err(error) => {
@@ -1617,6 +1619,7 @@ async fn proton_finish(
             snapshot
         }
     };
+    log::info!("proton auth: first sync finished");
     Ok(Some(snapshot))
 }
 

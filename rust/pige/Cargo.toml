@@ -27,6 +27,12 @@ iced_android = { git = "https://github.com/Santuzius/iced_android", tag = "v0.1.
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 futures = { version = "0.3", features = ["executor"] }
 log = "0.4"
+# One logging pipeline for both platforms: the subscriber captures this
+# crate's `log` records and the vendored Proton transport's `tracing` events
+# (wire request/status/timing). Desktop writes stdout; Android writes logcat
+# (see `logging.rs`). `RUST_LOG` selects the verbosity where a shell can set it.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Desktop window icon decoding. PNG-only; the crate is already in the tree
@@ -34,5 +40,6 @@ log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.15"
+# Raw logcat bindings for the unified logger's Android writer.
+android_log-sys = "0.3"
 jni = "0.21"
