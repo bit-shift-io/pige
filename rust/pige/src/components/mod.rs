@@ -18,8 +18,8 @@
 //! [`pull_refresh`]. The builders and custom widgets are adapted from
 //! qlaunch's `components.rs` and companion modules (bitshift, MIT).
 
-use iced::Color;
-use iced::widget::{button as iced_button, column, container, row, text};
+use iced::{Color, Element};
+use iced::widget::{button as iced_button, column, container, row, space, text};
 
 use crate::theme::{self, TextRole, Typography};
 use crate::{Message, icons};
@@ -48,7 +48,44 @@ pub use dialog::{dialog, dialog_sized};
 pub use fields::{password_field, search_field, text_area, text_field};
 pub use menu::{MenuAnchor, MenuItem, menu, menu_overlay};
 pub use recipient_suggestions::{SuggestionNavigation, recipient_field, suggestion_panel};
-pub use rows::{FolderKind, FolderView, ListRow, folder_row, list_row, section_header};
+pub use rows::{
+    FolderKind, FolderView, ListRow, folder_row, list_row, list_row_card, section_header,
+};
+
+/// The shared raised surface used by Settings sections and message cards.
+/// Everything that wants to look like a card draws this exact background,
+/// padding and radius.
+pub fn card_style(palette: theme::Palette) -> container::Style {
+    container::Style {
+        background: Some(palette.surface_container.into()),
+        text_color: Some(palette.on_surface),
+        border: iced::border::rounded(palette.radius.md),
+        ..Default::default()
+    }
+}
+
+/// Wrap content in the shared card surface described by [`card_style`].
+pub fn card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    let palette = theme::active();
+    container(content)
+        .width(iced::Fill)
+        .padding(palette.space.lg)
+        .style(move |_| card_style(palette))
+        .into()
+}
+
+/// A hairline horizontal separator for plain message rows.
+pub fn horizontal_divider<'a>() -> Element<'a, Message> {
+    let palette = theme::active();
+    container(space())
+        .width(iced::Fill)
+        .height(1.0)
+        .style(move |_| container::Style {
+            background: Some(palette.outline_variant.into()),
+            ..Default::default()
+        })
+        .into()
+}
 
 /// A collapsible account header: the label, unread roll-up and the account's
 /// email underneath. The label row is the click target that toggles it.

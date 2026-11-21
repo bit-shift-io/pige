@@ -11,7 +11,7 @@ use pige_core::auth::AuthProgress;
 use pige_core::mail::{FolderId, MessageId, ThreadId};
 use pige_core::search::{SearchHit, SearchScope};
 use pige_core::send::OutboxId;
-use pige_core::settings::{Settings, ThemeMode};
+use pige_core::settings::{ListStyle, Settings, ThemeMode};
 
 use crate::screens::accounts::{AccountField, AccountMethod};
 use crate::screens::advanced::Row as AdvancedRow;
@@ -222,6 +222,8 @@ pub enum Message {
     SettingsPrefetchToggled(bool),
     /// The theme choice changed.
     SettingsThemeChanged(ThemeMode),
+    /// The message list presentation changed.
+    SettingsListStyleChanged(ListStyle),
     /// Persist the edited settings and reschedule background sync.
     SettingsSave,
     /// The save finished, off the UI thread.

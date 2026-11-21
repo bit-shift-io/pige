@@ -31,6 +31,19 @@ pub enum ThemeMode {
     Dark,
 }
 
+/// How the folder's message list is drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListStyle {
+    /// The original plain rows, with no separating lines or cards.
+    #[default]
+    Plain,
+    /// Plain rows separated by a hairline divider.
+    Divider,
+    /// One raised card per conversation, like the Settings sections.
+    Cards,
+}
+
 /// Everything the user can change about pige's behaviour.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,6 +60,8 @@ pub struct Settings {
     pub prefetch_bodies: bool,
     /// The preferred colour scheme.
     pub theme: ThemeMode,
+    /// How message rows in a folder are presented.
+    pub list_style: ListStyle,
 }
 
 impl Default for Settings {
@@ -57,6 +72,7 @@ impl Default for Settings {
             background_sync: true,
             prefetch_bodies: true,
             theme: ThemeMode::System,
+            list_style: ListStyle::Plain,
         }
     }
 }
@@ -119,5 +135,16 @@ mod tests {
         assert!(settings.notifications);
         assert!(settings.background_sync);
         assert_eq!(settings.theme, ThemeMode::System);
+        assert_eq!(settings.list_style, ListStyle::Plain);
+    }
+
+    #[test]
+    fn an_old_document_defaults_to_plain_rows() {
+        let old =
+            r#"{"sync_minutes":15,"notifications":true,"background_sync":true,"theme":"system"}"#;
+        let parsed: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.list_style, ListStyle::Plain);
+        let cards: Settings = serde_json::from_str(r#"{"list_style":"cards"}"#).unwrap();
+        assert_eq!(cards.list_style, ListStyle::Cards);
     }
 }

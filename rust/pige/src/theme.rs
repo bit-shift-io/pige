@@ -70,6 +70,10 @@ pub struct Palette {
     pub scrim: Color,
     /// The elevation shadow colour.
     pub shadow: Color,
+    /// Muted, equally weighted tones for contact avatars. A name hashes into
+    /// one of these; they stay gentle in both schemes and never borrow a
+    /// semantic colour such as `error`.
+    pub avatar_tones: [Color; 6],
     /// The spacing scale.
     pub space: Space,
     /// The corner-radius scale.
@@ -133,6 +137,8 @@ pub struct Metrics {
     pub toast_radius: f32,
     pub toast_margin: f32,
     pub badge_height: f32,
+    /// Width of the account-colour bar pinned to a message row's left edge.
+    pub account_bar_width: f32,
     pub unread_dot: f32,
     pub avatar_size: f32,
     pub avatar_font_ratio: f32,
@@ -301,6 +307,14 @@ const LIGHT: Palette = Palette {
     on_dark: Color::from_rgb8(0xff, 0xff, 0xff),
     scrim: Color::from_rgba(0.0, 0.0, 0.0, 0.32),
     shadow: Color::from_rgba(0.0, 0.0, 0.0, 0.16),
+    avatar_tones: [
+        Color::from_rgb8(0xe8, 0xdd, 0xff),
+        Color::from_rgb8(0xdc, 0xe9, 0xf5),
+        Color::from_rgb8(0xdf, 0xf0, 0xe3),
+        Color::from_rgb8(0xf7, 0xe3, 0xd3),
+        Color::from_rgb8(0xf5, 0xdc, 0xe2),
+        Color::from_rgb8(0xea, 0xe4, 0xf2),
+    ],
     space: Space {
         xxs: 2.0,
         xs: 4.0,
@@ -350,6 +364,14 @@ const DARK: Palette = Palette {
     on_dark: Color::from_rgb8(0xff, 0xff, 0xff),
     scrim: Color::from_rgba(0.0, 0.0, 0.0, 0.54),
     shadow: Color::from_rgba(0.0, 0.0, 0.0, 0.30),
+    avatar_tones: [
+        Color::from_rgb8(0x4a, 0x3d, 0x6b),
+        Color::from_rgb8(0x36, 0x4a, 0x5e),
+        Color::from_rgb8(0x33, 0x53, 0x4a),
+        Color::from_rgb8(0x5a, 0x45, 0x38),
+        Color::from_rgb8(0x5a, 0x3d, 0x47),
+        Color::from_rgb8(0x46, 0x41, 0x4f),
+    ],
     space: Space {
         xxs: 2.0,
         xs: 4.0,
@@ -396,6 +418,7 @@ const METRICS: Metrics = Metrics {
     toast_radius: 8.0,
     toast_margin: 16.0,
     badge_height: 18.0,
+    account_bar_width: 4.0,
     unread_dot: 8.0,
     avatar_size: 40.0,
     avatar_font_ratio: 0.4,

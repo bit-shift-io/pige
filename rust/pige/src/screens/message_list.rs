@@ -3,6 +3,7 @@
 use iced::widget::{column, container};
 use iced::{Element, Fill, Length};
 use pige_core::mail::FolderKind;
+use pige_core::settings::ListStyle;
 
 use crate::app::{
     App, account_color, account_for_folder, avatar_color, format_list_date, initials, row_view,
@@ -73,25 +74,35 @@ pub fn list_pane<'a>(
                 "Messages you save as drafts appear here.",
             ));
         } else {
-            pane = pane.push(components::scroller(draft_rows(&drafts)));
+            pane = pane.push(components::scroller(draft_rows(&drafts, app.settings.list_style)));
         }
     } else if app.snapshot.conversations.is_empty() {
         let (title, body) = folder_empty_copy(app);
         pane = pane.push(components::empty_state(&title, &body));
     } else {
-        let mut rows = column![].spacing(0).width(Fill);
-        for conversation in &app.snapshot.conversations {
+        let style = app.settings.list_style;
+        let mut rows = column![]
+            .spacing(if style == ListStyle::Cards {
+                palette.space.sm
+            } else {
+                0.0
+            })
+            .width(Fill);
+        let last = app.snapshot.conversations.len().saturating_sub(1);
+        for (index, conversation) in app.snapshot.conversations.iter().enumerate() {
             let row = row_view(
                 conversation,
                 account_color(&app.snapshot, &conversation.account_id),
             );
-            rows = rows.push(elastic_scroll::row(
-                components::list_row(
-                    row,
-                    Message::OpenConversation(conversation.thread_id.clone()),
-                ),
-                &app.list_motion,
-            ));
+            let message = Message::OpenConversation(conversation.thread_id.clone());
+            let row = match style {
+                ListStyle::Cards => components::list_row_card(row, message),
+                _ => components::list_row(row, message),
+            };
+            rows = rows.push(elastic_scroll::row(row, &app.list_motion));
+            if style == ListStyle::Divider && index < last {
+                rows = rows.push(components::horizontal_divider());
+            }
         }
         if app.snapshot.has_more {
             rows = rows.push(
@@ -105,7 +116,15 @@ pub fn list_pane<'a>(
             );
         }
 
-        let scroller = components::scroller(elastic_scroll::content(rows.into(), &app.list_motion));
+        let rows: Element<'a, Message> = if style == ListStyle::Cards {
+            container(rows)
+                .padding([palette.space.md, palette.space.lg])
+                .width(Fill)
+                .into()
+        } else {
+            rows.into()
+        };
+        let scroller = components::scroller(elastic_scroll::content(rows, &app.list_motion));
         let scroller = components::pull_refresh::wrap(scroller, Message::Refresh);
         pane = pane.push(elastic_scroll::wrap(
             scroller,
@@ -158,12 +177,23 @@ fn selected_drafts(app: &App) -> Vec<&pige_core::send::OutboxEntry> {
         .collect()
 }
 
-fn draft_rows<'a>(drafts: &[&'a pige_core::send::OutboxEntry]) -> Element<'a, Message> {
+fn draft_rows<'a>(
+    drafts: &[&'a pige_core::send::OutboxEntry],
+    style: ListStyle,
+) -> Element<'a, Message> {
+    let palette = theme::active();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64);
-    let mut rows = column![].spacing(0).width(Fill);
-    for draft in drafts {
+    let mut rows = column![]
+        .spacing(if style == ListStyle::Cards {
+            palette.space.sm
+        } else {
+            0.0
+        })
+        .width(Fill);
+    let last = drafts.len().saturating_sub(1);
+    for (index, draft) in drafts.iter().enumerate() {
         let recipient = draft
             .message
             .to
@@ -182,23 +212,35 @@ fn draft_rows<'a>(drafts: &[&'a pige_core::send::OutboxEntry]) -> Element<'a, Me
             .find(|line| !line.trim().is_empty())
             .map(|line| line.chars().take(120).collect::<String>())
             .unwrap_or_default();
-        rows = rows.push(components::list_row(
-            ListRow {
-                initials: initials(&recipient),
-                avatar_color: avatar_color(&recipient),
-                sender: recipient,
-                date: format_list_date(now, draft.updated_at),
-                subject,
-                snippet,
-                unread: false,
-                has_attachment: false,
-                count: 0,
-                account_color: None,
-            },
-            Message::OpenDraft(draft.id.clone()),
-        ));
+        let row = ListRow {
+            initials: initials(&recipient),
+            avatar_color: avatar_color(&recipient),
+            sender: recipient,
+            date: format_list_date(now, draft.updated_at),
+            subject,
+            snippet,
+            unread: false,
+            has_attachment: false,
+            count: 0,
+            account_color: None,
+        };
+        let message = Message::OpenDraft(draft.id.clone());
+        rows = rows.push(match style {
+            ListStyle::Cards => components::list_row_card(row, message),
+            _ => components::list_row(row, message),
+        });
+        if style == ListStyle::Divider && index < last {
+            rows = rows.push(components::horizontal_divider());
+        }
     }
-    rows.into()
+    if style == ListStyle::Cards {
+        container(rows)
+            .padding([palette.space.md, palette.space.lg])
+            .width(Fill)
+            .into()
+    } else {
+        rows.into()
+    }
 }
 
 fn folder_title(app: &App) -> &str {

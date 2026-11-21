@@ -4,7 +4,7 @@
 //! screen can build one without a renderer and the tests can exercise their
 //! data directly.
 
-use iced::widget::{button, column, container, row, space};
+use iced::widget::{button, column, container, row, space, stack};
 use iced::{Color, Element, Fill};
 
 use crate::Message;
@@ -24,7 +24,7 @@ pub struct ListRow {
     pub unread: bool,
     pub has_attachment: bool,
     pub count: u32,
-    /// The account's accent colour, drawn as a block behind the avatar.
+    /// The account's accent colour, drawn as a bar on the row's left edge.
     pub account_color: Option<Color>,
 }
 
@@ -128,8 +128,25 @@ fn tile_style(
     }
 }
 
-/// A three-line conversation row: avatar, sender/date, subject and snippet.
+/// The surface a message row draws on. Plain rows sit directly on the pane;
+/// cards use the shared raised surface from the Settings sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSurface {
+    Plain,
+    Card,
+}
+
+/// A three-line conversation row on the plain pane surface.
 pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
+    list_row_on(item, on_press, RowSurface::Plain)
+}
+
+/// The same row, raised onto the shared card surface.
+pub fn list_row_card<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
+    list_row_on(item, on_press, RowSurface::Card)
+}
+
+fn list_row_on<'a>(item: ListRow, on_press: Message, surface: RowSurface) -> Element<'a, Message> {
     let palette = theme::active();
     let sender_style = palette.role(TextRole::LabelLarge);
     let subject_style = palette.role(TextRole::BodyMedium);
@@ -141,22 +158,26 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
     let sender_color = if item.unread { primary } else { secondary };
     let subject_color = if item.unread { primary } else { secondary };
 
-    // Date sits at the top right. The paperclip shares the subject line (its
-    // right edge, directly under the date) instead of stacking under the date:
-    // stacking made the sender row two lines tall and opened a gap above the
-    // subject. The subject label fills the remaining width and trims around it.
-    let date_column = column![styled_text(item.date.clone(), date_style, secondary)]
-        .align_x(iced::Alignment::End)
-        .spacing(0.0);
-
+    // The date stays in the top row's own column, so it is always flush with
+    // the right edge. The paperclip shares the subject line (its right edge,
+    // directly under the date) instead of stacking under the date: stacking
+    // made the sender row two lines tall and opened a gap above the subject.
     let top = row![
         label::fitted(item.sender.clone(), sender_style, sender_color, false, None),
-        date_column,
+        styled_text(item.date.clone(), date_style, secondary),
     ]
     .align_y(iced::Alignment::Start)
     .spacing(palette.space.xs)
     .width(Fill);
 
+    // Unread and count indicators float over the lower lines so they cannot
+    // push the date inward. Reserve a little room at the end of those lines so
+    // text ellipsizes before it runs underneath the indicators.
+    let indicators_width = if item.unread || item.count > 1 {
+        palette.space.lg
+    } else {
+        0.0
+    };
     let mut subject_row = row![label::fitted(
         item.subject.clone(),
         subject_style,
@@ -175,78 +196,93 @@ pub fn list_row<'a>(item: ListRow, on_press: Message) -> Element<'a, Message> {
                 .color(secondary),
         );
     }
+    if indicators_width > 0.0 {
+        subject_row = subject_row.push(space().width(indicators_width));
+    }
 
-    let lines = column![
-        top.width(Fill),
-        subject_row,
-        label::fitted(item.snippet.clone(), snippet_style, secondary, false, None),
-    ]
-    .spacing(0)
-    .width(Fill);
+    let mut snippet_row =
+        row![label::fitted(item.snippet.clone(), snippet_style, secondary, false, None)]
+            .width(Fill);
+    if indicators_width > 0.0 {
+        snippet_row = snippet_row.push(space().width(indicators_width));
+    }
+
+    let lines = column![top, subject_row, snippet_row]
+        .spacing(0)
+        .width(Fill);
 
     let avatar = avatar::avatar(
         &item.initials,
         item.avatar_color,
         palette.metrics.avatar_size,
     );
-    // A rounded block behind the circular avatar keeps accounts visually
-    // distinct even when two senders hash to the same avatar colour.
-    let avatar: Element<'a, Message> = match item.account_color {
-        Some(color) => {
-            let block = palette.metrics.avatar_size + palette.space.xs * 2.0;
-            container(avatar)
-                .padding(palette.space.xs)
-                .style(move |_| container::Style {
-                    background: Some(color.into()),
-                    border: iced::border::rounded(block / 2.0),
-                    ..Default::default()
-                })
-                .into()
-        }
-        None => avatar,
-    };
 
-    let mut content = row![avatar, lines]
+    let base = row![avatar, lines]
         .spacing(palette.space.md)
         .align_y(iced::Alignment::Center)
         .width(Fill);
-    // Only reserve the trailing column when it carries a dot or badge, so the
-    // date can sit closer to the edge.
-    if item.unread || item.count > 1 {
-        let mut trailing = column![]
-            .width(palette.space.lg)
-            .align_x(iced::Alignment::End);
-        if item.unread {
-            trailing = trailing.push(unread_dot(palette));
-        }
-        if item.count > 1 {
-            trailing = trailing.push(badge(item.count, palette));
-        }
-        content = content.push(trailing);
-    }
 
-    let background = if item.unread {
-        palette.surface_container
-    } else {
-        Color::TRANSPARENT
+    // The account colour is a slim bar pinned to the row's left edge, not a
+    // ring or block around the avatar. It is overlaid so it never changes the
+    // text layout.
+    let bar: Element<'a, Message> = match item.account_color {
+        Some(color) => container(space())
+            .width(palette.metrics.account_bar_width)
+            .height(Fill)
+            .style(move |_| container::Style {
+                background: Some(color.into()),
+                ..Default::default()
+            })
+            .into(),
+        None => space().width(0.0).into(),
     };
 
-    button(
-        container(content)
+    let indicators: Element<'a, Message> = if item.unread || item.count > 1 {
+        let mut stack = column![].align_x(iced::Alignment::End);
+        if item.unread {
+            stack = stack.push(unread_dot(palette));
+        }
+        if item.count > 1 {
+            stack = stack.push(badge(item.count, palette));
+        }
+        container(stack)
             .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Center)
+            .into()
+    } else {
+        space().into()
+    };
+
+    let inner = container(stack![base, bar, indicators]).width(Fill);
+    let inner = match surface {
+        RowSurface::Plain => inner
             .padding([0.0, palette.space.lg])
             .center_y(palette.metrics.list_row_height)
             .style(move |_| container::Style {
-                background: Some(background.into()),
+                background: Some(
+                    if item.unread {
+                        palette.surface_container
+                    } else {
+                        Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
                 text_color: Some(palette.on_surface),
                 ..Default::default()
             }),
-    )
-    .width(Fill)
-    .padding(0)
-    .style(tile_style(palette, false))
-    .on_press(on_press)
-    .into()
+        RowSurface::Card => inner
+            .padding(palette.space.lg)
+            .style(move |_| crate::components::card_style(palette)),
+    };
+
+    button(inner)
+        .width(Fill)
+        .padding(0)
+        .style(tile_style(palette, false))
+        .on_press(on_press)
+        .into()
 }
 
 /// One folder in the navigation pane.

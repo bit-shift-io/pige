@@ -1164,6 +1164,7 @@ impl App {
                     }
                 }
             }
+            Message::SettingsListStyleChanged(style) => self.settings.list_style = style,
             Message::SettingsSave => {
                 let minutes = self
                     .settings_sync

@@ -2,7 +2,7 @@
 
 use pige_core::Store;
 use pige_core::config::{self, ConfigDocument};
-use pige_core::settings::{Settings, ThemeMode, load_settings};
+use pige_core::settings::{ListStyle, Settings, ThemeMode, load_settings};
 use tempfile::TempDir;
 
 fn migrated_store() -> (Store, TempDir) {
@@ -22,6 +22,7 @@ fn settings_default_to_15_minutes_notifications_on_and_system_theme() {
     assert!(settings.notifications);
     assert!(settings.background_sync);
     assert_eq!(settings.theme, ThemeMode::System);
+    assert_eq!(settings.list_style, ListStyle::Plain);
     assert_eq!(settings, Settings::default());
 }
 
@@ -36,6 +37,7 @@ fn settings_round_trip_in_the_configuration_document() {
         background_sync: false,
         prefetch_bodies: false,
         theme: ThemeMode::Dark,
+        list_style: ListStyle::Cards,
     };
     let doc = ConfigDocument {
         settings: settings.clone(),

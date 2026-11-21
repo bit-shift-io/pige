@@ -356,6 +356,62 @@ fn set_snippet_updates_the_conversation_preview() {
 }
 
 #[test]
+fn conversation_preview_falls_back_to_another_copy_of_the_thread() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    let inbox = folder(&account.id);
+    store.upsert_account(&account).unwrap();
+    store.upsert_folder(&inbox).unwrap();
+
+    // The newest copy has no preview (a prefix fetch could not decode it);
+    // an older copy in the same thread still carries one.
+    let mut older = message(&inbox, 1, 1, 1_700_000_000);
+    older.thread_id = ThreadId("shared".to_string());
+    older.snippet = "readable text".to_string();
+    let mut newest = message(&inbox, 2, 1, 1_700_000_100);
+    newest.thread_id = ThreadId("shared".to_string());
+    newest.snippet.clear();
+    store.upsert_message(&older).unwrap();
+    store.upsert_message(&newest).unwrap();
+
+    assert_eq!(
+        store.conversations(&inbox.id, 10, None).unwrap()[0].snippet,
+        "readable text"
+    );
+}
+
+#[test]
+fn conversation_preview_falls_back_to_a_cached_body() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    let account = account();
+    let inbox = folder(&account.id);
+    store.upsert_account(&account).unwrap();
+    store.upsert_folder(&inbox).unwrap();
+
+    let mut message = message(&inbox, 1, 1, 1_700_000_000);
+    message.thread_id = ThreadId("thread-body".to_string());
+    message.snippet.clear();
+    store.upsert_message(&message).unwrap();
+    store
+        .upsert_body(
+            &message.id,
+            &pige_core::store::Body {
+                plain_text: Some("  first line\n second line ".to_string()),
+                html: None,
+                fetched_at: 1_700_000_100,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.conversations(&inbox.id, 10, None).unwrap()[0].snippet,
+        "first line second line"
+    );
+}
+
+#[test]
 fn migration_repairs_stale_previews_from_cached_bodies() {
     use pige_core::store::Body;
 

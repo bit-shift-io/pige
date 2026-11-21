@@ -7,7 +7,7 @@
 
 use iced::widget::{column, container, row};
 use iced::{Alignment, Element, Fill};
-use pige_core::settings::ThemeMode;
+use pige_core::settings::{ListStyle, ThemeMode};
 
 use crate::app::{App, LearningConfirm};
 use crate::components::{self, ButtonVariant};
@@ -35,6 +35,7 @@ pub fn screen<'a>(app: &'a App) -> Element<'a, Message> {
         prefetch_section(app),
         notifications_section(app),
         theme_section(app),
+        list_style_section(app),
         accounts_section(app),
         recipient_suggestions_section(app),
         components::action_card(
@@ -157,6 +158,41 @@ fn theme_section<'a>(app: &'a App) -> Element<'a, Message> {
     .spacing(palette.space.sm)
     .align_y(Alignment::Center);
     section("Theme", body.into())
+}
+
+fn list_style_section<'a>(app: &'a App) -> Element<'a, Message> {
+    let palette = theme::active();
+    let current = app.settings.list_style;
+    let body = column![
+        row![
+            components::chip(
+                "Plain",
+                current == ListStyle::Plain,
+                Message::SettingsListStyleChanged(ListStyle::Plain),
+            ),
+            components::chip(
+                "Dividers",
+                current == ListStyle::Divider,
+                Message::SettingsListStyleChanged(ListStyle::Divider),
+            ),
+            components::chip(
+                "Cards",
+                current == ListStyle::Cards,
+                Message::SettingsListStyleChanged(ListStyle::Cards),
+            ),
+        ]
+        .spacing(palette.space.sm)
+        .align_y(Alignment::Center),
+        styled(
+            "Choose how messages are separated in every folder: plain rows, a hairline divider, or raised cards like these settings."
+                .to_string(),
+            TextRole::LabelMedium,
+            palette.on_surface_variant,
+        ),
+    ]
+    .spacing(palette.space.xs)
+    .width(Fill);
+    section("Message list", body.into())
 }
 
 fn accounts_section<'a>(app: &'a App) -> Element<'a, Message> {
@@ -347,7 +383,7 @@ pub(crate) fn learning_confirm_modal(
 /// A titled card holding one group of settings.
 fn section<'a>(title: &str, body: Element<'a, Message>) -> Element<'a, Message> {
     let palette = theme::active();
-    container(
+    components::card(
         column![
             styled(title.to_string(), TextRole::TitleSmall, palette.on_surface),
             body,
@@ -355,15 +391,6 @@ fn section<'a>(title: &str, body: Element<'a, Message>) -> Element<'a, Message> 
         .spacing(palette.space.md)
         .width(Fill),
     )
-    .width(Fill)
-    .padding(palette.space.lg)
-    .style(move |_| container::Style {
-        background: Some(palette.surface_container.into()),
-        text_color: Some(palette.on_surface),
-        border: iced::border::rounded(palette.radius.md),
-        ..Default::default()
-    })
-    .into()
 }
 
 fn styled<'a>(

@@ -707,6 +707,47 @@ fn prefetch_candidates_on(
     Ok(result)
 }
 
+/// Resolve a conversation's list preview from local data.
+///
+/// The newest message in a folder can have an empty snippet: IMAP only fetches
+/// a bounded prefix for previews, and a body repaired later may belong to a
+/// different copy of the same thread. Fall back to the newest non-empty snippet
+/// in the thread, then to the newest cached body's text, before giving up.
+fn preview_on(
+    conn: &Connection,
+    thread_id: &str,
+    newest_snippet: String,
+) -> Result<String, StoreError> {
+    if !newest_snippet.trim().is_empty() {
+        return Ok(newest_snippet);
+    }
+    let in_thread: Option<String> = conn
+        .query_row(
+            "SELECT snippet FROM messages
+             WHERE thread_id = ?1 AND TRIM(snippet) != ''
+             ORDER BY date DESC, rowid DESC LIMIT 1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(snippet) = in_thread {
+        return Ok(snippet);
+    }
+    let body: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT b.plain_text, b.html FROM bodies b
+             JOIN messages m ON m.id = b.message_id
+             WHERE m.thread_id = ?1
+             ORDER BY m.date DESC, m.rowid DESC LIMIT 1",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(body
+        .and_then(|(plain, html)| crate::mail::snippet_from_parts(plain.as_deref(), html.as_deref()))
+        .unwrap_or_default())
+}
+
 /// Conversation list for one folder: one row per thread using its newest
 /// message for display and aggregates over the copies in that folder.
 pub(crate) fn conversations_on(
@@ -748,12 +789,13 @@ pub(crate) fn conversations_on(
     let mut conversations = Vec::new();
     while let Some(row) = rows.next()? {
         let from_json: String = row.get(3)?;
+        let thread_id: String = row.get(0)?;
         conversations.push(Conversation {
-            thread_id: ThreadId(row.get(0)?),
+            snippet: preview_on(conn, &thread_id, row.get(4)?)?,
+            thread_id: ThreadId(thread_id),
             account_id: AccountId(row.get(1)?),
             subject: row.get(2)?,
             sender: sender_from_json(&from_json)?,
-            snippet: row.get(4)?,
             date: row.get(5)?,
             message_count: row.get(6)?,
             unread: row.get(7)?,
@@ -804,12 +846,13 @@ pub(crate) fn unified_conversations_on(
     let mut conversations = Vec::new();
     while let Some(row) = rows.next()? {
         let from_json: String = row.get(3)?;
+        let thread_id: String = row.get(0)?;
         conversations.push(Conversation {
-            thread_id: ThreadId(row.get(0)?),
+            snippet: preview_on(conn, &thread_id, row.get(4)?)?,
+            thread_id: ThreadId(thread_id),
             account_id: AccountId(row.get(1)?),
             subject: row.get(2)?,
             sender: sender_from_json(&from_json)?,
-            snippet: row.get(4)?,
             date: row.get(5)?,
             message_count: row.get(6)?,
             unread: row.get(7)?,

@@ -408,19 +408,13 @@ fn first_letter(word: &str) -> Option<char> {
         .or_else(|| word.chars().next())
 }
 
-/// A stable avatar colour for an address, drawn from the active palette.
+/// A stable, muted avatar colour for a contact name or address. The hash keeps
+/// the same person the same colour across launches; the palette's avatar tones
+/// keep every choice gentle and never turn a semantic colour into a name tag.
 pub fn avatar_color(email: &str) -> Color {
     let palette = theme::active();
-    let choices = [
-        palette.primary_container,
-        palette.secondary_container,
-        palette.surface_container_highest,
-        palette.error_container,
-        palette.primary,
-        palette.error,
-    ];
-    let index = (address_hash(email) % choices.len() as u64) as usize;
-    choices[index]
+    let index = (address_hash(email) % palette.avatar_tones.len() as u64) as usize;
+    palette.avatar_tones[index]
 }
 
 /// FNV-1a: unlike `DefaultHasher`, this stays stable across Rust releases and
