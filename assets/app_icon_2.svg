@@ -24,10 +24,6 @@
       <stop offset="0%" stop-color="#CBD5E1" />
       <stop offset="100%" stop-color="#94A3B8" />
     </linearGradient>
-
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="5" stdDeviation="4" flood-color="#090D16" flood-opacity="0.35" />
-    </filter>
   </defs>
 
   <!-- Dark App Icon Background -->
@@ -36,8 +32,10 @@
   <!-- Vibrant Inner Circle -->
   <circle cx="256" cy="256" r="172" fill="url(#circleGrad)" />
 
-  <!-- Origami Bird Group -->
-  <g filter="url(#shadow)">
+  <!-- Origami Bird Group. The original drop-shadow filter (feDropShadow)
+       made common renderers drop this whole group, so the bird vanished;
+       the group renders without the filter reference. -->
+  <g>
     <!-- 1. Back/upper-left folded wing flap -->
     <polygon points="212,242 128,172 195,182" fill="url(#wingBack)" />
     <polygon points="212,242 195,182 238,205" fill="#A4B3C6" />
