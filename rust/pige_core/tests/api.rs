@@ -1510,6 +1510,280 @@ async fn prefetch_marks_unreadable_bodies_and_does_not_refetch() {
     );
 }
 
+/// One INBOX transport advertising `messages` with `bodies` served by
+/// `fetch_body`: the seed for a sync pass that will report new mail.
+fn new_mail_transport(messages: Vec<RemoteMessage>, bodies: Vec<(Uid, Vec<u8>)>) -> FakeTransport {
+    let count = messages.len() as u32;
+    let uidnext = messages.iter().map(|m| m.uid.0).max().unwrap_or(0) + 1;
+    FakeTransport {
+        folders: vec![RemoteFolder {
+            name: "INBOX".to_string(),
+            delimiter: Some("/".to_string()),
+            kind: FolderKind::Inbox,
+            selectable: true,
+        }],
+        messages: HashMap::from([("INBOX".to_string(), messages)]),
+        states: HashMap::from([(
+            "INBOX".to_string(),
+            FolderState {
+                uidvalidity: 1,
+                uidnext,
+                exists: count,
+            },
+        )]),
+        bodies: HashMap::from([(
+            "INBOX".to_string(),
+            bodies.into_iter().collect::<HashMap<_, _>>(),
+        )]),
+        ..FakeTransport::default()
+    }
+}
+
+#[tokio::test]
+async fn sync_all_prefetches_new_mail_bodies() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    harness.factory.add_transport(
+        account.clone(),
+        new_mail_transport(
+            vec![remote_message(1, "hello", "a@example.com")],
+            vec![(Uid(1), b"Subject: hello\r\n\r\nwarm body".to_vec())],
+        ),
+    );
+
+    let snapshot = api::sync_all().await.expect("sync succeeds");
+
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert_eq!(
+        transport.fetch_body_calls,
+        vec![("INBOX".to_string(), Uid(1))],
+        "the new message's body is downloaded in the same pass"
+    );
+    let store = harness.open_store();
+    let inbox = &store.folders(&account).unwrap()[0];
+    let stored = store.messages(&inbox.id, 10, None).unwrap();
+    assert_eq!(stored.len(), 1);
+    let body = store.body(&stored[0].id).unwrap().expect("body cached");
+    assert!(body.plain_text.unwrap_or_default().contains("warm body"));
+    let _ = snapshot;
+
+    // A second pass has no new mail and must not refetch.
+    api::sync_all().await.expect("second sync");
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert_eq!(transport.fetch_body_calls.len(), 1, "no refetch");
+}
+
+#[tokio::test]
+async fn sync_all_skips_new_mail_prefetch_when_disabled() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    harness.factory.add_transport(
+        account.clone(),
+        new_mail_transport(vec![remote_message(1, "hello", "a@example.com")], vec![]),
+    );
+    api::save_settings(&api::Settings {
+        prefetch_bodies: false,
+        ..api::Settings::default()
+    })
+    .unwrap();
+
+    api::sync_all().await.expect("sync succeeds");
+
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert!(
+        transport.fetch_body_calls.is_empty(),
+        "the toggle must suppress new-mail prefetch"
+    );
+}
+
+#[tokio::test]
+async fn sync_all_skips_prefetch_for_oversized_messages() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    let mut big = remote_message(1, "big", "a@example.com");
+    big.header.size = 11 * 1024 * 1024;
+    big.size = 11 * 1024 * 1024;
+    harness.factory.add_transport(
+        account.clone(),
+        new_mail_transport(
+            vec![big],
+            vec![(Uid(1), b"Subject: big\r\n\r\nhuge body".to_vec())],
+        ),
+    );
+    let mut events = api::subscribe();
+
+    api::sync_all().await.expect("sync succeeds");
+
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, CoreEvent::NewMail(_))),
+        "an oversized message still notifies"
+    );
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert!(
+        transport.fetch_body_calls.is_empty(),
+        "an oversized message is never downloaded"
+    );
+    let store = harness.open_store();
+    let inbox = &store.folders(&account).unwrap()[0];
+    let stored = store.messages(&inbox.id, 10, None).unwrap();
+    assert_eq!(stored.len(), 1, "the message is still listed");
+    assert!(store.body(&stored[0].id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn sync_all_caps_new_mail_prefetch_at_ten() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    let messages = (1..=12)
+        .map(|uid| remote_message(uid, &format!("mail {uid}"), "a@example.com"))
+        .collect();
+    let bodies = (1..=12)
+        .map(|uid| {
+            (
+                Uid(uid),
+                format!("Subject: mail {uid}\r\n\r\nbody {uid}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    harness
+        .factory
+        .add_transport(account.clone(), new_mail_transport(messages, bodies));
+
+    api::sync_all().await.expect("sync succeeds");
+
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert_eq!(
+        transport.fetch_body_calls.len(),
+        10,
+        "a burst caps the downloads per pass"
+    );
+    let store = harness.open_store();
+    let inbox = &store.folders(&account).unwrap()[0];
+    let stored = store.messages(&inbox.id, 100, None).unwrap();
+    assert_eq!(stored.len(), 12, "every message is still listed");
+    let cached = stored
+        .iter()
+        .filter(|m| store.body(&m.id).unwrap().is_some())
+        .count();
+    assert_eq!(cached, 10, "exactly the capped set is warm");
+}
+
+#[tokio::test]
+async fn sync_all_prefetch_survives_unreadable_body() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    // No `bodies` entry: fetch_body returns empty bytes, which decode to no
+    // readable text.
+    harness.factory.add_transport(
+        account.clone(),
+        new_mail_transport(vec![remote_message(1, "odd", "a@example.com")], vec![]),
+    );
+
+    api::sync_all().await.expect("sync still succeeds");
+
+    let store = harness.open_store();
+    let inbox = &store.folders(&account).unwrap()[0];
+    let stored = store.messages(&inbox.id, 10, None).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        store.body_state(&stored[0].id).unwrap(),
+        Some("none".to_string()),
+        "an unreadable body is recorded so prefetch never retries it"
+    );
+    assert!(store.body(&stored[0].id).unwrap().is_none());
+
+    api::sync_all().await.expect("second sync");
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert_eq!(
+        transport.fetch_body_calls.len(),
+        1,
+        "the unreadable body is not refetched"
+    );
+}
+
+#[tokio::test]
+async fn sync_all_emits_new_mail_before_prefetch() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    harness.factory.add_transport(
+        account.clone(),
+        new_mail_transport(
+            vec![remote_message(1, "hello", "a@example.com")],
+            vec![(Uid(1), b"Subject: hello\r\n\r\nwarm body".to_vec())],
+        ),
+    );
+    // Park every body fetch the pass attempts: zero permits.
+    let pause = Arc::new(Semaphore::new(0));
+    let mut transport = harness.factory.transport(&account).await.unwrap();
+    transport.fetch_body_pause = Some(pause.clone());
+    harness.factory.add_transport(account.clone(), transport);
+
+    let mut events = api::subscribe();
+    let sync = tokio::spawn(async { api::sync_all().await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let notified = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "NewMail never arrived while the body download was parked"
+        );
+        if std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, CoreEvent::NewMail(_)))
+        {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(
+        notified,
+        "the notification fired before the download finished"
+    );
+
+    // Release the parked fetch; the pass then completes with the body cached.
+    pause.add_permits(1);
+    sync.await.unwrap().expect("sync succeeds");
+    let transport = harness.factory.transport(&account).await.unwrap();
+    assert_eq!(
+        transport.fetch_body_calls,
+        vec![("INBOX".to_string(), Uid(1))],
+        "the prefetch still ran"
+    );
+}
+
 #[tokio::test]
 async fn prefetch_opens_one_session_for_the_whole_account_batch() {
     let _guard = TEST_LOCK.lock().await;

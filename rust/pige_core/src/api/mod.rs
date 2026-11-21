@@ -38,8 +38,8 @@ use crate::mail::{
 };
 use crate::platform::{BackupStore, CredentialStore, Notifier, Opener, TransportFactory};
 use crate::providers::{
-    ContactSourceId, OperationContext, ProviderCapabilities, ProviderFactory, RemoteAttachmentId,
-    RemoteContactId, SubmissionService, imap::ImapSubmission,
+    ContactSourceId, OperationContext, ProviderCapabilities, ProviderFactory, ProviderSession,
+    RemoteAttachmentId, RemoteContactId, SubmissionService, imap::ImapSubmission,
 };
 use crate::search::{SearchHit, SearchScope};
 use crate::send::{
@@ -61,6 +61,7 @@ const SYNC_PAGES: u32 = 8;
 pub use crate::contacts::{RecipientQuery, RecipientSuggestion, SuggestionSource};
 pub use crate::providers::{DeliveryClass, DeliveryClassification};
 pub use crate::settings::{Settings, ThemeMode};
+use crate::sync::NewMailSummary;
 pub use crate::sync::history::LearningProgress;
 pub use accounts::{
     answer_auth, await_platform_auth, begin_auth, begin_auth_with_username, can_switch_backend,
@@ -2732,6 +2733,79 @@ pub async fn prefetch_bodies() {
         .await;
 }
 
+/// How many newly-arrived bodies one sync pass downloads. A burst still
+/// notifies and lists every message; only the warm-open guarantee is capped.
+const NEW_MAIL_PREFETCH_LIMIT: usize = 10;
+
+/// Download the bodies the sync pass just delivered, so a notification tap
+/// opens a cached message. Notify-first: the caller has already emitted
+/// `NewMail` and `SyncFinished`. Best-effort — every failure is logged and
+/// swallowed, and the sync `ctx` (deadline + cancellation) bounds each read.
+async fn prefetch_new_mail(
+    store: &Store,
+    scheduler: &AccountScheduler,
+    account: &Account,
+    session: &mut ProviderSession,
+    ctx: &OperationContext,
+    mails: &[NewMailSummary],
+) {
+    // Same tolerance as the notify loop: a headless worker without global
+    // state has no toggle to read, so it proceeds.
+    let enabled = lock_state()
+        .as_ref()
+        .is_none_or(|state| state.config_doc.settings.prefetch_bodies);
+    if !enabled || mails.is_empty() {
+        return;
+    }
+    for mail in mails.iter().take(NEW_MAIL_PREFETCH_LIMIT) {
+        // Revalidate against the store: the message may have been moved,
+        // trashed, or already opened (and thus cached) while the pass ran.
+        let Ok(Some(stored)) = store.message(&mail.message_id) else {
+            continue;
+        };
+        if stored.header.size > MAX_BODY_BYTES {
+            continue;
+        }
+        let Ok(memberships) = store.message_memberships(&mail.message_id) else {
+            continue;
+        };
+        if !memberships.contains(&mail.folder_id) {
+            continue;
+        }
+        match store.body(&mail.message_id) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("new-mail prefetch cache check: {error}");
+                continue;
+            }
+        }
+        if store.body_state(&mail.message_id).ok().flatten().as_deref() == Some("none") {
+            continue;
+        }
+        // A message with no provider identity cannot be prefetched.
+        let Ok(remote) = store.remote_message(&account.id, &mail.message_id) else {
+            continue;
+        };
+        // Reborrow: the `&mut` must survive across loop iterations.
+        let operation = async { body::fetch_body_with(&mut *session, ctx, &remote).await };
+        let content = match scheduler.run_background(ctx, operation).await {
+            Ok(Some(Ok(content))) => content,
+            Ok(Some(Err(error))) => {
+                log::warn!("new-mail prefetch {}: {error}", mail.message_id);
+                continue;
+            }
+            // Busy gate: the user is interacting; stop this pass's batch.
+            Ok(None) => break,
+            Err(error) => {
+                log::debug!("new-mail prefetch deferred: {}", scheduler_message(error));
+                break;
+            }
+        };
+        body::cache_body_content(store, &mail.message_id, &content);
+    }
+}
+
 fn prefetch_candidate_is_current(state: &AppState, candidate: &PrefetchCandidate) -> bool {
     state
         .config_doc
@@ -3963,6 +4037,20 @@ async fn sync_one(
         account: account.id.clone(),
         new_mail: report.new_inbox.len(),
     });
+
+    // Notify-first: with the session still open, warm the bodies the pass
+    // just delivered so a notification tap opens a cached message.
+    if !report.new_inbox.is_empty() {
+        prefetch_new_mail(
+            store,
+            scheduler,
+            account,
+            &mut session,
+            &ctx,
+            &report.new_inbox,
+        )
+        .await;
+    }
     Ok(capabilities)
 }
 
