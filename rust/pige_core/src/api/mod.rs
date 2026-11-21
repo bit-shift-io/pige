@@ -2749,15 +2749,22 @@ async fn prefetch_new_mail(
     ctx: &OperationContext,
     mails: &[NewMailSummary],
 ) {
-    // Same tolerance as the notify loop: a headless worker without global
-    // state has no toggle to read, so it proceeds.
+    // Every surface — including the background worker — loads the persisted
+    // config through `api::init`, so the toggle is read from global state.
+    // The fallback only covers a state that should never be missing here.
     let enabled = lock_state()
         .as_ref()
         .is_none_or(|state| state.config_doc.settings.prefetch_bodies);
     if !enabled || mails.is_empty() {
         return;
     }
-    for mail in mails.iter().take(NEW_MAIL_PREFETCH_LIMIT) {
+    // Cap actual downloads, not summaries: a skipped summary (cached,
+    // oversized, moved) must not consume one of the ten attempts.
+    let mut fetched = 0;
+    for mail in mails.iter() {
+        if fetched >= NEW_MAIL_PREFETCH_LIMIT {
+            break;
+        }
         // Revalidate against the store: the message may have been moved,
         // trashed, or already opened (and thus cached) while the pass ran.
         let Ok(Some(stored)) = store.message(&mail.message_id) else {
@@ -2788,6 +2795,7 @@ async fn prefetch_new_mail(
             continue;
         };
         // Reborrow: the `&mut` must survive across loop iterations.
+        fetched += 1;
         let operation = async { body::fetch_body_with(&mut *session, ctx, &remote).await };
         let content = match scheduler.run_background(ctx, operation).await {
             Ok(Some(Ok(content))) => content,
@@ -3874,7 +3882,8 @@ async fn sync_accounts(
     };
     let mut capabilities = Vec::new();
 
-    for account in accounts {
+    let account_count = accounts.len();
+    for (index, account) in accounts.iter().enumerate() {
         if bounds.stopped() {
             break;
         }
@@ -3882,7 +3891,18 @@ async fn sync_accounts(
             account: account.id.clone(),
         });
 
-        match sync_one(&store, config, sessions, scheduler, account, sender, bounds).await {
+        match sync_one(
+            &store,
+            config,
+            sessions,
+            scheduler,
+            account,
+            sender,
+            bounds,
+            index + 1 == account_count,
+        )
+        .await
+        {
             Ok(caps) => {
                 outcome.succeeded += 1;
                 capabilities.push((account.id.clone(), caps));
@@ -3904,6 +3924,10 @@ async fn sync_accounts(
     (outcome, capabilities)
 }
 
+// `final_account` marks the last account so the spinner clears before the
+// best-effort body warm-up; grouping it into a struct would obscure a single
+// boolean used once.
+#[allow(clippy::too_many_arguments)]
 async fn sync_one(
     store: &Store,
     config: &Config,
@@ -3912,6 +3936,7 @@ async fn sync_one(
     account: &Account,
     sender: &broadcast::Sender<CoreEvent>,
     bounds: &SyncBounds,
+    final_account: bool,
 ) -> Result<ProviderCapabilities, String> {
     // A bounded pass caps this account's context at the pass deadline instead
     // of the interactive 60s. A missing or cancelled session means the account
@@ -4013,6 +4038,17 @@ async fn sync_one(
                 log::warn!("recompute unread for {}: {error}", folder.id);
             }
         }
+    }
+
+    // The mail phase is finished for the last account; clear the spinner
+    // before the notification snapshot reaches the UI. Body prefetch is a
+    // best-effort warm-up after this point and must not keep the UI busy.
+    // `finish_sync` still owns the final status (including errors).
+    if final_account {
+        if let Some(state) = lock_state().as_mut() {
+            state.status = SyncStatus::Idle;
+        }
+        let _ = sender.send(CoreEvent::SnapshotChanged);
     }
 
     // The in-app event always fires so the list refreshes; only the OS

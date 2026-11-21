@@ -1693,6 +1693,63 @@ async fn sync_all_caps_new_mail_prefetch_at_ten() {
 }
 
 #[tokio::test]
+async fn sync_all_caps_downloads_not_summaries() {
+    let _guard = TEST_LOCK.lock().await;
+    let harness = Harness::new();
+    let account = api::add_account(input("A", "a@example.com"))
+        .await
+        .unwrap()
+        .accounts[0]
+        .id
+        .clone();
+    // The three newest messages cannot be prefetched; the cap must still
+    // reach ten actual downloads from the fetchable messages behind them.
+    let messages = (1..=13)
+        .map(|uid| {
+            let mut message = remote_message(uid, &format!("mail {uid}"), "a@example.com");
+            if uid <= 3 {
+                message.header.size = 11 * 1024 * 1024;
+                message.size = 11 * 1024 * 1024;
+            }
+            message
+        })
+        .collect();
+    let bodies = (1..=13)
+        .map(|uid| {
+            (
+                Uid(uid),
+                format!("Subject: mail {uid}\r\n\r\nbody {uid}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    harness
+        .factory
+        .add_transport(account.clone(), new_mail_transport(messages, bodies));
+
+    api::sync_all().await.expect("sync succeeds");
+
+    let transport = harness.factory.transport(&account).await.unwrap();
+    let fetched = &transport.fetch_body_calls;
+    assert_eq!(fetched.len(), 10, "ten downloads despite skipped summaries");
+    assert!(
+        fetched.iter().all(|(_, uid)| uid.0 > 3),
+        "oversized messages are never downloaded"
+    );
+    let store = harness.open_store();
+    let inbox = &store.folders(&account).unwrap()[0];
+    let stored = store.messages(&inbox.id, 100, None).unwrap();
+    assert_eq!(stored.len(), 13, "every message is still listed");
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|m| store.body(&m.id).unwrap().is_some())
+            .count(),
+        10,
+        "exactly ten bodies are warm"
+    );
+}
+
+#[tokio::test]
 async fn sync_all_prefetch_survives_unreadable_body() {
     let _guard = TEST_LOCK.lock().await;
     let harness = Harness::new();
@@ -1772,6 +1829,19 @@ async fn sync_all_emits_new_mail_before_prefetch() {
         notified,
         "the notification fired before the download finished"
     );
+
+    // The mail phase is over: the spinner must clear even though the body
+    // download is still parked, so new mail is visible without a busy UI.
+    let idle = loop {
+        if api::snapshot().status == SyncStatus::Idle {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(idle, "sync status stayed busy through the prefetch");
 
     // Release the parked fetch; the pass then completes with the body cached.
     pause.add_permits(1);

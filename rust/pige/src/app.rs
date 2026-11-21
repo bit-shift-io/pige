@@ -24,6 +24,8 @@ use crate::theme;
 pub(crate) const SCROLLBAR_IDLE: Duration = Duration::from_millis(800);
 
 /// The committed 256 px render of the app icon, embedded at compile time.
+/// Android takes its icon from the manifest, so it never ships these bytes.
+#[cfg(not(target_os = "android"))]
 pub(crate) const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app_icon_256.png");
 
 /// The desktop window icon. A decode failure returns `None` rather than
