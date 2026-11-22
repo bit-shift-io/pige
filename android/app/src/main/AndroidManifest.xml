@@ -41,5 +41,9 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"/>
         </provider>
+        <!-- Rebuilds the per-account group summary after a child is swiped. -->
+        <receiver
+            android:name=".NotificationDismissReceiver"
+            android:exported="false"/>
     </application>
 </manifest>
