@@ -209,7 +209,8 @@ pub extern "system" fn Java_bitshift_pige_GoogleAuthorization_nativeResult(
 
 /// A notification tap, forwarded once by `MainActivity.onNewIntent`/`onCreate`.
 /// Best-effort: select the account's Inbox when it is cached, then open the
-/// notified conversation. Failures are logged and never cross back into Java.
+/// notified conversation. An empty thread is a summary tap and stops at the
+/// Inbox. Failures are logged and never cross back into Java.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_bitshift_pige_MainActivity_nativeNotificationTap(
     mut env: JNIEnv,
@@ -220,10 +221,6 @@ pub extern "system" fn Java_bitshift_pige_MainActivity_nativeNotificationTap(
     init_logging();
     let account: String = env.get_string(&account).map(Into::into).unwrap_or_default();
     let thread: String = env.get_string(&thread).map(Into::into).unwrap_or_default();
-    if thread.is_empty() {
-        log::warn!("notification tap without a thread id");
-        return;
-    }
 
     std::thread::spawn(move || {
         if !initialize_api("notificationTap") {
@@ -255,8 +252,14 @@ pub extern "system" fn Java_bitshift_pige_MainActivity_nativeNotificationTap(
                 Some(folder) => api::select_folder(&folder).await,
                 None => api::select_unified().await,
             };
-            if let Err(error) = selected {
+            if let Err(error) = &selected {
                 log::warn!("notification tap: select inbox: {error}");
+            }
+            if thread.is_empty() {
+                if selected.is_ok() {
+                    log::info!("notification tap: opened inbox");
+                }
+                return;
             }
             match api::open_conversation(&ThreadId(thread)).await {
                 Ok(_) => log::info!("notification tap: opened conversation"),

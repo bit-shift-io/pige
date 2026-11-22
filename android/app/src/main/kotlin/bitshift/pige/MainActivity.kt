@@ -55,11 +55,18 @@ class MainActivity : IcedActivity() {
 
     /// Forward a notification's account/thread extras exactly once, then drop
     /// them so a configuration change or recreation cannot reopen the reader.
+    /// A child tap carries a thread; a summary tap has none and clears the
+    /// account's notifications after opening its Inbox.
     private fun forwardNotificationTap(intent: Intent?) {
         val account = intent?.getStringExtra(EXTRA_ACCOUNT) ?: return
-        val thread = intent.getStringExtra(EXTRA_THREAD) ?: return
+        val thread = intent.getStringExtra(EXTRA_THREAD).orEmpty()
         intent.removeExtra(EXTRA_ACCOUNT)
         intent.removeExtra(EXTRA_THREAD)
+        if (thread.isEmpty()) {
+            NotificationPoster.clearAccount(this, account)
+        } else {
+            NotificationPoster.childTapped(this, account, thread)
+        }
         nativeNotificationTap(account, thread)
     }
 
