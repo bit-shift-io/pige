@@ -31,7 +31,7 @@ pub fn run() -> iced::Result {
     // makes a repeat call (JNI racing a cold start) a no-op.
     logging::init();
     let mut daemon = iced::daemon(App::new, App::update, App::view)
-        .title(|_: &App, _| "pige".into())
+        .title(|_: &App, _| "Pige".into())
         .theme(|app: &App, _| {
             if app.dark {
                 iced::Theme::Dark
