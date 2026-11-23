@@ -27,6 +27,7 @@ use crate::{Message, icons};
 pub mod avatar;
 pub mod buttons;
 pub mod chips;
+pub mod edge_strip;
 pub mod chrome;
 pub mod dialog;
 pub mod elastic_scroll;

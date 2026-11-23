@@ -8,6 +8,7 @@ use iced::widget::{button, column, container, row, space, stack};
 use iced::{Color, Element, Fill};
 
 use crate::Message;
+use crate::components::edge_strip::{Side, edge_strip};
 use crate::components::{avatar, label, styled_text};
 use crate::icons;
 use crate::theme::{self, Palette, TextRole};
@@ -24,7 +25,8 @@ pub struct ListRow {
     pub unread: bool,
     pub has_attachment: bool,
     pub count: u32,
-    /// The account's accent colour, drawn as a bar on the row's left edge.
+    /// The account's accent colour, drawn as a full-height strip on the row
+    /// surface's left edge, behind the content.
     pub account_color: Option<Color>,
 }
 
@@ -88,18 +90,6 @@ fn badge(count: u32, palette: Palette) -> Element<'static, Message> {
         ..Default::default()
     })
     .into()
-}
-
-fn unread_dot(palette: Palette) -> Element<'static, Message> {
-    container(space())
-        .width(palette.metrics.unread_dot)
-        .height(palette.metrics.unread_dot)
-        .style(move |_| container::Style {
-            background: Some(palette.primary.into()),
-            border: iced::border::rounded(palette.metrics.unread_dot / 2.0),
-            ..Default::default()
-        })
-        .into()
 }
 
 fn tile_style(
@@ -170,10 +160,11 @@ fn list_row_on<'a>(item: ListRow, on_press: Message, surface: RowSurface) -> Ele
     .spacing(palette.space.xs)
     .width(Fill);
 
-    // Unread and count indicators float over the lower lines so they cannot
-    // push the date inward. Reserve a little room at the end of those lines so
-    // text ellipsizes before it runs underneath the indicators.
-    let indicators_width = if item.unread || item.count > 1 {
+    // The conversation count floats over the lower lines so it cannot push
+    // the date inward. (Unread is the right edge strip; it needs no room from
+    // the text.) Reserve a little room at the end of those lines so text
+    // ellipsizes before it runs underneath the badge.
+    let indicators_width = if item.count > 1 {
         palette.space.lg
     } else {
         0.0
@@ -222,30 +213,8 @@ fn list_row_on<'a>(item: ListRow, on_press: Message, surface: RowSurface) -> Ele
         .align_y(iced::Alignment::Center)
         .width(Fill);
 
-    // The account colour is a slim bar pinned to the row's left edge, not a
-    // ring or block around the avatar. It is overlaid so it never changes the
-    // text layout.
-    let bar: Element<'a, Message> = match item.account_color {
-        Some(color) => container(space())
-            .width(palette.metrics.account_bar_width)
-            .height(Fill)
-            .style(move |_| container::Style {
-                background: Some(color.into()),
-                ..Default::default()
-            })
-            .into(),
-        None => space().width(0.0).into(),
-    };
-
-    let indicators: Element<'a, Message> = if item.unread || item.count > 1 {
-        let mut stack = column![].align_x(iced::Alignment::End);
-        if item.unread {
-            stack = stack.push(unread_dot(palette));
-        }
-        if item.count > 1 {
-            stack = stack.push(badge(item.count, palette));
-        }
-        container(stack)
+    let indicators: Element<'a, Message> = if item.count > 1 {
+        container(badge(item.count, palette))
             .width(Fill)
             .height(Fill)
             .align_x(iced::alignment::Horizontal::Right)
@@ -255,26 +224,48 @@ fn list_row_on<'a>(item: ListRow, on_press: Message, surface: RowSurface) -> Ele
         space().into()
     };
 
-    let inner = container(stack![base, bar, indicators]).width(Fill);
-    let inner = match surface {
-        RowSurface::Plain => inner
+    // The content sizes the row; the surface (card or plain pane) wraps it,
+    // so the padding sits inside the surface while the edge strips sit
+    // outside it, flush with the surface's very edge.
+    let content = container(stack![base, indicators]).width(Fill);
+    let content = match surface {
+        RowSurface::Plain => content
             .padding([0.0, palette.space.lg])
-            .center_y(palette.metrics.list_row_height)
-            .style(move |_| container::Style {
-                background: Some(
-                    if item.unread {
-                        palette.surface_container
-                    } else {
-                        Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                text_color: Some(palette.on_surface),
-                ..Default::default()
-            }),
-        RowSurface::Card => inner
-            .padding(palette.space.lg)
-            .style(move |_| crate::components::card_style(palette)),
+            .center_y(palette.metrics.list_row_height),
+        RowSurface::Card => content.padding(palette.space.lg),
+    };
+
+    // Edge strips draw under the content: the account colour on the left
+    // edge, and for unread rows the accent on the right edge (replacing the
+    // old floating dot). They are clipped to the surface's rounded shape, so
+    // on a card they follow its corners and read as part of it.
+    let radius = match surface {
+        RowSurface::Plain => 0.0,
+        RowSurface::Card => palette.radius.md,
+    };
+    let mut layered = stack![content];
+    if let Some(color) = item.account_color {
+        layered = layered.push_under(edge_strip(color, Side::Left, radius));
+    }
+    if item.unread {
+        layered = layered.push_under(edge_strip(palette.primary, Side::Right, radius));
+    }
+
+    let inner = container(layered).width(Fill);
+    let inner = match surface {
+        RowSurface::Plain => inner.style(move |_| container::Style {
+            background: Some(
+                if item.unread {
+                    palette.surface_container
+                } else {
+                    Color::TRANSPARENT
+                }
+                .into(),
+            ),
+            text_color: Some(palette.on_surface),
+            ..Default::default()
+        }),
+        RowSurface::Card => inner.style(move |_| crate::components::card_style(palette)),
     };
 
     button(inner)

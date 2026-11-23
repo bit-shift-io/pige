@@ -137,9 +137,9 @@ pub struct Metrics {
     pub toast_radius: f32,
     pub toast_margin: f32,
     pub badge_height: f32,
-    /// Width of the account-colour bar pinned to a message row's left edge.
-    pub account_bar_width: f32,
-    pub unread_dot: f32,
+    /// Width of the full-height edge strips on a message row surface: the
+    /// account colour on the left edge, the unread accent on the right.
+    pub edge_bar_width: f32,
     pub avatar_size: f32,
     pub avatar_font_ratio: f32,
     pub empty_icon_size: f32,
@@ -418,8 +418,7 @@ const METRICS: Metrics = Metrics {
     toast_radius: 8.0,
     toast_margin: 16.0,
     badge_height: 18.0,
-    account_bar_width: 4.0,
-    unread_dot: 8.0,
+    edge_bar_width: 4.0,
     avatar_size: 40.0,
     avatar_font_ratio: 0.4,
     empty_icon_size: 48.0,
