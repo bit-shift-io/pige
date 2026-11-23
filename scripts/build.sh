@@ -50,11 +50,25 @@ if ! is_jdk "${JAVA_HOME:-}"; then
 fi
 
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+# A stale ANDROID_NDK_HOME (for example a half-finished NDK download, or a
+# version the rc files point at) must not fail the build when a complete NDK
+# is installed; probe like the JDK detection above, preferring the version
+# this script pins.
+ndk_bin() { printf '%s/toolchains/llvm/prebuilt/linux-x86_64/bin' "$1"; }
+
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/28.2.13676358}"
-TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+if [[ ! -x "$(ndk_bin "$ANDROID_NDK_HOME")/clang" ]]; then
+    echo "Incomplete NDK at $ANDROID_NDK_HOME (clang is missing); probing alternatives." >&2
+    for candidate in "$ANDROID_HOME/ndk/28.2.13676358" "$ANDROID_HOME"/ndk/*; do
+        [[ -x "$(ndk_bin "$candidate")/clang" ]] || continue
+        export ANDROID_NDK_HOME="$candidate"
+        echo "Using complete NDK at $ANDROID_NDK_HOME." >&2
+        break
+    done
+fi
+TOOLCHAIN="$(ndk_bin "$ANDROID_NDK_HOME")"
 if [[ ! -x "$TOOLCHAIN/clang" ]]; then
-    echo "Incomplete NDK at $ANDROID_NDK_HOME (clang is missing)." >&2
-    echo "Set ANDROID_NDK_HOME to a complete NDK; this build uses 28.2.13676358." >&2
+    echo "No complete NDK under $ANDROID_HOME/ndk; install NDK 28.2.13676358." >&2
     exit 1
 fi
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-android34-clang"
